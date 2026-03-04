@@ -42,6 +42,8 @@ class Prop(BaseModel):
     sport: SportId
     league: str | None = None  # ESPN league slug: nba/nfl/nhl/...
     player_name: str
+    player_position: str | None = None  # ESPN position abbreviation when available (e.g., G/F/C, QB, RW)
+    espn_athlete_id: int | None = None
     underdog_player_id: str | None = None
     underdog_option_id: str
     game_title: str | None = None

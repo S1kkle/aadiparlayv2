@@ -1,0 +1,28 @@
+# Render Blueprint: backend only (frontend stays on Vercel).
+# Deploy from repo root; set GROQ_API_KEY and Underdog env vars in Render dashboard.
+services:
+  - type: web
+    runtime: python
+    name: aadiparlay-backend
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
+      - key: UD_AUTH_TOKEN
+        sync: false
+      - key: UD_USER_LOCATION_TOKEN
+        sync: false
+      - key: UD_OVER_UNDER_LINES_URL
+        value: https://api.underdogfantasy.com/beta/v5/over_under_lines
+      - key: UD_PRODUCT
+        value: fantasy
+      - key: UD_PRODUCT_EXPERIENCE_ID
+        sync: false
+      - key: UD_STATE_CONFIG_ID
+        sync: false
+      - key: CORS_ALLOW_ORIGINS
+        sync: false

@@ -1,0 +1,27 @@
+# Cache & databases
+backend/.cache/
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+backend/.env
+.env.local
+
+# Node
+node_modules/
+web/.next/
+web/out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

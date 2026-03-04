@@ -12,6 +12,8 @@ export async function fetchRankedProps(params: {
   refresh?: boolean;
   maxProps?: number;
   aiLimit?: number;
+  requireAi?: boolean;
+  requireAiCount?: number;
 }): Promise<RankedPropsResponse> {
   const backend = getBackendUrl();
   const url = new URL("/props", backend);
@@ -20,8 +22,51 @@ export async function fetchRankedProps(params: {
   if (params.refresh) url.searchParams.set("refresh", "true");
   if (params.maxProps) url.searchParams.set("max_props", String(params.maxProps));
   if (params.aiLimit !== undefined) url.searchParams.set("ai_limit", String(params.aiLimit));
+  if (params.requireAi) url.searchParams.set("require_ai", "true");
+  if (params.requireAiCount) url.searchParams.set("require_ai_count", String(params.requireAiCount));
 
   const res = await fetch(url.toString(), {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as RankedPropsResponse;
+}
+
+export async function startPropsJob(params: {
+  sport: SportId;
+  scope?: "all" | "featured";
+  refresh?: boolean;
+  maxProps?: number;
+  aiLimit?: number;
+  requireAiCount?: number;
+}): Promise<{ job_id: string }> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/props/job", backend).toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sport: params.sport,
+      scope: params.scope ?? "all",
+      refresh: !!params.refresh,
+      max_props: params.maxProps ?? 10,
+      ai_limit: params.aiLimit ?? 10,
+      require_ai_count: params.requireAiCount ?? 10,
+    }),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as { job_id: string };
+}
+
+export async function fetchPropsJobResult(jobId: string): Promise<RankedPropsResponse> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL(`/props/job/${jobId}/result`, backend).toString(), {
     cache: "no-store",
   });
   if (!res.ok) {

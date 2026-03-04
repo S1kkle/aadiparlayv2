@@ -1,9 +1,11 @@
 import asyncio
 import math
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
-from app.clients.espn import EspnClient
+from app.clients.espn import EspnClient, _canon_name
 from app.clients.ollama import OllamaClient
 from app.clients.underdog import UnderdogClient
 from app.db import SqliteTTLCache
@@ -42,7 +44,8 @@ def american_to_decimal(american: int) -> float:
 
 
 def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
-    s = stat.strip().lower()
+    raw = stat.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
 
     if sport == "NBA":
         mapping = {
@@ -53,7 +56,7 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "steals": ["steals"],
             "turnovers": ["turnovers"],
         }
-        return mapping.get(s, [])
+        return mapping.get(raw, []) or mapping.get(s, [])
 
     if sport == "NFL":
         mapping = {
@@ -69,7 +72,7 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "receiving_touchdowns": ["receivingTouchdowns"],
             "receiving_tds": ["receivingTouchdowns"],
         }
-        return mapping.get(s, [])
+        return mapping.get(raw, []) or mapping.get(s, [])
 
     if sport == "NHL":
         mapping = {
@@ -79,7 +82,23 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "shots": ["shotsTotal"],
             "shots_on_goal": ["shotsTotal"],
         }
-        return mapping.get(s, [])
+        return mapping.get(raw, []) or mapping.get(s, [])
+
+    if sport == "MMA":
+        mapping = {
+            "sig_strikes": ["sigStrikesLanded"],
+            "significant_strikes": ["sigStrikesLanded"],
+            "significant_strikes_landed": ["sigStrikesLanded"],
+            "sig_strikes_landed": ["sigStrikesLanded"],
+            "takedowns": ["takedownsLanded"],
+            "takedowns_landed": ["takedownsLanded"],
+            "knockdowns": ["knockDowns"],
+            "total_strikes": ["totalStrikesLanded"],
+            "total_strikes_landed": ["totalStrikesLanded"],
+            "submissions": ["submissions"],
+            "advances": ["advances"],
+        }
+        return mapping.get(raw, []) or mapping.get(s, [])
 
     return []
 
@@ -108,6 +127,9 @@ class Ranker:
         refresh: bool,
         max_props: int = 120,
         ai_limit: int = 25,
+        require_ai: bool = False,
+        require_ai_count: int = 10,
+        on_ai_progress: Any | None = None,
     ) -> list[Prop]:
         # cache Underdog pull briefly (their API is rate-limited / geo-gated)
         cache_key = f"underdog:over_under_lines:{scope}"
@@ -141,7 +163,12 @@ class Ranker:
         for p in props:
             if p.model_prob is None:
                 p.model_prob = p.implied_prob
-                p.notes.append("Model fallback: no ESPN stat series available.")
+                if p.sport in ("NBA", "NFL", "NHL", "MMA"):
+                    p.notes.append("Model fallback: no ESPN stat series available.")
+                else:
+                    p.notes.append(
+                        f"Model not supported for {p.sport} yet (experimental); using implied probability."
+                    )
 
         edge_vals: list[float] = []
         ev_vals: list[float] = []
@@ -163,14 +190,67 @@ class Ranker:
             z_by_option[p.underdog_option_id] = (edge_z[i], ev_z[i], vol_z[i])
             p.score = self._cfg.w_edge * edge_z[i] + self._cfg.w_ev * ev_z[i] - self._cfg.w_vol * vol_z[i]
 
-        # Select the top-N purely statistically first (unbiased by feed order),
-        # then run AI on exactly those returned picks so the UI always has AI for top 10.
+        # Sort once by statistical score (unbiased by feed order)
         props.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
-        selected = props[:max_props] if max_props > 0 else props
 
-        # 3) Ollama qualitative analysis (best-effort) for selected only
-        if self._ollama is not None and ai_limit > 0:
-            await self._apply_ollama(selected)
+        selected: list[Prop] = []
+        if require_ai and self._ollama is not None and ai_limit > 0:
+            # For "All sports", only return props that have ai_summary.
+            if not await self._ollama.is_available():
+                raise RuntimeError("Ollama not available.")
+
+            analyzed: list[Prop] = []
+            with_ai: list[Prop] = []
+            cursor = 0
+            batch = max(10, int(max_props))
+
+            async def _on_prop_done(p: Prop) -> None:
+                if on_ai_progress is None:
+                    return
+                try:
+                    ok = isinstance(p.ai_summary, str) and p.ai_summary.strip()
+                    await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok)})
+                except Exception:
+                    return
+
+            while cursor < len(props) and len(with_ai) < require_ai_count:
+                chunk = props[cursor : cursor + batch]
+                cursor += batch
+                analyzed.extend(chunk)
+                # In strict mode, the user wants ALL returned picks to have AI.
+                # Allow Ollama to take as long as needed per pick, while still
+                # emitting progress so the UI doesn't look frozen.
+                await self._apply_ollama(
+                    chunk,
+                    on_prop_done=_on_prop_done,
+                    per_prop_timeout_s=60 * 20,
+                    ollama_timeout_s=60 * 20,
+                )
+                with_ai.extend([p for p in chunk if isinstance(p.ai_summary, str) and p.ai_summary.strip()])
+                if on_ai_progress is not None:
+                    try:
+                        await on_ai_progress(
+                            {
+                                "type": "ai_batch",
+                                "analyzed": len(analyzed),
+                                "have_ai": len(with_ai),
+                                "need_ai": int(require_ai_count),
+                            }
+                        )
+                    except Exception:
+                        pass
+
+            if len(with_ai) < require_ai_count:
+                raise RuntimeError(
+                    f"Unable to generate AI summaries for {require_ai_count} picks (generated {len(with_ai)})."
+                )
+
+            selected = with_ai[: max(1, int(require_ai_count))]
+        else:
+            # Default behavior: analyze exactly the selected props and return immediately.
+            selected = props[:max_props] if max_props > 0 else props
+            if self._ollama is not None and ai_limit > 0:
+                await self._apply_ollama(selected)
 
         # Final score (stats + AI) for selected only
         for p in selected:
@@ -184,19 +264,29 @@ class Ranker:
     async def _apply_espn_model(self, props: list[Prop]) -> None:
         assert self._espn is not None
 
-        # Resolve athlete IDs per (sport, player_name) and fetch gamelog once
+        team_sport_props = [p for p in props if p.sport in ("NBA", "NFL", "NHL")]
+        mma_props = [p for p in props if p.sport == "MMA"]
+
+        if team_sport_props:
+            await self._apply_espn_model_team_sports(team_sport_props)
+        if mma_props:
+            await self._apply_espn_model_mma(mma_props)
+
+    async def _apply_espn_model_team_sports(self, props: list[Prop]) -> None:
+        assert self._espn is not None
+
         unique_players: list[tuple[SportId, str]] = []
         seen: set[tuple[SportId, str]] = set()
         for p in props:
             key = (p.sport, p.player_name)
             if key in seen:
                 continue
-            if p.sport not in ("NBA", "NFL", "NHL"):
-                continue
             seen.add(key)
             unique_players.append(key)
 
         gamelog_by_player: dict[tuple[SportId, str], dict[str, Any] | None] = {}
+        position_by_player: dict[tuple[SportId, str], str | None] = {}
+        athlete_id_by_player: dict[tuple[SportId, str], int | None] = {}
 
         sem = asyncio.Semaphore(10)
 
@@ -206,7 +296,6 @@ class Ranker:
                 gamelog_by_player[(sp, name)] = None
                 return
             sport_slug, league_slug = sl
-            # prefer team-roster mapping when we have an abbreviation; fallback to global search
             team_abbr = None
             for p in props:
                 if p.sport == sp and p.player_name == name and p.team_abbr:
@@ -214,30 +303,38 @@ class Ranker:
                     break
             async with sem:
                 if team_abbr:
-                    athlete_id = await self._espn.resolve_athlete_id_from_team_roster(
+                    athlete_id, pos = await self._espn.resolve_athlete_profile_from_team_roster(
                         sport=sport_slug, league=league_slug, team_abbr=team_abbr, full_name=name
                     )
+                    position_by_player[(sp, name)] = pos
+                    if athlete_id is None:
+                        athlete_id = await self._espn.find_best_athlete_id(
+                            sport=sport_slug, league=league_slug, full_name=name
+                        )
                 else:
                     athlete_id = await self._espn.find_best_athlete_id(
                         sport=sport_slug, league=league_slug, full_name=name
                     )
+                    position_by_player[(sp, name)] = None
             if athlete_id is None:
                 gamelog_by_player[(sp, name)] = None
+                athlete_id_by_player[(sp, name)] = None
                 return
             try:
                 async with sem:
                     gamelog_by_player[(sp, name)] = await self._espn.fetch_gamelog(
                         sport=sport_slug, league=league_slug, athlete_id=athlete_id
                     )
+                    athlete_id_by_player[(sp, name)] = athlete_id
             except Exception:
                 gamelog_by_player[(sp, name)] = None
+                athlete_id_by_player[(sp, name)] = athlete_id
 
         await asyncio.gather(*(fetch_one(sp, name) for sp, name in unique_players))
 
-        # Apply model per prop
         for p in props:
-            if p.sport not in ("NBA", "NFL", "NHL"):
-                continue
+            p.player_position = position_by_player.get((p.sport, p.player_name))
+            p.espn_athlete_id = athlete_id_by_player.get((p.sport, p.player_name))
             gamelog = gamelog_by_player.get((p.sport, p.player_name))
             if not gamelog:
                 p.notes.append("No ESPN gamelog found for athlete.")
@@ -290,7 +387,135 @@ class Ranker:
             p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
-    async def _apply_ollama(self, props: list[Prop]) -> None:
+    async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
+        """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog."""
+        assert self._espn is not None
+
+        unique_fighters: list[str] = []
+        seen: set[str] = set()
+        for p in props:
+            if p.player_name in seen:
+                continue
+            seen.add(p.player_name)
+            unique_fighters.append(p.player_name)
+
+        fight_history_by_name: dict[str, list[dict[str, Any]]] = {}
+        athlete_id_by_name: dict[str, int | None] = {}
+        career_stats_by_name: dict[str, dict[str, float]] = {}
+        sem = asyncio.Semaphore(6)
+
+        async def fetch_fighter(name: str) -> None:
+            async with sem:
+                aid = await self._espn.find_mma_athlete_id(full_name=name)
+            athlete_id_by_name[name] = aid
+            if aid is None:
+                fight_history_by_name[name] = []
+                career_stats_by_name[name] = {}
+                return
+            async with sem:
+                fight_history_by_name[name] = await self._espn.fetch_mma_fight_history(
+                    athlete_id=aid, last_n=self._cfg.last_n,
+                )
+            async with sem:
+                career_stats_by_name[name] = await self._espn.fetch_mma_career_stats(athlete_id=aid)
+
+        await asyncio.gather(*(fetch_fighter(n) for n in unique_fighters))
+
+        for p in props:
+            p.espn_athlete_id = athlete_id_by_name.get(p.player_name)
+            fights = fight_history_by_name.get(p.player_name, [])
+            if not fights:
+                p.notes.append("No ESPN fight history found for athlete.")
+                continue
+
+            candidates = _stat_field_candidates(sport="MMA", stat=p.stat)
+            if not candidates:
+                p.notes.append(f"Stat '{p.stat}' not mapped to ESPN MMA stat fields yet.")
+                continue
+
+            series: list[float] = []
+            field_used: str | None = None
+            for field in candidates:
+                vals = [f["stats"].get(field, None) for f in fights if isinstance(f.get("stats"), dict)]
+                vals = [v for v in vals if v is not None]
+                if vals:
+                    series = vals
+                    field_used = field
+                    break
+            if not series:
+                p.notes.append("ESPN fight history has no values for this stat field.")
+                continue
+
+            params = fit_normal(series)
+            if params is None:
+                p.notes.append("Unable to fit distribution (insufficient ESPN MMA data).")
+                continue
+            p.volatility = float(params.sigma)
+            p.stat_field = field_used
+
+            # Build recent_games from fight history (opponent_abbr = opponent name for MMA)
+            p.recent_games = []
+            for f in fights:
+                date_str = f.get("date")
+                game_date = None
+                if isinstance(date_str, str):
+                    try:
+                        game_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                stat_val = f.get("stats", {}).get(field_used)
+                if stat_val is not None:
+                    p.recent_games.append(GameStat(
+                        game_date=game_date,
+                        opponent_abbr=f.get("opponent_name"),
+                        value=float(stat_val),
+                    ))
+
+            # Vs-opponent: find previous fights against the same opponent
+            if p.opponent_abbr:
+                opp_canon = _canon_name(p.opponent_abbr)
+                for f in fights:
+                    opp_name = f.get("opponent_name")
+                    if not opp_name:
+                        continue
+                    if _canon_name(opp_name) == opp_canon:
+                        date_str = f.get("date")
+                        game_date = None
+                        if isinstance(date_str, str):
+                            try:
+                                game_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                            except ValueError:
+                                pass
+                        stat_val = f.get("stats", {}).get(field_used)
+                        if stat_val is not None:
+                            p.vs_opponent_games.append(GameStat(
+                                game_date=game_date,
+                                opponent_abbr=opp_name,
+                                value=float(stat_val),
+                            ))
+
+            # Store career stats on prop for AI context later
+            career = career_stats_by_name.get(p.player_name, {})
+            if career:
+                p.notes.append(
+                    f"Career: SLpM={career.get('strikeLPM', 'N/A')}, "
+                    f"StrAcc={career.get('strikeAccuracy', 'N/A')}%, "
+                    f"TDAcc={career.get('takedownAccuracy', 'N/A')}%, "
+                    f"TDAvg={career.get('takedownAvg', 'N/A')}, "
+                    f"SubAvg={career.get('submissionAvg', 'N/A')}"
+                )
+
+            p_over = prob_over(line=p.line, params=params)
+            p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
+
+    async def _apply_ollama(
+        self,
+        props: list[Prop],
+        *,
+        on_prop_done: Any | None = None,
+        per_prop_timeout_s: float = 25.0,
+        ollama_timeout_s: float = 30.0,
+    ) -> None:
         assert self._ollama is not None
         assert self._espn is not None
 
@@ -299,7 +524,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v5"
+        AI_PROMPT_VERSION = "v7"
         sem = asyncio.Semaphore(4)
 
         def _mean(xs: list[float]) -> float | None:
@@ -315,6 +540,179 @@ class Ranker:
             else:
                 hits = sum(1 for v in values if v < line)
             return hits / len(values)
+
+        async def _mma_matchup_lines(p: Prop) -> list[str]:
+            """MMA-specific matchup context using fighter career stats & opponent data."""
+            out: list[str] = []
+            assert self._espn is not None
+
+            # Fighter's own career stats (from notes)
+            for note in p.notes:
+                if note.startswith("Career:"):
+                    out.append(f"Fighter ({p.player_name}) {note}")
+                    break
+
+            # Try to fetch opponent career stats
+            if p.opponent_abbr:
+                try:
+                    opp_aid = await self._espn.find_mma_athlete_id(full_name=p.opponent_abbr)
+                    if opp_aid:
+                        opp_career = await self._espn.fetch_mma_career_stats(athlete_id=opp_aid)
+                        if opp_career:
+                            out.append(
+                                f"Opponent ({p.opponent_abbr}) career: "
+                                f"SLpM={opp_career.get('strikeLPM', 'N/A')}, "
+                                f"StrAcc={opp_career.get('strikeAccuracy', 'N/A')}%, "
+                                f"TDAcc={opp_career.get('takedownAccuracy', 'N/A')}%, "
+                                f"TDAvg={opp_career.get('takedownAvg', 'N/A')}, "
+                                f"SubAvg={opp_career.get('submissionAvg', 'N/A')}"
+                            )
+
+                        # Get opponent's recent fight history for the specific stat
+                        opp_fights = await self._espn.fetch_mma_fight_history(
+                            athlete_id=opp_aid, last_n=5,
+                        )
+                        if opp_fights and p.stat_field:
+                            opp_allowed: list[float] = []
+                            for f in opp_fights:
+                                v = f.get("stats", {}).get(p.stat_field)
+                                if v is not None:
+                                    opp_allowed.append(float(v))
+                            if opp_allowed:
+                                avg_opp = sum(opp_allowed) / len(opp_allowed)
+                                out.append(
+                                    f"Opponent ({p.opponent_abbr}) averages {avg_opp:.1f} "
+                                    f"{p.stat_field} themselves (last {len(opp_allowed)} fights)."
+                                )
+                except Exception:
+                    pass
+
+            # Fighter's own win-rate context from recent fights
+            recent = p.recent_games or []
+            if recent:
+                out.append(f"Fighter has data from {len(recent)} recent fights for {p.stat_field}.")
+
+            return out
+
+        async def _matchup_lines(p: Prop) -> list[str]:
+            """
+            Adds opponent defense context, using ESPN boxscores.
+            Designed to be best-effort and fast; runs only for selected props.
+            """
+            if p.sport == "MMA":
+                return await _mma_matchup_lines(p)
+            if p.sport != "NBA":
+                return []
+            if not p.opponent_abbr:
+                return []
+            sl = self._espn.sport_league_for_scope(p.sport)
+            if sl is None:
+                return []
+            sport_slug, league_slug = sl
+
+            # Map our prop stat to ESPN team-total stat keys.
+            # These keys match summary.boxscore.teams[*].statistics[*].name
+            stat_key = None
+            if p.stat_field in ("assists", "blocks", "steals", "turnovers", "totalRebounds", "points"):
+                stat_key = p.stat_field
+            else:
+                s = p.stat.strip().lower()
+                if s == "points":
+                    stat_key = "points"
+                elif s == "assists":
+                    stat_key = "assists"
+                elif s == "rebounds":
+                    stat_key = "totalRebounds"
+                elif s == "blocks":
+                    stat_key = "blocks"
+                elif s == "steals":
+                    stat_key = "steals"
+                elif s == "turnovers":
+                    stat_key = "turnovers"
+
+            if not stat_key:
+                return []
+
+            out: list[str] = []
+            try:
+                opp_allowed = await self._espn.compute_team_allowed_average(
+                    sport=sport_slug,
+                    league=league_slug,
+                    defense_team_abbr=p.opponent_abbr,
+                    stat_key=stat_key,
+                    last_n_games=5,
+                )
+            except Exception:
+                opp_allowed = None
+
+            if isinstance(opp_allowed, (int, float)):
+                # League-relative snapshot is expensive to compute from scratch.
+                # Only use it if it's already cached; otherwise, skip league context to keep /props fast.
+                snap = self._espn.get_cached_league_allowed_rank_snapshot(
+                    sport=sport_slug, league=league_slug, stat_key=stat_key, last_n_games=3
+                )
+                teams = snap.get("teams") if isinstance(snap, dict) else None
+                league_avg = snap.get("league_avg") if isinstance(snap, dict) else None
+                n = snap.get("n") if isinstance(snap, dict) else None
+                if isinstance(league_avg, (int, float)) and float(league_avg) != 0.0:
+                    diff = float(opp_allowed) - float(league_avg)
+                    diff_pct = (diff / float(league_avg)) * 100.0
+                    diff_str = f"{diff:+.2f} ({diff_pct:+.0f}%)"
+                else:
+                    diff_str = None
+
+                if isinstance(teams, dict) and isinstance(teams.get(p.opponent_abbr.upper()), dict):
+                    t = teams[p.opponent_abbr.upper()]
+                    rank = t.get("rank")
+                    if isinstance(rank, int) and isinstance(n, int):
+                        out.append(
+                            f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5)"
+                            + (f", {diff_str} vs league avg ~{float(league_avg):.2f}" if diff_str else "")
+                            + f"; softness rank {rank}/{n}."
+                        )
+                    else:
+                        out.append(
+                            f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5)"
+                            + (f", {diff_str} vs league avg ~{float(league_avg):.2f}" if diff_str else "")
+                            + "."
+                        )
+                else:
+                    if isinstance(league_avg, (int, float)):
+                        out.append(
+                            f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5); "
+                            + (f"{diff_str} vs league avg ~{float(league_avg):.2f} (cached)." if diff_str else f"league avg ~{float(league_avg):.2f} (cached).")
+                        )
+                    else:
+                        out.append(f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5).")
+
+            # Position-split estimate (NBA only) when we have a position.
+            # For rebounds props, Underdog is player REB; ESPN player key is 'rebounds' not 'totalRebounds'.
+            if p.player_position and p.player_position.strip():
+                pos = p.player_position.strip().upper()
+                player_stat_key = None
+                if stat_key == "totalRebounds":
+                    player_stat_key = "rebounds"
+                elif stat_key in ("assists", "blocks", "steals", "turnovers", "points"):
+                    player_stat_key = stat_key
+                if player_stat_key:
+                    try:
+                        pos_allowed = await self._espn.compute_team_allowed_by_position_average(
+                            sport=sport_slug,
+                            league=league_slug,
+                            defense_team_abbr=p.opponent_abbr,
+                            offense_position_abbr=pos,
+                            stat_key=player_stat_key,
+                            last_n_games=5,
+                        )
+                    except Exception:
+                        pos_allowed = None
+                    if isinstance(pos_allowed, (int, float)):
+                        out.append(
+                            f"Position split (est.): {p.opponent_abbr.upper()} allows ~{pos_allowed:.2f} {player_stat_key}/game "
+                            f"to {pos} (sum of opposing {pos} boxscore lines; last5)."
+                        )
+
+            return out
 
         async def run_one(p: Prop) -> None:
             cache_key = f"ollama:prop:{AI_PROMPT_VERSION}:{p.underdog_option_id}:{p.side}:{p.line}"
@@ -351,34 +749,65 @@ class Ranker:
             vs_avg = _mean(vs_vals)
             vs_hit = _hit_rate(vs_vals, line=p.line, side=p.side)
 
+            matchup = await _matchup_lines(p)
+
+            is_mma = p.sport == "MMA"
+
+            if is_mma:
+                sport_rules = (
+                    "- Analyze the matchup between the two fighters (striking vs grappling, style clashes, reach/weight advantages).\n"
+                    "- Consider recent fight outcomes (wins/losses, finishes vs decisions, activity level).\n"
+                    "- Mention key career stats from MATCHUP_CONTEXT if available (SLpM, TDAcc, etc.).\n"
+                    "- Fighters compete infrequently; note the time gap between fights if significant.\n"
+                )
+                context_label = f"Fight: {p.game_title or 'N/A'}\nFighter: {p.player_name} vs {p.opponent_abbr or '?'}"
+                recent_label = "Recent fights (most recent first):"
+                vs_label = "Previous fights vs this opponent:"
+            else:
+                sport_rules = (
+                    "- If injury lists are provided, mention 1-2 relevant injuries and how they impact role/usage.\n"
+                    "- ONLY mention injuries that appear in the provided injury report lines. Do NOT invent injuries.\n"
+                    "- If you mention an injury, include the exact injury line verbatim in parentheses.\n"
+                    "- Mention matchup context (pace/role/expected minutes, home/away, opponent defensive tendencies).\n"
+                )
+                context_label = (
+                    f"Game: {p.game_title or 'N/A'}\n"
+                    f"Team vs Opp: {(p.team_abbr or '?')} vs {(p.opponent_abbr or '?')}\n"
+                    f"Player: {p.player_name}\n"
+                    f"Player_position: {p.player_position or 'unknown'}"
+                )
+                recent_label = "Recent games (most recent first):"
+                vs_label = "Vs this opponent (current season, if available):"
+
             prompt = (
                 "Analyze an Underdog Pick'em prop.\n"
-                "Write a concise, logically-reasoned summary that weighs injuries/availability, matchup context, and recent form.\n"
+                "Write a concise, logically-reasoned summary that weighs matchup context and recent form.\n"
                 "Rules:\n"
-                "- If injury lists are provided, mention 1-2 relevant injuries and how they impact role/usage.\n"
-                "- ONLY mention injuries that appear in the provided injury report lines. Do NOT invent injuries.\n"
-                "- If you mention an injury, include the exact injury line verbatim in parentheses.\n"
-                "- Mention matchup context (pace/role/expected minutes, home/away, opponent).\n"
-                "- Cite at least two numbers from the stats context.\n"
+                + sport_rules
+                + "- Cite at least two numbers from the stats context.\n"
                 "- Do NOT just restate model_prob/edge; explain *why*.\n\n"
                 f"Sport: {p.sport}\n"
-                f"Game: {p.game_title or 'N/A'}\n"
-                f"Team vs Opp: {(p.team_abbr or '?')} vs {(p.opponent_abbr or '?')}\n"
-                f"Player: {p.player_name}\n"
+                f"{context_label}\n"
                 f"Pick: {p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
                 f"ESPN_field_used: {p.stat_field}\n\n"
-                "TEAM_INJURY_LINES (ESPN; allowed references):\n"
-                + ("\n".join([f"- {x}" for x in team_inj]) if team_inj else "- none listed")
+                "MATCHUP_CONTEXT (ESPN-derived; best-effort):\n"
+                + ("\n".join([f"- {x}" for x in matchup]) if matchup else "- none")
                 + "\n\n"
-                "OPP_INJURY_LINES (ESPN; allowed references):\n"
-                + ("\n".join([f"- {x}" for x in opp_inj]) if opp_inj else "- none listed")
-                + "\n\n"
-                "Stats context:\n"
-                f"- last10_avg: {last10_avg}\n"
-                f"- last10_hit_rate_vs_line: {last10_hit}\n"
+                + (
+                    "TEAM_INJURY_LINES (ESPN; allowed references):\n"
+                    + ("\n".join([f"- {x}" for x in team_inj]) if team_inj else "- none listed")
+                    + "\n\n"
+                    "OPP_INJURY_LINES (ESPN; allowed references):\n"
+                    + ("\n".join([f"- {x}" for x in opp_inj]) if opp_inj else "- none listed")
+                    + "\n\n"
+                    if not is_mma else ""
+                )
+                + "Stats context:\n"
+                f"- recent_avg: {last10_avg}\n"
+                f"- recent_hit_rate_vs_line: {last10_hit}\n"
                 f"- vs_opp_avg: {vs_avg}\n"
                 f"- vs_opp_hit_rate_vs_line: {vs_hit}\n\n"
-                "Recent games (most recent first):\n"
+                f"{recent_label}\n"
                 + "\n".join(
                     [
                         f"- {g.game_date.date().isoformat() if g.game_date else 'unknown_date'} vs {g.opponent_abbr or '?'}: {g.value}"
@@ -386,7 +815,7 @@ class Ranker:
                     ]
                 )
                 + "\n\n"
-                "Vs this opponent (current season, if available):\n"
+                f"{vs_label}\n"
                 + (
                     "\n".join(
                         [
@@ -407,12 +836,33 @@ class Ranker:
 
             async with sem:
                 try:
-                    result = await self._ollama.analyze_prop(prompt=prompt)
+                    result = await asyncio.wait_for(
+                        self._ollama.analyze_prop(prompt=prompt, timeout_s=ollama_timeout_s),
+                        timeout=per_prop_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    p.notes.append("Ollama analysis timed out (skipping qualitative analysis).")
+                    if on_prop_done is not None:
+                        try:
+                            await on_prop_done(p)
+                        except Exception:
+                            pass
+                    return
                 except Exception as e:
                     p.notes.append(f"Ollama analysis skipped: {e}")
+                    if on_prop_done is not None:
+                        try:
+                            await on_prop_done(p)
+                        except Exception:
+                            pass
                     return
             self._cache.set_json(cache_key, result, ttl_seconds=30 * 60)
             self._apply_ai_to_prop(p, result)
+            if on_prop_done is not None:
+                try:
+                    await on_prop_done(p)
+                except Exception:
+                    pass
 
         await asyncio.gather(*(run_one(p) for p in props))
 

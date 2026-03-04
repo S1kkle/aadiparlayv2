@@ -96,7 +96,6 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
             if match_id and match_id in games:
                 game = games[match_id]
                 game_title = game.get("title") or game.get("short_title") or game.get("abbreviated_title")
-                # derive team/opponent abbreviations from abbreviated_title like "MEM @ DAL"
                 abbr_title = game.get("abbreviated_title") or game.get("title") or ""
                 if isinstance(abbr_title, str) and "@" in abbr_title:
                     away, home = [p.strip() for p in abbr_title.split("@", 1)]
@@ -107,8 +106,24 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     elif player and player.get("team_id") == away_team_id:
                         team_abbr, opp_abbr = away, home
                     else:
-                        # unknown which side; keep both as hints
                         team_abbr, opp_abbr = None, None
+                elif isinstance(abbr_title, str) and " vs" in abbr_title.lower():
+                    # MMA / 1v1 sport: "Fighter A vs. Fighter B" or "Fighter A vs Fighter B"
+                    import re as _re
+                    parts = _re.split(r"\s+vs\.?\s+", abbr_title, maxsplit=1, flags=_re.IGNORECASE)
+                    if len(parts) == 2:
+                        a_name, b_name = parts[0].strip(), parts[1].strip()
+                        player_full = ""
+                        if player:
+                            first = player.get("first_name") or ""
+                            last = player.get("last_name") or ""
+                            player_full = (first + " " + last).strip().lower()
+                        if player_full and player_full in a_name.lower():
+                            opp_abbr = b_name
+                        elif player_full and player_full in b_name.lower():
+                            opp_abbr = a_name
+                        else:
+                            opp_abbr = None
                 dt_raw = game.get("scheduled_at")
                 if isinstance(dt_raw, str):
                     try:

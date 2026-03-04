@@ -68,3 +68,13 @@ class SqliteTTLCache:
                 )
                 conn.commit()
 
+    def clear(self) -> int:
+        """
+        Clears all cached entries. Returns number of rows deleted.
+        """
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM cache")
+                conn.commit()
+                return int(cur.rowcount or 0)
+

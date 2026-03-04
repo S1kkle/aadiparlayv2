@@ -1,8 +1,8 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchRankedProps, getBackendUrl } from "@/lib/api";
+import { fetchPropsJobResult, fetchRankedProps, getBackendUrl, startPropsJob } from "@/lib/api";
 import type { Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 const SPORT_OPTIONS: { id: SportId; label: string }[] = [
@@ -61,28 +61,109 @@ export default function Home() {
   const backendUrl = useMemo(() => getBackendUrl(), []);
   const [sport, setSport] = useState<SportId>("NBA");
   const [loading, setLoading] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<RankedPropsResponse | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [jobProgress, setJobProgress] = useState<{
+    stage: string;
+    ai_succeeded: number;
+    ai_attempted: number;
+    ai_target: number;
+    analyzed: number;
+  } | null>(null);
+  const esRef = useRef<EventSource | null>(null);
 
   async function load(refresh = false) {
     setLoading(true);
     setError(null);
+    setJobProgress(null);
+    if (esRef.current) {
+      try {
+        esRef.current.close();
+      } catch {}
+      esRef.current = null;
+    }
     try {
-      const res = await fetchRankedProps({
+      // Always use job+progress mode so we only render when all 10 AI summaries are ready.
+      setData(null);
+      const { job_id } = await startPropsJob({
         sport,
         scope: "all",
         refresh,
         maxProps: 10,
         aiLimit: 10,
+        requireAiCount: 10,
       });
-      setData(res);
+
+      const es = new EventSource(
+        `${backendUrl.replace(/\/$/, "")}/props/job/${job_id}/events`
+      );
+      esRef.current = es;
+
+      es.onmessage = async (msg) => {
+        try {
+          const ev = JSON.parse(msg.data) as any;
+          if (ev?.type === "progress") {
+            setJobProgress({
+              stage: String(ev.stage ?? "ai"),
+              ai_succeeded: Number(ev.ai_succeeded ?? 0),
+              ai_attempted: Number(ev.ai_attempted ?? 0),
+              ai_target: Number(ev.ai_target ?? 10),
+              analyzed: Number(ev.analyzed ?? 0),
+            });
+          } else if (ev?.type === "error") {
+            setError(String(ev.error ?? "Job failed"));
+            setLoading(false);
+            try {
+              es.close();
+            } catch {}
+            esRef.current = null;
+          } else if (ev?.type === "done") {
+            try {
+              es.close();
+            } catch {}
+            esRef.current = null;
+            const res = await fetchPropsJobResult(job_id);
+            setData(res);
+            setLoading(false);
+            setJobProgress(null);
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      es.onerror = () => {
+        setError("Lost connection to backend progress stream.");
+        setLoading(false);
+        try {
+          es.close();
+        } catch {}
+        esRef.current = null;
+      };
     } catch (e) {
       setData(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      // loading is cleared on done/error for job mode
     }
+  }
+
+  async function clearCacheAndReload() {
+    setClearing(true);
+    setError(null);
+    try {
+      await fetch(`${backendUrl.replace(/\/$/, "")}/cache/clear`, { method: "POST" });
+      setExpanded({});
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+    // Kick off a fresh reload separately so the button doesn't spin forever
+    // if ESPN/Ollama requests are slow right after a cache wipe.
+    void load(true);
   }
 
   useEffect(() => {
@@ -137,12 +218,56 @@ export default function Home() {
                 >
                   {loading ? "Loading…" : "Refresh"}
                 </button>
+
+                <button
+                  className="h-10 rounded-md border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-900 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900"
+                  onClick={() => void clearCacheAndReload()}
+                  disabled={loading || clearing}
+                  title="Clears backend cache (ESPN/Ollama/Underdog) and reloads"
+                >
+                  {clearing ? "Clearing…" : "Clear saved picks"}
+                </button>
               </div>
             </div>
           </div>
         </header>
 
         <section className="mt-6">
+          {jobProgress ? (
+            <div className="mb-4 rounded-xl border border-zinc-200 bg-white/80 p-4 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/70">
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <div className="text-zinc-700 dark:text-zinc-200">
+                  Generating AI summaries:{" "}
+                  <span className="font-mono text-xs">
+                    {jobProgress.ai_succeeded}/{jobProgress.ai_target}
+                  </span>{" "}
+                  <span className="text-xs text-zinc-500">
+                    (attempted {jobProgress.ai_attempted}, analyzed {jobProgress.analyzed})
+                  </span>
+                </div>
+                <div className="font-mono text-xs text-zinc-500">
+                  stage:{jobProgress.stage}
+                </div>
+              </div>
+              <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+                <div
+                  className="h-2 bg-zinc-900 dark:bg-zinc-100"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(
+                        (100 * jobProgress.ai_succeeded) /
+                          Math.max(1, jobProgress.ai_target)
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+              <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
+                This will load only after all 10 AI summaries finish.
+              </div>
+            </div>
+          ) : null}
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900 dark:border-red-900/40 dark:bg-red-950/40 dark:text-red-200">
               <div className="font-medium">Request failed</div>
@@ -248,7 +373,7 @@ export default function Home() {
                         ) : null}
                       </td>
                           <td className="px-4 py-3 text-xs text-zinc-700 dark:text-zinc-300">
-                            <div className="leading-5">
+                            <div className="leading-5 break-words">
                               {shortText(p.ai_summary, 140) ? (
                                 shortText(p.ai_summary, 140)
                               ) : (
@@ -298,7 +423,7 @@ export default function Home() {
                                   <div className="text-xs font-semibold text-zinc-600 dark:text-zinc-300">
                                     AI Summary
                                   </div>
-                                  <div className="text-sm leading-6 text-zinc-800 dark:text-zinc-200">
+                                  <div className="max-w-full overflow-x-auto whitespace-pre-wrap break-words text-sm leading-6 text-zinc-800 dark:text-zinc-200">
                                     {p.ai_summary ? (
                                       p.ai_summary
                                     ) : (
@@ -426,7 +551,7 @@ export default function Home() {
                                       Tailwinds
                                     </div>
                                     {p.ai_tailwinds?.length ? (
-                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300">
+                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300 break-words">
                                         {p.ai_tailwinds.slice(0, 8).map((t, i) => (
                                           <li key={i}>{t}</li>
                                         ))}
@@ -442,7 +567,7 @@ export default function Home() {
                                       Risk factors
                                     </div>
                                     {p.ai_risk_factors?.length ? (
-                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300">
+                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300 break-words">
                                         {p.ai_risk_factors.slice(0, 8).map((t, i) => (
                                           <li key={i}>{t}</li>
                                         ))}
@@ -458,7 +583,7 @@ export default function Home() {
                                       Notes
                                     </div>
                                     {p.notes?.length ? (
-                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300">
+                                      <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-zinc-700 dark:text-zinc-300 break-words">
                                         {p.notes.slice(0, 8).map((t, i) => (
                                           <li key={i}>{t}</li>
                                         ))}

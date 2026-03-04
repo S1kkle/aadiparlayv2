@@ -6,6 +6,8 @@ export type Prop = {
   sport: SportId;
   league?: string | null;
   player_name: string;
+  player_position?: string | null;
+  espn_athlete_id?: number | null;
   underdog_player_id?: string | null;
   underdog_option_id: string;
   game_title?: string | null;

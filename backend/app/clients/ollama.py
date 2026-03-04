@@ -15,18 +15,23 @@ class OllamaConfig:
 
 class OllamaClient:
     def __init__(self, cfg: OllamaConfig) -> None:
-        self._cfg = cfg
+        # On some Windows setups, "localhost" resolves to IPv6 ::1 first while Ollama
+        # only listens on 127.0.0.1, causing availability checks to fail.
+        base = (cfg.base_url or "").strip()
+        if "://localhost" in base:
+            base = base.replace("://localhost", "://127.0.0.1")
+        self._cfg = OllamaConfig(base_url=base, model=cfg.model)
 
     async def is_available(self) -> bool:
         url = f"{self._cfg.base_url.rstrip('/')}/api/tags"
         try:
-            async with httpx.AsyncClient(timeout=2) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(url)
                 return resp.status_code == 200
         except Exception:
             return False
 
-    async def analyze_prop(self, *, prompt: str) -> dict[str, Any]:
+    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0) -> dict[str, Any]:
         """
         Calls Ollama chat endpoint expecting strict JSON output.
         """
@@ -53,7 +58,7 @@ class OllamaClient:
             ],
             "options": {"temperature": 0.2},
         }
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
