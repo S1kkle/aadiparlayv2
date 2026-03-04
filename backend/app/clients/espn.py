@@ -356,75 +356,74 @@ class EspnClient:
             if len(fight_refs) >= last_n:
                 break
 
-        sem = asyncio.Semaphore(5)
-
-        async def _process_fight(info: dict[str, str]) -> dict[str, Any] | None:
+        # Process fights sequentially to avoid overwhelming ESPN with parallel requests.
+        results: list[dict[str, Any]] = []
+        for info in fight_refs:
             stats_dict: dict[str, float] = {}
             date_str: str | None = None
             opponent_name: str | None = None
             winner: bool | None = None
 
-            async with sem:
-                # Per-fight stats
-                try:
-                    stats_data = await self._get_json(info["comp_ref"] + "/statistics")
-                    for cat in (stats_data.get("splits", {}).get("categories") or []):
-                        for s in (cat.get("stats") or []):
-                            nm = s.get("name")
-                            val = s.get("value")
-                            if nm and isinstance(val, (int, float)):
-                                stats_dict[nm] = float(val)
-                except Exception:
-                    pass
-
-                # Winner status
-                try:
-                    comp_data = await self._get_json(info["comp_ref"])
-                    winner = comp_data.get("winner")
-                except Exception:
-                    pass
-
-                # Competition detail for date + opponent
-                if info.get("competition_ref"):
-                    try:
-                        detail = await self._get_json(info["competition_ref"])
-                        dr = detail.get("date")
-                        if isinstance(dr, str):
-                            date_str = dr
-                        for c in (detail.get("competitors") or []):
-                            if not isinstance(c, dict):
-                                continue
-                            cid = c.get("id")
-                            try:
-                                cid_int = int(cid) if isinstance(cid, (int, str)) else None
-                            except ValueError:
-                                cid_int = None
-                            if cid_int is not None and cid_int != athlete_id:
-                                ath_ref = (c.get("athlete") or {}).get("$ref")
-                                if isinstance(ath_ref, str):
-                                    try:
-                                        opp = await self._get_json(ath_ref.replace("http://", "https://"))
-                                        opponent_name = opp.get("fullName") or opp.get("displayName")
-                                    except Exception:
-                                        pass
-                                break
-                    except Exception:
-                        pass
+            # Per-fight stats (required — skip fight if this fails)
+            try:
+                stats_url = info["comp_ref"] + "/statistics"
+                stats_data = await self._get_json(stats_url)
+                for cat in (stats_data.get("splits", {}).get("categories") or []):
+                    for s in (cat.get("stats") or []):
+                        nm = s.get("name")
+                        val = s.get("value")
+                        if nm and isinstance(val, (int, float)):
+                            stats_dict[nm] = float(val)
+            except Exception:
+                continue
 
             if not stats_dict:
-                return None
-            return {
+                continue
+
+            # Winner status (optional)
+            try:
+                comp_data = await self._get_json(info["comp_ref"])
+                winner = comp_data.get("winner")
+            except Exception:
+                pass
+
+            # Competition detail for date + opponent (optional)
+            if info.get("competition_ref"):
+                try:
+                    detail = await self._get_json(info["competition_ref"])
+                    dr = detail.get("date")
+                    if isinstance(dr, str):
+                        date_str = dr
+                    for c in (detail.get("competitors") or []):
+                        if not isinstance(c, dict):
+                            continue
+                        cid = c.get("id")
+                        try:
+                            cid_int = int(cid) if isinstance(cid, (int, str)) else None
+                        except ValueError:
+                            cid_int = None
+                        if cid_int is not None and cid_int != athlete_id:
+                            ath_ref = (c.get("athlete") or {}).get("$ref")
+                            if isinstance(ath_ref, str):
+                                try:
+                                    opp = await self._get_json(ath_ref.replace("http://", "https://"))
+                                    opponent_name = opp.get("fullName") or opp.get("displayName")
+                                except Exception:
+                                    pass
+                            break
+                except Exception:
+                    pass
+
+            results.append({
                 "date": date_str,
                 "opponent_name": opponent_name,
                 "winner": winner,
                 "stats": stats_dict,
-            }
+            })
 
-        raw_results = await asyncio.gather(*(_process_fight(f) for f in fight_refs))
-        results = [r for r in raw_results if r is not None]
         results.sort(key=lambda x: x.get("date") or "", reverse=True)
-
-        self._cache.set_json(cache_key, results, ttl_seconds=12 * 60 * 60)
+        if results:
+            self._cache.set_json(cache_key, results, ttl_seconds=12 * 60 * 60)
         return results
 
     async def fetch_mma_career_stats(self, *, athlete_id: int) -> dict[str, float]:
