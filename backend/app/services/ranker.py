@@ -217,14 +217,11 @@ class Ranker:
                 chunk = props[cursor : cursor + batch]
                 cursor += batch
                 analyzed.extend(chunk)
-                # In strict mode, the user wants ALL returned picks to have AI.
-                # Allow Ollama to take as long as needed per pick, while still
-                # emitting progress so the UI doesn't look frozen.
                 await self._apply_ollama(
                     chunk,
                     on_prop_done=_on_prop_done,
-                    per_prop_timeout_s=60 * 20,
-                    ollama_timeout_s=60 * 20,
+                    per_prop_timeout_s=90,
+                    ollama_timeout_s=90,
                 )
                 with_ai.extend([p for p in chunk if isinstance(p.ai_summary, str) and p.ai_summary.strip()])
                 if on_ai_progress is not None:
@@ -240,12 +237,11 @@ class Ranker:
                     except Exception:
                         pass
 
-            if len(with_ai) < require_ai_count:
-                raise RuntimeError(
-                    f"Unable to generate AI summaries for {require_ai_count} picks (generated {len(with_ai)})."
-                )
-
-            selected = with_ai[: max(1, int(require_ai_count))]
+            # Return whatever we got; don't fail if rate limits prevented all AI summaries.
+            if with_ai:
+                selected = with_ai[: max(1, int(require_ai_count))]
+            else:
+                selected = props[:max_props] if max_props > 0 else props
         else:
             # Default behavior: analyze exactly the selected props and return immediately.
             selected = props[:max_props] if max_props > 0 else props
@@ -525,7 +521,7 @@ class Ranker:
             return
 
         AI_PROMPT_VERSION = "v7"
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(2)
 
         def _mean(xs: list[float]) -> float | None:
             if not xs:

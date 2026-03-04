@@ -4,6 +4,7 @@ Use when GROQ_API_KEY is set for always-on hosting without local Ollama.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -67,17 +68,24 @@ class GroqClient:
             "temperature": 0.2,
             "max_tokens": 1024,
         }
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {self._cfg.api_key.strip()}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        headers = {
+            "Authorization": f"Bearer {self._cfg.api_key.strip()}",
+            "Content-Type": "application/json",
+        }
+        max_retries = 3
+        data: dict[str, Any] = {}
+        for attempt in range(max_retries):
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code == 429:
+                    wait = min(2 ** (attempt + 1), 15)
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        else:
+            raise RuntimeError("Groq rate limit (429) after retries")
         choices = data.get("choices") or []
         if not choices:
             raise ValueError("Groq response had no choices")
