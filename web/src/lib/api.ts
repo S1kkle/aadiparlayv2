@@ -1,4 +1,4 @@
-import { RankedPropsResponse, SportId } from "@/lib/types";
+import { HistoryEntry, RankedPropsResponse, SportId } from "@/lib/types";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
@@ -74,5 +74,23 @@ export async function fetchPropsJobResult(jobId: string): Promise<RankedPropsRes
     throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
   }
   return (await res.json()) as RankedPropsResponse;
+}
+
+export async function fetchHistory(): Promise<HistoryEntry[]> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/history", backend).toString(), { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data?.entries ?? []) as HistoryEntry[];
+}
+
+export async function saveHistory(entry: { sport: string; props: any[] }): Promise<void> {
+  const backend = getBackendUrl();
+  await fetch(new URL("/history", backend).toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(entry),
+    cache: "no-store",
+  });
 }
 

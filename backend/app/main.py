@@ -118,13 +118,28 @@ ranker = Ranker(
 
 jobs = PropsJobStore()
 
-async def _warm_nba_league_matchup_cache() -> None:
-    # Precompute league snapshots so the AI can mention "vs league average" deltas quickly.
-    stat_keys = ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]
-    for k in stat_keys:
+async def _warm_league_matchup_caches() -> None:
+    nba_keys = ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]
+    for k in nba_keys:
         try:
             await espn_client.compute_league_allowed_rank_snapshot(
                 sport="basketball", league="nba", stat_key=k, last_n_games=3
+            )
+        except Exception:
+            continue
+    nfl_keys = ["passingYards", "rushingYards", "receivingYards", "receptions", "passingTouchdowns"]
+    for k in nfl_keys:
+        try:
+            await espn_client.compute_league_allowed_rank_snapshot(
+                sport="football", league="nfl", stat_key=k, last_n_games=3
+            )
+        except Exception:
+            continue
+    nhl_keys = ["goals", "assists", "points", "shots"]
+    for k in nhl_keys:
+        try:
+            await espn_client.compute_league_allowed_rank_snapshot(
+                sport="hockey", league="nhl", stat_key=k, last_n_games=3
             )
         except Exception:
             continue
@@ -132,7 +147,7 @@ async def _warm_nba_league_matchup_cache() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    asyncio.create_task(_warm_nba_league_matchup_cache())
+    asyncio.create_task(_warm_league_matchup_caches())
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -165,7 +180,7 @@ async def get_ranked_props(
 @app.post("/cache/clear")
 async def clear_cache() -> dict[str, int | str]:
     deleted = cache.clear()
-    asyncio.create_task(_warm_nba_league_matchup_cache())
+    asyncio.create_task(_warm_league_matchup_caches())
     return {"status": "ok", "deleted": deleted}
 
 
@@ -279,4 +294,24 @@ async def props_job_result(job_id: str):
     if job.status == "error":
         return JSONResponse(status_code=500, content={"status": "error", "error": job.error or "unknown"})
     return job.result
+
+
+import json as _json
+import uuid as _uuid
+
+
+@app.get("/history")
+async def get_history():
+    entries = cache.get_history(limit=30)
+    return {"entries": entries}
+
+
+@app.post("/history")
+async def save_history(req: dict):
+    entry_id = str(_uuid.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+    sport = req.get("sport", "UNKNOWN")
+    props_list = req.get("props", [])
+    cache.save_history(entry_id, timestamp, sport, _json.dumps(props_list, default=str))
+    return {"status": "ok", "id": entry_id}
 

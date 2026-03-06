@@ -23,6 +23,19 @@ export type Prop = {
   recent_games?: { game_date?: string | null; opponent_abbr?: string | null; value: number }[];
   vs_opponent_games?: { game_date?: string | null; opponent_abbr?: string | null; value: number }[];
 
+  // context
+  is_home?: boolean | null;
+  is_b2b?: boolean | null;
+  rest_days?: number | null;
+  avg_minutes?: number | null;
+
+  // trend
+  trend_short_avg?: number | null;
+  trend_direction?: string | null;
+  hit_rate_last10?: number | null;
+  hit_rate_str?: string | null;
+
+  // odds
   american_price?: number | null;
   decimal_price?: number | null;
   model_prob?: number | null;
@@ -31,11 +44,17 @@ export type Prop = {
   ev?: number | null;
   volatility?: number | null;
 
+  // ai
   ai_bias?: number | null;
   ai_confidence?: number | null;
   ai_summary?: string | null;
   ai_tailwinds: string[];
   ai_risk_factors: string[];
+  ai_prob_adjustment?: number | null;
+
+  // derived
+  confidence_tier?: string | null;
+  model_ai_agree?: boolean | null;
 
   score?: number | null;
   notes: string[];
@@ -47,3 +66,9 @@ export type RankedPropsResponse = {
   props: Prop[];
 };
 
+export type HistoryEntry = {
+  id: string;
+  timestamp: string;
+  sport: string;
+  props: Prop[];
+};

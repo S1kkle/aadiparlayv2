@@ -14,7 +14,14 @@ from app.services.underdog_normalizer import (
     american_to_implied_prob as ud_american_to_implied_prob,
     normalize_underdog_over_under_lines,
 )
-from app.services.stat_model import fit_normal, prob_over
+from app.services.stat_model import (
+    NormalParams,
+    bayesian_shrink,
+    fit_normal_weighted,
+    is_low_count_stat,
+    poisson_prob_over,
+    prob_over,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +31,29 @@ class RankerConfig:
     w_ev: float
     w_vol: float
     w_ai: float
+
+
+HOME_ADVANTAGE: dict[str, float] = {
+    "NBA": 0.02,
+    "NFL": 0.02,
+    "NHL": 0.015,
+}
+
+NFL_STAT_KEY_MAP: dict[str, str] = {
+    "passingYards": "passingYards",
+    "rushingYards": "rushingYards",
+    "receivingYards": "receivingYards",
+    "passingTouchdowns": "passingTouchdowns",
+    "receptions": "receptions",
+    "interceptions": "interceptions",
+}
+
+NHL_STAT_KEY_MAP: dict[str, str] = {
+    "goals": "goals",
+    "assists": "assists",
+    "points": "points",
+    "shotsTotal": "shots",
+}
 
 
 def _zscore(values: list[float]) -> list[float]:
@@ -55,6 +85,11 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "blocks": ["blocks"],
             "steals": ["steals"],
             "turnovers": ["turnovers"],
+            "three_pointers_made": ["threePointFieldGoalsMade"],
+            "3_pointers_made": ["threePointFieldGoalsMade"],
+            "3pm": ["threePointFieldGoalsMade"],
+            "free_throws_made": ["freeThrowsMade"],
+            "ftm": ["freeThrowsMade"],
         }
         return mapping.get(raw, []) or mapping.get(s, [])
 
@@ -71,6 +106,9 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "receiving_yards": ["receivingYards"],
             "receiving_touchdowns": ["receivingTouchdowns"],
             "receiving_tds": ["receivingTouchdowns"],
+            "completions": ["completions"],
+            "passing_attempts": ["passingAttempts"],
+            "rushing_attempts": ["rushingAttempts"],
         }
         return mapping.get(raw, []) or mapping.get(s, [])
 
@@ -81,6 +119,9 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "points": ["points"],
             "shots": ["shotsTotal"],
             "shots_on_goal": ["shotsTotal"],
+            "saves": ["saves"],
+            "goals_against": ["goalsAgainst"],
+            "blocked_shots": ["blockedShots"],
         }
         return mapping.get(raw, []) or mapping.get(s, [])
 
@@ -101,6 +142,23 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
         return mapping.get(raw, []) or mapping.get(s, [])
 
     return []
+
+
+def _compute_confidence_tier(p: Prop) -> str:
+    score = 0
+    if p.recent_games and len(p.recent_games) >= 8:
+        score += 1
+    if abs(p.edge or 0) > 0.05:
+        score += 1
+    if p.model_ai_agree:
+        score += 1
+    if p.hit_rate_last10 is not None and p.hit_rate_last10 >= 0.6:
+        score += 1
+    if score >= 3:
+        return "high"
+    if score >= 1:
+        return "medium"
+    return "low"
 
 
 class Ranker:
@@ -131,7 +189,6 @@ class Ranker:
         require_ai_count: int = 10,
         on_ai_progress: Any | None = None,
     ) -> list[Prop]:
-        # cache Underdog pull briefly (their API is rate-limited / geo-gated)
         cache_key = f"underdog:over_under_lines:{scope}"
         payload: dict[str, Any] | None = None
         if not refresh:
@@ -143,10 +200,7 @@ class Ranker:
         props = normalize_underdog_over_under_lines(payload)
         if sport != "UNKNOWN":
             props = [p for p in props if p.sport == sport]
-        # NOTE: Do NOT truncate before scoring.
-        # Underdog often returns props grouped by a game; truncating here biases the result.
 
-        # 1) implied probability from Underdog
         for p in props:
             if p.american_price is None:
                 p.american_price = -110
@@ -155,11 +209,9 @@ class Ranker:
             if p.implied_prob is None:
                 p.implied_prob = ud_american_to_implied_prob(p.american_price)
 
-        # 2) ESPN model probability (when possible)
         if self._espn is not None:
             await self._apply_espn_model(props)
 
-        # fallback for any props we couldn't model
         for p in props:
             if p.model_prob is None:
                 p.model_prob = p.implied_prob
@@ -184,18 +236,25 @@ class Ranker:
         ev_z = _zscore(ev_vals)
         vol_z = _zscore(vol_vals)
 
-        # preliminary score (no AI yet) so we can AI-rank a subset
         z_by_option: dict[str, tuple[float, float, float]] = {}
         for i, p in enumerate(props):
             z_by_option[p.underdog_option_id] = (edge_z[i], ev_z[i], vol_z[i])
             p.score = self._cfg.w_edge * edge_z[i] + self._cfg.w_ev * ev_z[i] - self._cfg.w_vol * vol_z[i]
 
-        # Sort once by statistical score (unbiased by feed order)
         props.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
+
+        # --- Deduplicate over/under for same player+stat (#14) ---
+        seen_player_stat: dict[tuple[str, str], str] = {}
+        deduped: list[Prop] = []
+        for p in props:
+            key = (p.player_name, p.stat)
+            if key not in seen_player_stat:
+                seen_player_stat[key] = p.underdog_option_id
+                deduped.append(p)
+        props = deduped
 
         selected: list[Prop] = []
         if require_ai and self._ollama is not None and ai_limit > 0:
-            # For "All sports", only return props that have ai_summary.
             if not await self._ollama.is_available():
                 raise RuntimeError("Ollama not available.")
 
@@ -237,13 +296,11 @@ class Ranker:
                     except Exception:
                         pass
 
-            # Return whatever we got; don't fail if rate limits prevented all AI summaries.
             if with_ai:
                 selected = with_ai[: max(1, int(require_ai_count))]
             else:
                 selected = props[:max_props] if max_props > 0 else props
         else:
-            # Default behavior: analyze exactly the selected props and return immediately.
             selected = props[:max_props] if max_props > 0 else props
             if self._ollama is not None and ai_limit > 0:
                 await self._apply_ollama(selected)
@@ -252,7 +309,23 @@ class Ranker:
         for p in selected:
             ez, evz, vz = z_by_option.get(p.underdog_option_id, (0.0, 0.0, 0.0))
             ai_signal = float((p.ai_bias or 0) * (p.ai_confidence or 0.0))
-            p.score = self._cfg.w_edge * ez + self._cfg.w_ev * evz - self._cfg.w_vol * vz + self._cfg.w_ai * ai_signal
+            ai_adj = float(p.ai_prob_adjustment or 0.0)
+            p.score = (
+                self._cfg.w_edge * ez
+                + self._cfg.w_ev * evz
+                - self._cfg.w_vol * vz
+                + self._cfg.w_ai * (ai_signal + ai_adj * 3.0)
+            )
+
+            # --- Confidence tier & model-AI agreement (#15, #16) ---
+            model_favorable = (p.edge or 0) > 0
+            if p.ai_bias is not None:
+                ai_favorable = (
+                    (p.side == "over" and p.ai_bias == 1)
+                    or (p.side == "under" and p.ai_bias == -1)
+                )
+                p.model_ai_agree = model_favorable and ai_favorable
+            p.confidence_tier = _compute_confidence_tier(p)
 
         selected.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
         return selected
@@ -352,10 +425,44 @@ class Ranker:
                 p.notes.append("ESPN gamelog has no values for this stat field.")
                 continue
 
-            params = fit_normal(series)
+            # Recency-weighted normal fit (#1)
+            params = fit_normal_weighted(series, decay=0.85)
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN data).")
                 continue
+
+            # Bayesian shrinkage for small samples (#6)
+            if len(series) < 5:
+                shrunk_mu = bayesian_shrink(params.mu, len(series), p.line, shrinkage_k=3.0)
+                params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
+
+            # Opponent adjustment using cached league snapshot (#4)
+            if p.opponent_abbr and p.sport in ("NBA", "NFL", "NHL"):
+                sl = self._espn.sport_league_for_scope(p.sport)
+                if sl:
+                    sport_slug, league_slug = sl
+                    snap_key = field_used or ""
+                    snap = self._espn.get_cached_league_allowed_rank_snapshot(
+                        sport=sport_slug, league=league_slug, stat_key=snap_key, last_n_games=3
+                    )
+                    if isinstance(snap, dict) and snap.get("league_avg") and snap.get("teams"):
+                        league_avg = float(snap["league_avg"])
+                        teams_data = snap.get("teams", {})
+                        opp_upper = p.opponent_abbr.strip().upper()
+                        if isinstance(teams_data, dict) and opp_upper in teams_data:
+                            opp_data = teams_data[opp_upper]
+                            if isinstance(opp_data, dict) and "allowed_avg" in opp_data:
+                                opp_allowed = float(opp_data["allowed_avg"])
+                                if league_avg > 0:
+                                    adj_factor = opp_allowed / league_avg
+                                    params = NormalParams(mu=params.mu * adj_factor, sigma=params.sigma)
+
+            # Home/away adjustment (#5)
+            if p.is_home is not None and p.sport in HOME_ADVANTAGE:
+                ha = HOME_ADVANTAGE[p.sport]
+                factor = 1.0 + ha if p.is_home else 1.0 - ha
+                params = NormalParams(mu=params.mu * factor, sigma=params.sigma)
+
             p.volatility = float(params.sigma)
             p.stat_field = field_used
 
@@ -380,7 +487,44 @@ class Ranker:
                         if "value" in x
                     ]
 
-            p_over = prob_over(line=p.line, params=params)
+            # Trend detection (#2)
+            if len(series) >= 3:
+                short_avg = sum(series[:3]) / 3
+                full_avg = sum(series) / len(series)
+                p.trend_short_avg = round(short_avg, 2)
+                if full_avg > 0:
+                    if short_avg > full_avg * 1.05:
+                        p.trend_direction = "up"
+                    elif short_avg < full_avg * 0.95:
+                        p.trend_direction = "down"
+                    else:
+                        p.trend_direction = "flat"
+
+            # Hit rate
+            hits = sum(1 for v in series if (v > p.line if p.side == "over" else v < p.line))
+            p.hit_rate_last10 = hits / len(series)
+            p.hit_rate_str = f"{hits}/{len(series)}"
+
+            # Average minutes (#9)
+            if p.sport in ("NBA",):
+                mins = self._espn.extract_stat_series(gamelog, field_name="minutes", last_n=self._cfg.last_n)
+                if mins:
+                    p.avg_minutes = round(sum(mins) / len(mins), 1)
+
+            # B2B / rest days detection (#8)
+            if p.scheduled_at and p.recent_games:
+                last_game = p.recent_games[0].game_date
+                if last_game:
+                    diff = p.scheduled_at - last_game
+                    days = diff.days
+                    p.rest_days = max(0, days)
+                    p.is_b2b = (days <= 1)
+
+            # Model probability — Poisson for low-count stats (#3), normal otherwise
+            if is_low_count_stat(field_used):
+                p_over = poisson_prob_over(line=p.line, lam=params.mu)
+            else:
+                p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
     async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
@@ -442,14 +586,20 @@ class Ranker:
                 p.notes.append("ESPN fight history has no values for this stat field.")
                 continue
 
-            params = fit_normal(series)
+            # Recency-weighted fit (#1)
+            params = fit_normal_weighted(series, decay=0.85)
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN MMA data).")
                 continue
+
+            # Bayesian shrinkage for small MMA samples (#6)
+            if len(series) < 5:
+                shrunk_mu = bayesian_shrink(params.mu, len(series), p.line, shrinkage_k=3.0)
+                params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
+
             p.volatility = float(params.sigma)
             p.stat_field = field_used
 
-            # Build recent_games from fight history (opponent_abbr = opponent name for MMA)
             p.recent_games = []
             for f in fights:
                 date_str = f.get("date")
@@ -467,7 +617,6 @@ class Ranker:
                         value=float(stat_val),
                     ))
 
-            # Vs-opponent: find previous fights against the same opponent
             if p.opponent_abbr:
                 opp_canon = _canon_name(p.opponent_abbr)
                 for f in fights:
@@ -490,7 +639,6 @@ class Ranker:
                                 value=float(stat_val),
                             ))
 
-            # Store career stats on prop for AI context later
             career = career_stats_by_name.get(p.player_name, {})
             if career:
                 p.notes.append(
@@ -501,7 +649,29 @@ class Ranker:
                     f"SubAvg={career.get('submissionAvg', 'N/A')}"
                 )
 
-            p_over = prob_over(line=p.line, params=params)
+            # Trend detection (#2)
+            if len(series) >= 3:
+                short_avg = sum(series[:3]) / 3
+                full_avg = sum(series) / len(series)
+                p.trend_short_avg = round(short_avg, 2)
+                if full_avg > 0:
+                    if short_avg > full_avg * 1.05:
+                        p.trend_direction = "up"
+                    elif short_avg < full_avg * 0.95:
+                        p.trend_direction = "down"
+                    else:
+                        p.trend_direction = "flat"
+
+            # Hit rate
+            hits = sum(1 for v in series if (v > p.line if p.side == "over" else v < p.line))
+            p.hit_rate_last10 = hits / len(series)
+            p.hit_rate_str = f"{hits}/{len(series)}"
+
+            # Poisson for low-count MMA stats (#3)
+            if is_low_count_stat(field_used):
+                p_over = poisson_prob_over(line=p.line, lam=params.mu)
+            else:
+                p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
     async def _apply_ollama(
@@ -520,7 +690,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v7"
+        AI_PROMPT_VERSION = "v8"
         sem = asyncio.Semaphore(2)
 
         def _mean(xs: list[float]) -> float | None:
@@ -538,17 +708,14 @@ class Ranker:
             return hits / len(values)
 
         async def _mma_matchup_lines(p: Prop) -> list[str]:
-            """MMA-specific matchup context using fighter career stats & opponent data."""
             out: list[str] = []
             assert self._espn is not None
 
-            # Fighter's own career stats (from notes)
             for note in p.notes:
                 if note.startswith("Career:"):
                     out.append(f"Fighter ({p.player_name}) {note}")
                     break
 
-            # Try to fetch opponent career stats
             if p.opponent_abbr:
                 try:
                     opp_aid = await self._espn.find_mma_athlete_id(full_name=p.opponent_abbr)
@@ -564,7 +731,6 @@ class Ranker:
                                 f"SubAvg={opp_career.get('submissionAvg', 'N/A')}"
                             )
 
-                        # Get opponent's recent fight history for the specific stat
                         opp_fights = await self._espn.fetch_mma_fight_history(
                             athlete_id=opp_aid, last_n=5,
                         )
@@ -583,7 +749,6 @@ class Ranker:
                 except Exception:
                     pass
 
-            # Fighter's own win-rate context from recent fights
             recent = p.recent_games or []
             if recent:
                 out.append(f"Fighter has data from {len(recent)} recent fights for {p.stat_field}.")
@@ -591,13 +756,9 @@ class Ranker:
             return out
 
         async def _matchup_lines(p: Prop) -> list[str]:
-            """
-            Adds opponent defense context, using ESPN boxscores.
-            Designed to be best-effort and fast; runs only for selected props.
-            """
             if p.sport == "MMA":
                 return await _mma_matchup_lines(p)
-            if p.sport != "NBA":
+            if p.sport not in ("NBA", "NFL", "NHL"):
                 return []
             if not p.opponent_abbr:
                 return []
@@ -606,25 +767,31 @@ class Ranker:
                 return []
             sport_slug, league_slug = sl
 
-            # Map our prop stat to ESPN team-total stat keys.
-            # These keys match summary.boxscore.teams[*].statistics[*].name
-            stat_key = None
-            if p.stat_field in ("assists", "blocks", "steals", "turnovers", "totalRebounds", "points"):
-                stat_key = p.stat_field
-            else:
-                s = p.stat.strip().lower()
-                if s == "points":
-                    stat_key = "points"
-                elif s == "assists":
-                    stat_key = "assists"
-                elif s == "rebounds":
-                    stat_key = "totalRebounds"
-                elif s == "blocks":
-                    stat_key = "blocks"
-                elif s == "steals":
-                    stat_key = "steals"
-                elif s == "turnovers":
-                    stat_key = "turnovers"
+            # Map prop stat to team-total stat key for opponent defense context
+            stat_key: str | None = None
+            if p.sport == "NBA":
+                if p.stat_field in ("assists", "blocks", "steals", "turnovers", "totalRebounds", "points"):
+                    stat_key = p.stat_field
+                else:
+                    s = p.stat.strip().lower()
+                    nba_map = {"points": "points", "assists": "assists", "rebounds": "totalRebounds",
+                               "blocks": "blocks", "steals": "steals", "turnovers": "turnovers"}
+                    stat_key = nba_map.get(s)
+            elif p.sport == "NFL":
+                stat_key = NFL_STAT_KEY_MAP.get(p.stat_field or "")
+                if not stat_key:
+                    s = p.stat.strip().lower()
+                    nfl_map = {"passing_yards": "passingYards", "rushing_yards": "rushingYards",
+                               "receiving_yards": "receivingYards", "receptions": "receptions",
+                               "passing_touchdowns": "passingTouchdowns"}
+                    stat_key = nfl_map.get(s) or nfl_map.get(re.sub(r"[^a-z0-9]+", "_", s).strip("_"))
+            elif p.sport == "NHL":
+                stat_key = NHL_STAT_KEY_MAP.get(p.stat_field or "")
+                if not stat_key:
+                    s = p.stat.strip().lower()
+                    nhl_map = {"goals": "goals", "assists": "assists", "points": "points",
+                               "shots": "shots", "shots_on_goal": "shots"}
+                    stat_key = nhl_map.get(s) or nhl_map.get(re.sub(r"[^a-z0-9]+", "_", s).strip("_"))
 
             if not stat_key:
                 return []
@@ -642,8 +809,6 @@ class Ranker:
                 opp_allowed = None
 
             if isinstance(opp_allowed, (int, float)):
-                # League-relative snapshot is expensive to compute from scratch.
-                # Only use it if it's already cached; otherwise, skip league context to keep /props fast.
                 snap = self._espn.get_cached_league_allowed_rank_snapshot(
                     sport=sport_slug, league=league_slug, stat_key=stat_key, last_n_games=3
                 )
@@ -681,9 +846,8 @@ class Ranker:
                     else:
                         out.append(f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5).")
 
-            # Position-split estimate (NBA only) when we have a position.
-            # For rebounds props, Underdog is player REB; ESPN player key is 'rebounds' not 'totalRebounds'.
-            if p.player_position and p.player_position.strip():
+            # Position-split for NBA
+            if p.sport == "NBA" and p.player_position and p.player_position.strip():
                 pos = p.player_position.strip().upper()
                 player_stat_key = None
                 if stat_key == "totalRebounds":
@@ -717,7 +881,6 @@ class Ranker:
                 self._apply_ai_to_prop(p, cached)
                 return
 
-            # Injury context (team + opponent) from ESPN league injuries
             sl = self._espn.sport_league_for_scope(p.sport)
             team_inj: list[str] = []
             opp_inj: list[str] = []
@@ -775,17 +938,41 @@ class Ranker:
                 recent_label = "Recent games (most recent first):"
                 vs_label = "Vs this opponent (current season, if available):"
 
+            # Enriched context lines (#10, #13)
+            context_extras: list[str] = []
+            if p.is_home is not None:
+                context_extras.append(f"Venue: {'HOME' if p.is_home else 'AWAY'}")
+            if p.is_b2b:
+                context_extras.append("Schedule: BACK-TO-BACK (2nd game in 2 days)")
+            elif p.rest_days is not None and p.rest_days >= 3:
+                context_extras.append(f"Schedule: {p.rest_days} days rest (well-rested)")
+            if p.avg_minutes is not None:
+                context_extras.append(f"Avg minutes (last {self._cfg.last_n}): {p.avg_minutes}")
+            if p.trend_direction and p.trend_short_avg is not None:
+                context_extras.append(
+                    f"Trend: {p.trend_direction.upper()} (last3 avg {p.trend_short_avg} vs overall avg {last10_avg:.1f})"
+                    if last10_avg is not None else f"Trend: {p.trend_direction.upper()} (last3 avg {p.trend_short_avg})"
+                )
+            if p.hit_rate_str:
+                context_extras.append(f"Hit rate vs line: {p.hit_rate_str} ({p.side} {p.line})")
+
+            context_extras_str = "\n".join(f"- {x}" for x in context_extras) if context_extras else "- none"
+
             prompt = (
                 "Analyze an Underdog Pick'em prop.\n"
                 "Write a concise, logically-reasoned summary that weighs matchup context and recent form.\n"
                 "Rules:\n"
                 + sport_rules
                 + "- Cite at least two numbers from the stats context.\n"
-                "- Do NOT just restate model_prob/edge; explain *why*.\n\n"
+                "- Do NOT just restate model_prob/edge; explain *why*.\n"
+                "- Consider trend direction, home/away, rest, and hit rate when forming your analysis.\n\n"
                 f"Sport: {p.sport}\n"
                 f"{context_label}\n"
                 f"Pick: {p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
                 f"ESPN_field_used: {p.stat_field}\n\n"
+                "SITUATIONAL_CONTEXT:\n"
+                + context_extras_str
+                + "\n\n"
                 "MATCHUP_CONTEXT (ESPN-derived; best-effort):\n"
                 + ("\n".join([f"- {x}" for x in matchup]) if matchup else "- none")
                 + "\n\n"
@@ -869,9 +1056,10 @@ class Ranker:
         conf = result.get("confidence")
         tailwinds = result.get("tailwinds")
         risks = result.get("risk_factors")
+        prob_adj = result.get("prob_adjustment")
 
         if isinstance(summary, str) and summary.strip():
-            p.ai_summary = summary.strip()[:500]
+            p.ai_summary = summary.strip()[:1000]
         if isinstance(bias, int) and bias in (-1, 0, 1):
             p.ai_bias = bias
         if isinstance(conf, (int, float)):
@@ -880,4 +1068,5 @@ class Ranker:
             p.ai_tailwinds = [str(x) for x in tailwinds if str(x).strip()][:8]
         if isinstance(risks, list):
             p.ai_risk_factors = [str(x) for x in risks if str(x).strip()][:8]
-
+        if isinstance(prob_adj, (int, float)):
+            p.ai_prob_adjustment = max(-0.15, min(0.15, float(prob_adj)))

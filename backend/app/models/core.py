@@ -60,6 +60,18 @@ class Prop(BaseModel):
     recent_games: list[GameStat] = Field(default_factory=list)
     vs_opponent_games: list[GameStat] = Field(default_factory=list)
 
+    # context
+    is_home: bool | None = None
+    is_b2b: bool | None = None
+    rest_days: int | None = None
+    avg_minutes: float | None = None
+
+    # trend
+    trend_short_avg: float | None = None  # last 3 game average
+    trend_direction: str | None = None  # "up" | "down" | "flat"
+    hit_rate_last10: float | None = None  # fraction 0..1
+    hit_rate_str: str | None = None  # e.g. "7/10"
+
     # odds/prices
     american_price: int | None = None
     decimal_price: float | None = None
@@ -77,6 +89,11 @@ class Prop(BaseModel):
     ai_summary: str | None = None
     ai_tailwinds: list[str] = Field(default_factory=list)
     ai_risk_factors: list[str] = Field(default_factory=list)
+    ai_prob_adjustment: float | None = None  # e.g. +0.05 or -0.03
+
+    # derived
+    confidence_tier: str | None = None  # "high" | "medium" | "low"
+    model_ai_agree: bool | None = None
 
     # final
     score: float | None = None

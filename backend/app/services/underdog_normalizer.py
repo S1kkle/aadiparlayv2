@@ -131,6 +131,12 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     except ValueError:
                         scheduled_at = None
 
+        # Determine home/away from the title split
+        is_home: bool | None = None
+        if team_abbr and isinstance(abbr_title, str) and "@" in abbr_title:
+            _away, _home = [p.strip() for p in abbr_title.split("@", 1)]
+            is_home = (team_abbr == _home)
+
         player_name: str | None = None
         underdog_player_id: str | None = None
         if player:
@@ -177,6 +183,7 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     scheduled_at=scheduled_at,
                     team_abbr=team_abbr,
                     opponent_abbr=opp_abbr,
+                    is_home=is_home,
                     stat=str(stat),
                     display_stat=str(display_stat) if display_stat else None,
                     line=float(line_value),

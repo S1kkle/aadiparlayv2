@@ -78,3 +78,41 @@ class SqliteTTLCache:
                 conn.commit()
                 return int(cur.rowcount or 0)
 
+    def _ensure_history_table(self) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS prediction_history (
+                      id TEXT PRIMARY KEY,
+                      timestamp TEXT NOT NULL,
+                      sport TEXT NOT NULL,
+                      props_json TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+
+    def save_history(self, entry_id: str, timestamp: str, sport: str, props_json: str) -> None:
+        self._ensure_history_table()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO prediction_history(id, timestamp, sport, props_json) VALUES(?, ?, ?, ?)",
+                    (entry_id, timestamp, sport, props_json),
+                )
+                conn.commit()
+
+    def get_history(self, limit: int = 30) -> list[dict[str, Any]]:
+        self._ensure_history_table()
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, timestamp, sport, props_json FROM prediction_history ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [
+                    {"id": r["id"], "timestamp": r["timestamp"], "sport": r["sport"], "props": json.loads(r["props_json"])}
+                    for r in rows
+                ]
+
