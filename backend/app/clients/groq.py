@@ -15,7 +15,7 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 SYSTEM_JSON = (
     "You are a sports prop analyst. "
     "Return ONLY valid JSON with keys: "
-    "summary (string), overall_bias (-1|0|1), confidence (0..1), "
+    "summary (string), overall_bias (-1|0|1 where 1 = FAVORS the pick direction given, -1 = AGAINST the pick direction given, 0 = neutral), confidence (0..1), "
     "prob_adjustment (float between -0.15 and +0.15, your estimated shift to the model probability "
     "based on qualitative factors like injuries, matchup, trend, rest — e.g. +0.05 means 5% more likely), "
     "tailwinds (string[]), risk_factors (string[]). "

@@ -318,13 +318,10 @@ class Ranker:
             )
 
             # --- Confidence tier & model-AI agreement (#15, #16) ---
+            # bias=1 now means "favors the pick direction", so agreement = positive edge + bias=1
             model_favorable = (p.edge or 0) > 0
             if p.ai_bias is not None:
-                ai_favorable = (
-                    (p.side == "over" and p.ai_bias == 1)
-                    or (p.side == "under" and p.ai_bias == -1)
-                )
-                p.model_ai_agree = model_favorable and ai_favorable
+                p.model_ai_agree = model_favorable and p.ai_bias == 1
             p.confidence_tier = _compute_confidence_tier(p)
 
         selected.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
@@ -690,7 +687,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v8"
+        AI_PROMPT_VERSION = "v9"
         sem = asyncio.Semaphore(2)
 
         def _mean(xs: list[float]) -> float | None:

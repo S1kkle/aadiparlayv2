@@ -46,8 +46,8 @@ function fmtVal(x: unknown) {
 }
 
 function biasLabel(bias: number | null | undefined) {
-  if (bias === 1) return "Lean OVER";
-  if (bias === -1) return "Lean UNDER";
+  if (bias === 1) return "Favors pick";
+  if (bias === -1) return "Against pick";
   if (bias === 0) return "Neutral";
   return "—";
 }
