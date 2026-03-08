@@ -298,15 +298,34 @@ class Ranker:
 
         selected: list[Prop] = []
         if require_ai and self._ollama is not None and ai_limit > 0:
-            await _emit_stage("ai", f"Starting AI analysis for top {require_ai_count} props...")
             if not await self._ollama.is_available():
                 raise RuntimeError("Ollama not available.")
 
-            analyzed: list[Prop] = []
-            with_ai: list[Prop] = []
-            cursor = 0
-            batch = max(10, int(max_props))
+            # --- Step 1: AI selection — let AI pick the best N from top candidates ---
+            candidate_pool = props[:min(40, len(props))]
+            await _emit_stage("ai_select", f"AI selecting best {require_ai_count} from {len(candidate_pool)} candidates...")
 
+            ai_selected_indices = await self._ai_select_props(
+                candidate_pool, pick_count=require_ai_count
+            )
+
+            ai_picks: list[Prop] = []
+            if ai_selected_indices:
+                for idx in ai_selected_indices:
+                    if 0 <= idx < len(candidate_pool):
+                        ai_picks.append(candidate_pool[idx])
+            if len(ai_picks) < require_ai_count:
+                used_ids = {p.underdog_option_id for p in ai_picks}
+                for p in candidate_pool:
+                    if p.underdog_option_id not in used_ids:
+                        ai_picks.append(p)
+                        used_ids.add(p.underdog_option_id)
+                        if len(ai_picks) >= require_ai_count:
+                            break
+
+            await _emit_stage("ai", f"Running deep analysis on {len(ai_picks)} AI-selected props...")
+
+            # --- Step 2: Full AI analysis on AI-selected props only ---
             async def _on_prop_done(p: Prop) -> None:
                 if on_ai_progress is None:
                     return
@@ -316,34 +335,27 @@ class Ranker:
                 except Exception:
                     return
 
-            while cursor < len(props) and len(with_ai) < require_ai_count:
-                chunk = props[cursor : cursor + batch]
-                cursor += batch
-                analyzed.extend(chunk)
-                await self._apply_ollama(
-                    chunk,
-                    on_prop_done=_on_prop_done,
-                    per_prop_timeout_s=90,
-                    ollama_timeout_s=90,
-                )
-                with_ai.extend([p for p in chunk if isinstance(p.ai_summary, str) and p.ai_summary.strip()])
-                if on_ai_progress is not None:
-                    try:
-                        await on_ai_progress(
-                            {
-                                "type": "ai_batch",
-                                "analyzed": len(analyzed),
-                                "have_ai": len(with_ai),
-                                "need_ai": int(require_ai_count),
-                            }
-                        )
-                    except Exception:
-                        pass
+            await self._apply_ollama(
+                ai_picks,
+                on_prop_done=_on_prop_done,
+                per_prop_timeout_s=90,
+                ollama_timeout_s=90,
+            )
 
-            if with_ai:
-                selected = with_ai[: max(1, int(require_ai_count))]
-            else:
-                selected = props[:max_props] if max_props > 0 else props
+            if on_ai_progress is not None:
+                try:
+                    have_ai = sum(1 for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip())
+                    await on_ai_progress({
+                        "type": "ai_batch",
+                        "analyzed": len(ai_picks),
+                        "have_ai": have_ai,
+                        "need_ai": int(require_ai_count),
+                    })
+                except Exception:
+                    pass
+
+            with_ai = [p for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip()]
+            selected = with_ai if with_ai else ai_picks
         else:
             selected = props[:max_props] if max_props > 0 else props
             if self._ollama is not None and ai_limit > 0:
@@ -444,6 +456,81 @@ class Ranker:
                 math.prod(p.model_prob or 0.5 for p in selected_props), 6
             ) if selected_props else 0.0,
         }
+
+    async def _ai_select_props(
+        self,
+        candidates: list[Prop],
+        *,
+        pick_count: int = 10,
+    ) -> list[int]:
+        """Ask AI to pick the best N props from a candidate list. Returns 0-indexed indices."""
+        assert self._ollama is not None
+
+        lines: list[str] = []
+        for i, p in enumerate(candidates):
+            lines.append(
+                f"{i+1}. {p.player_name} ({p.sport} {p.team_abbr or '?'} vs {p.opponent_abbr or '?'}) | "
+                f"{p.side.upper()} {p.line} {p.display_stat or p.stat} | "
+                f"model={p.model_prob:.3f} impl={p.implied_prob:.3f} edge={p.edge:+.3f} "
+                f"hit={p.hit_rate_str or '?'} trend={p.trend_direction or '?'} "
+                f"streak={p.current_streak or 0} consistency={p.stat_consistency or '?'} "
+                f"median={p.stat_median or '?'} floor={p.stat_floor or '?'} ceil={p.stat_ceiling or '?'} "
+                f"{'HOME' if p.is_home else 'AWAY' if p.is_home is not None else '?'} "
+                f"{'B2B' if p.is_b2b else f'{p.rest_days}d rest' if p.rest_days else ''}"
+            )
+
+        prompt = (
+            f"You are selecting the best {pick_count} prop picks from the following {len(candidates)} candidates.\n"
+            f"Each candidate has been ranked by a statistical model. Your job is to apply qualitative reasoning\n"
+            f"to select the {pick_count} picks with the highest realistic chance of hitting.\n\n"
+            "CONSIDER:\n"
+            "- Positive edge (model_prob > implied_prob) is good but not everything\n"
+            "- High hit rate and consistency = reliable\n"
+            "- Hot streaks may continue short-term; cold streaks may mean something is off\n"
+            "- Matchup matters: home vs away, back-to-back, rest days\n"
+            "- Floor/ceiling: a player whose floor is near the line is safer\n"
+            "- Diversify across games/sports when possible\n"
+            "- Avoid props where the line is far above the player's median/ceiling\n\n"
+            "CANDIDATES:\n"
+            + "\n".join(lines)
+            + "\n\n"
+            f"Return ONLY valid JSON: {{\"picks\": [list of {pick_count} candidate numbers (1-indexed)], "
+            f"\"reasoning\": \"brief 2-3 sentence explanation of your selection strategy\"}}"
+        )
+
+        select_system = (
+            "You are a sports prop selection expert. "
+            "Return ONLY valid JSON with keys: picks (array of integers), reasoning (string). "
+            "Pick the candidates most likely to hit based on the statistical profile and situational context."
+        )
+
+        cache_key = f"ai_select:{pick_count}:" + ":".join(
+            p.underdog_option_id for p in candidates[:10]
+        )
+        cached = self._cache.get_json(cache_key)
+        if isinstance(cached, dict) and cached.get("picks"):
+            raw = cached["picks"]
+            if isinstance(raw, list):
+                return [int(x) - 1 for x in raw if isinstance(x, (int, float)) and 1 <= int(x) <= len(candidates)]
+
+        try:
+            result = await self._ollama.analyze_prop(
+                prompt=prompt, timeout_s=60, system=select_system
+            )
+            self._cache.set_json(cache_key, result, ttl_seconds=10 * 60)
+        except Exception:
+            return list(range(min(pick_count, len(candidates))))
+
+        raw_picks = result.get("picks", [])
+        if isinstance(raw_picks, list):
+            indices = []
+            for x in raw_picks:
+                if isinstance(x, (int, float)) and 1 <= int(x) <= len(candidates):
+                    indices.append(int(x) - 1)
+            if indices:
+                return indices[:pick_count]
+
+        return list(range(min(pick_count, len(candidates))))
 
     async def _apply_espn_model(self, props: list[Prop]) -> None:
         assert self._espn is not None

@@ -507,6 +507,7 @@ export default function Home() {
                   {jobProgress.stage === "espn" && (jobProgress.detail || "Loading ESPN player data...")}
                   {jobProgress.stage === "rank" && (jobProgress.detail || "Computing statistical model...")}
                   {jobProgress.stage === "starting" && "Initializing..."}
+                  {jobProgress.stage === "ai_select" && (jobProgress.detail || "AI selecting best picks...")}
                   {jobProgress.stage === "ai" && (
                     <>
                       Generating AI summaries:{" "}
@@ -515,7 +516,7 @@ export default function Home() {
                       </span>
                     </>
                   )}
-                  {!["fetch", "espn", "rank", "starting", "ai"].includes(jobProgress.stage) && (
+                  {!["fetch", "espn", "rank", "starting", "ai_select", "ai"].includes(jobProgress.stage) && (
                     jobProgress.detail || jobProgress.stage
                   )}
                 </div>
@@ -523,8 +524,8 @@ export default function Home() {
 
               {/* Stage steps */}
               <div className="mt-3 flex items-center gap-1">
-                {["fetch", "espn", "rank", "ai"].map((s, i) => {
-                  const stages = ["fetch", "espn", "rank", "ai"];
+                {["fetch", "espn", "rank", "ai_select", "ai"].map((s, i) => {
+                  const stages = ["fetch", "espn", "rank", "ai_select", "ai"];
                   const currentIdx = stages.indexOf(jobProgress.stage);
                   const isDone = i < currentIdx;
                   const isCurrent = i === currentIdx;
@@ -543,7 +544,8 @@ export default function Home() {
                 <span>Fetch</span>
                 <span>ESPN</span>
                 <span>Model</span>
-                <span>AI</span>
+                <span>AI Pick</span>
+                <span>AI Analyze</span>
               </div>
 
               {/* AI progress bar (only show when in AI stage) */}
