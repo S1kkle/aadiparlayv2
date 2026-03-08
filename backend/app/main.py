@@ -315,3 +315,95 @@ async def save_history(req: dict):
     cache.save_history(entry_id, timestamp, sport, _json.dumps(props_list, default=str))
     return {"status": "ok", "id": entry_id}
 
+
+@app.get("/debug/mma/{fighter_name}")
+async def debug_mma(fighter_name: str):
+    """Trace MMA pipeline step-by-step for debugging."""
+    trace: dict = {"fighter": fighter_name, "steps": []}
+
+    # Step 1: find athlete ID
+    aid = await espn_client.find_mma_athlete_id(full_name=fighter_name)
+    trace["steps"].append({"step": "find_mma_athlete_id", "result": aid})
+    if aid is None:
+        trace["error"] = "Athlete not found"
+        return trace
+
+    # Step 2: fetch eventlog raw
+    eventlog_url = f"{espn_client._cfg.core_api_base}/v2/sports/mma/athletes/{aid}/eventlog"
+    try:
+        eventlog = await espn_client._get_json(eventlog_url)
+        items = (eventlog.get("events") or {}).get("items") or []
+        trace["steps"].append({
+            "step": "eventlog",
+            "total_items": len(items),
+            "played_items": sum(1 for i in items if isinstance(i, dict) and i.get("played")),
+            "first_3_items": [
+                {
+                    "played": i.get("played"),
+                    "has_competitor_ref": bool((i.get("competitor") or {}).get("$ref")),
+                    "has_competition_ref": bool((i.get("competition") or {}).get("$ref")),
+                    "competitor_ref_preview": str((i.get("competitor") or {}).get("$ref", ""))[:120],
+                }
+                for i in items[:3]
+                if isinstance(i, dict)
+            ],
+        })
+    except Exception as e:
+        trace["steps"].append({"step": "eventlog", "error": str(e)})
+        return trace
+
+    # Step 3: try first played fight's stats
+    played = [i for i in items if isinstance(i, dict) and i.get("played")]
+    if not played:
+        trace["steps"].append({"step": "stats", "error": "no played items"})
+        return trace
+
+    first = played[0]
+    comp_ref = ((first.get("competitor") or {}).get("$ref") or "").replace("http://", "https://")
+    stats_url = comp_ref + "/statistics"
+    trace["steps"].append({"step": "stats_url", "url": stats_url[:200]})
+
+    try:
+        stats_data = await espn_client._get_json(stats_url)
+        splits = stats_data.get("splits") or {}
+        cats = splits.get("categories") or []
+        all_stats: dict = {}
+        for cat in cats:
+            for s in (cat.get("stats") or []):
+                nm = s.get("name")
+                val = s.get("value")
+                if nm:
+                    all_stats[nm] = val
+        trace["steps"].append({
+            "step": "stats_parse",
+            "raw_keys": list(stats_data.keys())[:10],
+            "splits_keys": list(splits.keys())[:10],
+            "num_categories": len(cats),
+            "parsed_stats": all_stats,
+        })
+    except Exception as e:
+        trace["steps"].append({"step": "stats_fetch", "error": str(e), "url": stats_url[:200]})
+
+    # Step 4: full fight history
+    try:
+        fights = await espn_client.fetch_mma_fight_history(athlete_id=aid, last_n=10)
+        trace["steps"].append({
+            "step": "fight_history",
+            "count": len(fights),
+            "fights": [
+                {"date": f.get("date"), "opp": f.get("opponent_name"), "stats_keys": list(f.get("stats", {}).keys())}
+                for f in fights[:3]
+            ],
+        })
+    except Exception as e:
+        trace["steps"].append({"step": "fight_history", "error": str(e)})
+
+    # Step 5: career stats
+    try:
+        career = await espn_client.fetch_mma_career_stats(athlete_id=aid)
+        trace["steps"].append({"step": "career_stats", "stats": career})
+    except Exception as e:
+        trace["steps"].append({"step": "career_stats", "error": str(e)})
+
+    return trace
+
