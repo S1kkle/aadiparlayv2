@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 import httpx
 
@@ -18,6 +18,13 @@ EspnSport = Literal["basketball", "football", "hockey", "mma"]
 
 def _canon_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", name.strip().lower()).strip()
+
+
+def _append_path(ref_url: str, suffix: str) -> str:
+    """Append a path segment to an ESPN $ref URL, inserting before query params."""
+    parts = urlsplit(ref_url)
+    new_path = parts.path.rstrip("/") + suffix
+    return urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
 
 
 @dataclass(frozen=True)
@@ -366,7 +373,7 @@ class EspnClient:
 
             # Per-fight stats (required — skip fight if this fails)
             try:
-                stats_url = info["comp_ref"] + "/statistics"
+                stats_url = _append_path(info["comp_ref"], "/statistics")
                 stats_data = await self._get_json(stats_url)
                 for cat in (stats_data.get("splits", {}).get("categories") or []):
                     for s in (cat.get("stats") or []):
