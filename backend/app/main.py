@@ -379,6 +379,78 @@ async def recommend_parlay(req: dict):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.get("/debug/player/{sport}/{player_name}")
+async def debug_player(sport: str, player_name: str):
+    """Trace player data pipeline for debugging stale/missing data."""
+    trace: dict = {"player": player_name, "sport": sport, "steps": []}
+    sl = espn_client.sport_league_for_scope(sport.upper())
+    if sl is None:
+        trace["error"] = f"Unknown sport: {sport}"
+        return trace
+    sport_slug, league_slug = sl
+
+    aid = await espn_client.find_best_athlete_id(
+        sport=sport_slug, league=league_slug, full_name=player_name
+    )
+    trace["steps"].append({"step": "find_athlete", "athlete_id": aid})
+    if aid is None:
+        trace["error"] = "Athlete not found via search"
+        return trace
+
+    try:
+        gamelog = await espn_client.fetch_gamelog(
+            sport=sport_slug, league=league_slug, athlete_id=aid
+        )
+        names = gamelog.get("names", [])
+        season_types = gamelog.get("seasonTypes", [])
+        event_count = 0
+        first_events: list[dict] = []
+        if season_types:
+            st0 = season_types[0] if isinstance(season_types[0], dict) else {}
+            for cat in (st0.get("categories") or []):
+                evts = cat.get("events") or []
+                event_count += len(evts)
+                for ev in evts[:3]:
+                    if isinstance(ev, dict):
+                        first_events.append({
+                            "stats_len": len(ev.get("stats", [])),
+                            "stats_preview": (ev.get("stats") or [])[:6],
+                            "eventId": ev.get("eventId"),
+                        })
+
+        events_meta = gamelog.get("events", {})
+        event_dates: list[str] = []
+        if isinstance(events_meta, dict):
+            for eid, emeta in list(events_meta.items())[:5]:
+                if isinstance(emeta, dict):
+                    gd = emeta.get("gameDate")
+                    opp = emeta.get("opponent", {}).get("abbreviation") if isinstance(emeta.get("opponent"), dict) else None
+                    event_dates.append(f"{eid}: {gd} vs {opp}")
+
+        trace["steps"].append({
+            "step": "gamelog",
+            "names_count": len(names),
+            "names_sample": names[:10],
+            "season_types_count": len(season_types),
+            "total_events": event_count,
+            "first_events": first_events,
+            "recent_event_dates": event_dates,
+        })
+    except Exception as e:
+        trace["steps"].append({"step": "gamelog", "error": str(e)})
+
+    stat_fields = ["points", "assists", "totalRebounds", "blocks", "steals"]
+    for field in stat_fields:
+        try:
+            series = espn_client.extract_stat_series(gamelog, field_name=field, last_n=5)
+            if series:
+                trace["steps"].append({"step": f"series_{field}", "values": series})
+        except Exception:
+            pass
+
+    return trace
+
+
 @app.get("/debug/mma/{fighter_name}")
 async def debug_mma(fighter_name: str):
     """Trace MMA pipeline step-by-step for debugging."""

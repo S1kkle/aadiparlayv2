@@ -918,15 +918,47 @@ class EspnClient:
         self._cache.set_json(cache_key, {"athletes": athletes_list}, ttl_seconds=6 * 60 * 60)
         return athletes_list
 
+    def _current_espn_season(self, sport: EspnSport) -> int:
+        """ESPN season year for the current campaign (NBA 2025-26 season = 2026)."""
+        now = datetime.now()
+        if sport == "basketball":
+            return now.year + 1 if now.month >= 10 else now.year
+        if sport == "hockey":
+            return now.year + 1 if now.month >= 9 else now.year
+        if sport == "football":
+            return now.year + 1 if now.month >= 8 else now.year
+        return now.year
+
     async def fetch_gamelog(self, *, sport: EspnSport, league: EspnLeague, athlete_id: int) -> dict[str, Any]:
-        cache_key = f"espn:gamelog:{sport}:{league}:{athlete_id}"
+        season = self._current_espn_season(sport)
+        cache_key = f"espn:gamelog:v3:{sport}:{league}:{athlete_id}:{season}"
         cached = self._cache.get_json(cache_key)
         if isinstance(cached, dict) and cached:
             return cached
 
-        url = f"{self._cfg.site_web_api_base}/apis/common/v3/sports/{sport}/{league}/athletes/{athlete_id}/gamelog"
-        data = await self._get_json(url)
-        self._cache.set_json(cache_key, data, ttl_seconds=6 * 60 * 60)
+        url = (
+            f"{self._cfg.site_web_api_base}/apis/common/v3/sports/{sport}/{league}"
+            f"/athletes/{athlete_id}/gamelog?season={season}"
+        )
+        data: dict[str, Any] = {}
+        try:
+            data = await self._get_json(url)
+        except Exception:
+            pass
+
+        # Retry without season param if empty
+        if not data or not data.get("seasonTypes"):
+            try:
+                url_no_season = (
+                    f"{self._cfg.site_web_api_base}/apis/common/v3/sports/{sport}/{league}"
+                    f"/athletes/{athlete_id}/gamelog"
+                )
+                data = await self._get_json(url_no_season)
+            except Exception:
+                pass
+
+        if data:
+            self._cache.set_json(cache_key, data, ttl_seconds=2 * 60 * 60)
         return data
 
     async def fetch_league_injuries(self, *, sport: EspnSport, league: EspnLeague) -> dict[str, Any]:
