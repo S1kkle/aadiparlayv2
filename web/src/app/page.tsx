@@ -357,7 +357,15 @@ export default function Home() {
     let list = displayProps;
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
     const withAi = sortProps(list.filter(hasAi), sortKey, sortAsc);
-    return withAi.slice(0, 10);
+    const seenPlayers = new Set<string>();
+    const deduped: Prop[] = [];
+    for (const p of withAi) {
+      if (seenPlayers.has(p.player_name)) continue;
+      seenPlayers.add(p.player_name);
+      deduped.push(p);
+      if (deduped.length >= 10) break;
+    }
+    return deduped;
   }, [displayProps, statFilter, sortKey, sortAsc]);
 
   const remainingProps = useMemo(() => {
