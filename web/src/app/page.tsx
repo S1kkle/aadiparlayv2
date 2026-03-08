@@ -7,10 +7,11 @@ import {
   fetchPropsJobResult,
   fetchRankedProps,
   getBackendUrl,
+  recommendParlay,
   saveHistory,
   startPropsJob,
 } from "@/lib/api";
-import type { HistoryEntry, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import type { HistoryEntry, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 const SPORT_OPTIONS: { id: SportId; label: string }[] = [
   { id: "UNKNOWN", label: "All sports" },
@@ -190,6 +191,13 @@ export default function Home() {
   // Parlay builder
   const [parlayIds, setParlayIds] = useState<Set<string>>(new Set());
 
+  // AI parlay recommendation
+  const [parlayRec, setParlayRec] = useState<ParlayRecommendation | null>(null);
+  const [parlayRecLoading, setParlayRecLoading] = useState(false);
+
+  // Model-only props (shown before AI finishes)
+  const [modelProps, setModelProps] = useState<Prop[]>([]);
+
   // History
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -207,6 +215,8 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setJobProgress(null);
+    setModelProps([]);
+    setParlayRec(null);
     if (esRef.current) {
       try { esRef.current.close(); } catch {}
       esRef.current = null;
@@ -217,7 +227,7 @@ export default function Home() {
         sport,
         scope: "all",
         refresh,
-        maxProps: 10,
+        maxProps: 200,
         aiLimit: 10,
         requireAiCount: 10,
       });
@@ -239,6 +249,29 @@ export default function Home() {
               ai_target: Number(ev.ai_target ?? 10),
               analyzed: Number(ev.analyzed ?? 0),
             });
+          } else if (ev?.type === "model_done") {
+            const props = (ev.props ?? []) as Prop[];
+            setModelProps(props);
+          } else if (ev?.type === "ai_update") {
+            const optId = ev.option_id as string;
+            const aiData = ev.ai as Record<string, unknown>;
+            if (optId && aiData) {
+              setModelProps((prev) =>
+                prev.map((p) =>
+                  p.underdog_option_id === optId
+                    ? {
+                        ...p,
+                        ai_summary: (aiData.ai_summary as string) ?? p.ai_summary,
+                        ai_bias: (aiData.ai_bias as number) ?? p.ai_bias,
+                        ai_confidence: (aiData.ai_confidence as number) ?? p.ai_confidence,
+                        ai_tailwinds: (aiData.ai_tailwinds as string[]) ?? p.ai_tailwinds,
+                        ai_risk_factors: (aiData.ai_risk_factors as string[]) ?? p.ai_risk_factors,
+                        ai_prob_adjustment: (aiData.ai_prob_adjustment as number) ?? p.ai_prob_adjustment,
+                      }
+                    : p
+                )
+              );
+            }
           } else if (ev?.type === "error") {
             setError(String(ev.error ?? "Job failed"));
             setLoading(false);
@@ -249,9 +282,9 @@ export default function Home() {
             esRef.current = null;
             const res = await fetchPropsJobResult(job_id);
             setData(res);
+            setModelProps([]);
             setLoading(false);
             setJobProgress(null);
-            // Auto-save to history
             try {
               await saveHistory({ sport, props: res.props.slice(0, 10) });
             } catch {}
@@ -268,6 +301,21 @@ export default function Home() {
     } catch (e) {
       setData(null);
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function loadParlayRec(legs: number) {
+    const sourceProps = allProps.length ? allProps : modelProps;
+    if (!sourceProps.length) return;
+    setParlayRecLoading(true);
+    setParlayRec(null);
+    try {
+      const rec = await recommendParlay({ sport, legs, props: sourceProps.slice(0, 30) });
+      setParlayRec(rec);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setParlayRecLoading(false);
     }
   }
 
@@ -299,17 +347,26 @@ export default function Home() {
   }, [sport]);
 
   const allProps = data?.props ?? [];
-  const availableStats = useMemo(() => getUniqueStats(allProps), [allProps]);
-  const filteredProps = useMemo(() => {
-    let list = allProps;
+  const displayProps = allProps.length ? allProps : modelProps;
+  const aiFinished = !!data;
+  const availableStats = useMemo(() => getUniqueStats(displayProps), [displayProps]);
+  const topProps = useMemo(() => {
+    let list = displayProps;
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
     return sortProps(list, sortKey, sortAsc).slice(0, 10);
-  }, [allProps, statFilter, sortKey, sortAsc]);
+  }, [displayProps, statFilter, sortKey, sortAsc]);
+  const remainingProps = useMemo(() => {
+    let list = displayProps;
+    if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
+    const sorted = sortProps(list, sortKey, sortAsc);
+    return sorted.slice(10);
+  }, [displayProps, statFilter, sortKey, sortAsc]);
+  const filteredProps = topProps;
 
   // Parlay computations
   const parlayProps = useMemo(
-    () => allProps.filter((p) => parlayIds.has(p.underdog_option_id)),
-    [allProps, parlayIds]
+    () => displayProps.filter((p) => parlayIds.has(p.underdog_option_id)),
+    [displayProps, parlayIds]
   );
   const parlayDecimalOdds = useMemo(() => {
     if (!parlayProps.length) return 0;
@@ -520,16 +577,103 @@ export default function Home() {
             </div>
           ) : null}
 
-          {data ? (
-            <div className="mt-4 flex items-center justify-between text-sm text-zinc-600 dark:text-zinc-400">
-              <div>
-                Scope: <span className="font-mono text-xs">{data.scope}</span>
+          {(data || modelProps.length > 0) ? (
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-4 text-sm text-zinc-600 dark:text-zinc-400">
+                <div>
+                  Top <span className="font-mono text-xs">{filteredProps.length}</span> picks
+                  {!aiFinished && modelProps.length > 0 && (
+                    <span className="ml-2 text-xs text-amber-600 dark:text-amber-400">(stat model — AI loading...)</span>
+                  )}
+                </div>
+                {remainingProps.length > 0 && (
+                  <div className="text-xs text-zinc-400">
+                    +{remainingProps.length} more below
+                  </div>
+                )}
               </div>
-              <div>
-                Props: <span className="font-mono text-xs">{filteredProps.length}</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="h-8 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  onClick={() => void loadParlayRec(2)}
+                  disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
+                >
+                  {parlayRecLoading ? "Building..." : "Best 2-Leg Parlay"}
+                </button>
+                <button
+                  className="h-8 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  onClick={() => void loadParlayRec(5)}
+                  disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
+                >
+                  {parlayRecLoading ? "Building..." : "Best 5-Leg Parlay"}
+                </button>
               </div>
             </div>
           ) : null}
+
+          {/* --- AI Parlay Recommendation --- */}
+          {parlayRec && (
+            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/60 p-5 shadow-sm dark:border-emerald-800 dark:bg-emerald-950/30">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
+                  AI-Recommended {parlayRec.legs}-Leg Parlay
+                </h3>
+                <button
+                  className="text-xs text-emerald-700 hover:underline dark:text-emerald-400"
+                  onClick={() => setParlayRec(null)}
+                >
+                  Dismiss
+                </button>
+              </div>
+
+              <div className="mt-3 space-y-2">
+                {parlayRec.props.map((p, i) => (
+                  <div key={p.underdog_option_id ?? i} className="flex items-center justify-between rounded-lg border border-emerald-200 bg-white px-3 py-2 text-sm dark:border-emerald-800 dark:bg-zinc-950">
+                    <div className="flex items-center gap-3">
+                      <span className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-[10px] font-bold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300">
+                        {i + 1}
+                      </span>
+                      <div>
+                        <div className="font-medium">{p.player_name}</div>
+                        <div className="text-xs text-zinc-500">
+                          {p.side?.toUpperCase()} {p.line} {p.display_stat ?? p.stat}
+                          {p.game_title ? ` — ${p.game_title}` : ""}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs font-mono">
+                      <span className={edgeColor(p.edge)}>edge {fmtPct(p.edge)}</span>
+                      <span>hit {p.hit_rate_str ?? "?"}</span>
+                      <span>model {fmtPct(p.model_prob)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-4 dark:border-emerald-800 dark:bg-zinc-950">
+                <div className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 mb-2">AI Parlay Analysis</div>
+                <div className="text-sm leading-6 text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap break-words">
+                  {parlayRec.parlay_summary || "No summary generated."}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-mono text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    Combined prob: {fmtPct(parlayRec.combined_model_prob)}
+                  </span>
+                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-mono text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    AI confidence: {fmtNum(parlayRec.combined_confidence, 2)}
+                  </span>
+                </div>
+                {parlayRec.risk_factors?.length > 0 && (
+                  <div className="mt-3">
+                    <div className="text-xs font-semibold text-rose-700 dark:text-rose-300">Risks</div>
+                    <ul className="mt-1 list-disc pl-4 text-xs text-zinc-700 dark:text-zinc-300 space-y-0.5">
+                      {parlayRec.risk_factors.map((r, i) => <li key={i}>{r}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* --- Main table (desktop) --- */}
           <div className="mt-4 hidden overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm md:block dark:border-zinc-800 dark:bg-zinc-950">
@@ -1050,6 +1194,71 @@ export default function Home() {
               <div className="text-center text-sm text-zinc-500 py-8">Loading props…</div>
             )}
           </div>
+
+          {/* --- Remaining props (condensed) --- */}
+          {remainingProps.length > 0 && (
+            <div className="mt-6">
+              <details>
+                <summary className="cursor-pointer text-sm font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+                  All other props ({remainingProps.length})
+                </summary>
+                <div className="mt-3 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
+                  <div className="overflow-auto max-h-[400px]">
+                    <table className="w-full text-xs">
+                      <thead className="sticky top-0 bg-zinc-50/95 backdrop-blur dark:bg-zinc-900/95">
+                        <tr className="border-b border-zinc-200 text-left dark:border-zinc-800">
+                          <th className="px-2 py-2 w-6">#</th>
+                          <th className="px-2 py-2">Player</th>
+                          <th className="px-2 py-2">Pick</th>
+                          <th className="px-2 py-2">Hit</th>
+                          <th className="px-2 py-2">Model</th>
+                          <th className="px-2 py-2">Edge</th>
+                          <th className="px-2 py-2">Score</th>
+                          <th className="px-2 py-2 w-6">+</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {remainingProps.map((p, idx) => {
+                          const inParlay = parlayIds.has(p.underdog_option_id);
+                          return (
+                            <tr
+                              key={p.underdog_option_id}
+                              className="border-b border-zinc-100 hover:bg-zinc-50 dark:border-zinc-900 dark:hover:bg-zinc-900/30"
+                            >
+                              <td className="px-2 py-1.5 text-zinc-400 font-mono">{idx + 11}</td>
+                              <td className="px-2 py-1.5">
+                                <div className="font-medium text-zinc-800 dark:text-zinc-100">{p.player_name}</div>
+                                <div className="text-[10px] text-zinc-400">{p.sport} {p.team_abbr ? `(${p.team_abbr})` : ""}</div>
+                              </td>
+                              <td className="px-2 py-1.5 font-mono">
+                                {p.side.toUpperCase()} {p.line} <span className="text-zinc-500">{p.display_stat ?? p.stat}</span>
+                              </td>
+                              <td className="px-2 py-1.5 font-mono">{p.hit_rate_str ?? "—"}</td>
+                              <td className="px-2 py-1.5 font-mono">{fmtPct(p.model_prob)}</td>
+                              <td className={`px-2 py-1.5 font-mono ${edgeColor(p.edge)}`}>{fmtPct(p.edge)}</td>
+                              <td className="px-2 py-1.5 font-mono">{fmtNum(p.score, 2)}</td>
+                              <td className="px-2 py-1.5">
+                                <button
+                                  className={`inline-flex h-6 w-6 items-center justify-center rounded text-[10px] border ${
+                                    inParlay
+                                      ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+                                      : "border-zinc-200 bg-white text-zinc-500 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400"
+                                  }`}
+                                  onClick={() => toggleParlay(p.underdog_option_id)}
+                                >
+                                  {inParlay ? "✓" : "+"}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
 
           {/* --- Parlay Slip --- */}
           {parlayProps.length > 0 && (

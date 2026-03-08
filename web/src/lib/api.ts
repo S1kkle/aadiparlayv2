@@ -1,4 +1,4 @@
-import { HistoryEntry, RankedPropsResponse, SportId } from "@/lib/types";
+import { HistoryEntry, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
@@ -92,5 +92,28 @@ export async function saveHistory(entry: { sport: string; props: any[] }): Promi
     body: JSON.stringify(entry),
     cache: "no-store",
   });
+}
+
+export async function recommendParlay(params: {
+  sport: SportId;
+  legs: number;
+  props: Prop[];
+}): Promise<ParlayRecommendation> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/parlay/recommend", backend).toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sport: params.sport,
+      legs: params.legs,
+      props: params.props,
+    }),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as ParlayRecommendation;
 }
 

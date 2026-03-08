@@ -59,12 +59,12 @@ class GroqClient:
         except Exception:
             return False
 
-    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0) -> dict[str, Any]:
+    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0, system: str | None = None) -> dict[str, Any]:
         url = f"{GROQ_BASE}/chat/completions"
         payload = {
             "model": self._cfg.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_JSON},
+                {"role": "system", "content": system or SYSTEM_JSON},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,

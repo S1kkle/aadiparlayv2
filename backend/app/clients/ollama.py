@@ -31,7 +31,20 @@ class OllamaClient:
         except Exception:
             return False
 
-    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0) -> dict[str, Any]:
+    _DEFAULT_SYSTEM = (
+        "You are a sports prop analyst. "
+        "Return ONLY valid JSON with keys: "
+        "summary (string), overall_bias (-1|0|1 where 1 = FAVORS the pick direction given, -1 = AGAINST the pick direction given, 0 = neutral), confidence (0..1), "
+        "prob_adjustment (float between -0.15 and +0.15, your estimated shift to the model probability "
+        "based on qualitative factors like injuries, matchup, trend, rest — e.g. +0.05 means 5% more likely), "
+        "tailwinds (string[]), risk_factors (string[]). "
+        "The summary must be 2-4 sentences, explicitly referencing matchup context and injuries/availability "
+        "when provided, and must cite at least two numbers from the input (e.g., line, last10 avg/hit rate, model_prob, edge). "
+        "If you mention injuries, ONLY reference names/lines that appear in the provided TEAM_INJURY_LINES / OPP_INJURY_LINES, "
+        "and copy the injury line(s) verbatim in parentheses. Do NOT invent injuries."
+    )
+
+    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0, system: str | None = None) -> dict[str, Any]:
         """
         Calls Ollama chat endpoint expecting strict JSON output.
         """
@@ -43,18 +56,7 @@ class OllamaClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a sports prop analyst. "
-                        "Return ONLY valid JSON with keys: "
-                        "summary (string), overall_bias (-1|0|1 where 1 = FAVORS the pick direction given, -1 = AGAINST the pick direction given, 0 = neutral), confidence (0..1), "
-                        "prob_adjustment (float between -0.15 and +0.15, your estimated shift to the model probability "
-                        "based on qualitative factors like injuries, matchup, trend, rest — e.g. +0.05 means 5% more likely), "
-                        "tailwinds (string[]), risk_factors (string[]). "
-                        "The summary must be 2-4 sentences, explicitly referencing matchup context and injuries/availability "
-                        "when provided, and must cite at least two numbers from the input (e.g., line, last10 avg/hit rate, model_prob, edge). "
-                        "If you mention injuries, ONLY reference names/lines that appear in the provided TEAM_INJURY_LINES / OPP_INJURY_LINES, "
-                        "and copy the injury line(s) verbatim in parentheses. Do NOT invent injuries."
-                    ),
+                    "content": system or self._DEFAULT_SYSTEM,
                 },
                 {"role": "user", "content": prompt},
             ],

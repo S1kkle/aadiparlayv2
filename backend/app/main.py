@@ -15,7 +15,7 @@ from app.clients.groq import GroqClient, GroqConfig
 from app.clients.ollama import OllamaClient, OllamaConfig
 from app.clients.underdog import UnderdogClient, UnderdogConfig
 from app.db import SqliteTTLCache
-from app.models.core import HealthResponse, RankedPropsResponse, SportId
+from app.models.core import HealthResponse, Prop, RankedPropsResponse, SportId
 from app.props_jobs import PropsJobRequest, PropsJobStore, sse_format
 from app.services.ranker import Ranker, RankerConfig
 
@@ -216,6 +216,14 @@ async def start_props_job(req: dict) -> dict[str, str]:
             attempted = 0
             succeeded = 0
 
+            async def on_model_done(all_props: list[Prop]) -> None:
+                """Emit all stat-model results so frontend can display them before AI."""
+                serialized = [p.model_dump(mode="json") for p in all_props]
+                await job.emit({
+                    "type": "model_done",
+                    "props": serialized,
+                })
+
             async def on_ai_progress(ev: dict) -> None:
                 nonlocal attempted, succeeded
                 if ev.get("type") == "stage":
@@ -233,6 +241,20 @@ async def start_props_job(req: dict) -> dict[str, str]:
                     attempted += 1
                     if ev.get("ok"):
                         succeeded += 1
+                    prop_obj = ev.get("prop")
+                    if isinstance(prop_obj, Prop) and isinstance(prop_obj.ai_summary, str) and prop_obj.ai_summary.strip():
+                        await job.emit({
+                            "type": "ai_update",
+                            "option_id": prop_obj.underdog_option_id,
+                            "ai": {
+                                "ai_summary": prop_obj.ai_summary,
+                                "ai_bias": prop_obj.ai_bias,
+                                "ai_confidence": prop_obj.ai_confidence,
+                                "ai_tailwinds": prop_obj.ai_tailwinds,
+                                "ai_risk_factors": prop_obj.ai_risk_factors,
+                                "ai_prob_adjustment": prop_obj.ai_prob_adjustment,
+                            },
+                        })
                 if ev.get("type") in ("ai_prop_done", "ai_batch"):
                     raw_analyzed = ev.get("analyzed")
                     if isinstance(raw_analyzed, (int, float)):
@@ -261,6 +283,7 @@ async def start_props_job(req: dict) -> dict[str, str]:
                 require_ai=True,
                 require_ai_count=r.require_ai_count,
                 on_ai_progress=on_ai_progress,
+                on_model_done=on_model_done,
             )
 
             resp = RankedPropsResponse(
@@ -325,6 +348,35 @@ async def save_history(req: dict):
     props_list = req.get("props", [])
     cache.save_history(entry_id, timestamp, sport, _json.dumps(props_list, default=str))
     return {"status": "ok", "id": entry_id}
+
+
+@app.post("/parlay/recommend")
+async def recommend_parlay(req: dict):
+    """AI-recommended parlay from current props."""
+    sport: SportId = req.get("sport") or "UNKNOWN"
+    legs = int(req.get("legs") or 2)
+    if legs not in (2, 3, 4, 5, 6):
+        return JSONResponse(status_code=400, content={"error": "legs must be 2-6"})
+
+    props_data = req.get("props")
+    if not isinstance(props_data, list) or not props_data:
+        return JSONResponse(status_code=400, content={"error": "props list required"})
+
+    props_objs: list[Prop] = []
+    for raw in props_data:
+        try:
+            props_objs.append(Prop(**raw))
+        except Exception:
+            continue
+
+    if len(props_objs) < legs:
+        return JSONResponse(status_code=400, content={"error": f"Need at least {legs} props"})
+
+    try:
+        result = await ranker.recommend_parlay(props=props_objs, legs=legs)
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/debug/mma/{fighter_name}")

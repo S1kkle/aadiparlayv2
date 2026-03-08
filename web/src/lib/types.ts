@@ -78,3 +78,12 @@ export type HistoryEntry = {
   sport: string;
   props: Prop[];
 };
+
+export type ParlayRecommendation = {
+  legs: number;
+  props: Prop[];
+  parlay_summary: string;
+  combined_confidence: number;
+  risk_factors: string[];
+  combined_model_prob: number;
+};

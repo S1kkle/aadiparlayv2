@@ -195,6 +195,7 @@ class Ranker:
         require_ai: bool = False,
         require_ai_count: int = 10,
         on_ai_progress: Any | None = None,
+        on_model_done: Any | None = None,
     ) -> list[Prop]:
         async def _emit_stage(stage: str, detail: str = "") -> None:
             if on_ai_progress is None:
@@ -284,6 +285,17 @@ class Ranker:
 
         await _emit_stage("rank", f"Ranked {len(props)} unique player+stat props")
 
+        # Assign preliminary confidence tiers
+        for p in props:
+            p.confidence_tier = _compute_confidence_tier(p)
+
+        # --- Emit all stat-model props before AI ---
+        if on_model_done is not None:
+            try:
+                await on_model_done(props)
+            except Exception:
+                pass
+
         selected: list[Prop] = []
         if require_ai and self._ollama is not None and ai_limit > 0:
             await _emit_stage("ai", f"Starting AI analysis for top {require_ai_count} props...")
@@ -300,7 +312,7 @@ class Ranker:
                     return
                 try:
                     ok = isinstance(p.ai_summary, str) and p.ai_summary.strip()
-                    await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok)})
+                    await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok), "prop": p})
                 except Exception:
                     return
 
@@ -349,15 +361,89 @@ class Ranker:
                 + self._cfg.w_ai * (ai_signal + ai_adj * 3.0)
             )
 
-            # --- Confidence tier & model-AI agreement (#15, #16) ---
-            # bias=1 now means "favors the pick direction", so agreement = positive edge + bias=1
             model_favorable = (p.edge or 0) > 0
             if p.ai_bias is not None:
                 p.model_ai_agree = model_favorable and p.ai_bias == 1
             p.confidence_tier = _compute_confidence_tier(p)
 
         selected.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
-        return selected
+
+        # Return selected (with AI) + remaining model-only props
+        selected_ids = {p.underdog_option_id for p in selected}
+        remaining = [p for p in props if p.underdog_option_id not in selected_ids]
+        return selected + remaining
+
+    async def recommend_parlay(
+        self,
+        *,
+        props: list[Prop],
+        legs: int,
+    ) -> dict[str, Any]:
+        """Pick the best N-leg parlay from the given props and generate an AI summary."""
+        assert self._ollama is not None
+
+        candidates = props[:30]
+        lines: list[str] = []
+        for i, p in enumerate(candidates):
+            lines.append(
+                f"{i+1}. {p.player_name} | {p.side.upper()} {p.line} {p.display_stat or p.stat} | "
+                f"sport={p.sport} game={p.game_title or '?'} team={p.team_abbr or '?'} "
+                f"opp={p.opponent_abbr or '?'} | "
+                f"model_prob={p.model_prob:.3f} edge={p.edge:+.3f} ev={p.ev:+.4f} "
+                f"hit_rate={p.hit_rate_str or '?'} consistency={p.stat_consistency or '?'} "
+                f"streak={p.current_streak or 0} trend={p.trend_direction or '?'} "
+                f"ai_bias={p.ai_bias} ai_conf={p.ai_confidence}"
+            )
+
+        prompt = (
+            f"You are building a {legs}-leg parlay from Underdog Fantasy props.\n"
+            f"Pick exactly {legs} legs that maximize combined edge while minimizing correlation risk.\n\n"
+            "RULES:\n"
+            "- Prefer picks with positive edge, high hit rate, and high consistency.\n"
+            "- Avoid picking multiple props from the SAME GAME (correlation risk).\n"
+            "- Avoid picking multiple props for the SAME PLAYER.\n"
+            "- Prefer a mix of sports if available.\n"
+            "- Consider streaks and trends when selecting.\n\n"
+            "CANDIDATES:\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "Return ONLY valid JSON with keys:\n"
+            '- "picks" (array of integers: the 1-indexed candidate numbers you selected)\n'
+            '- "parlay_summary" (string: 3-5 sentence analysis of why these legs work together, '
+            "mention combined probability, correlation risk, and key factors)\n"
+            '- "combined_confidence" (float 0..1: your overall confidence in this parlay)\n'
+            '- "risk_factors" (string[]: 2-3 key risks for this parlay)\n'
+        )
+
+        parlay_system = (
+            "You are a sports parlay analyst. "
+            "Return ONLY valid JSON with keys: "
+            "picks (array of integers), parlay_summary (string 3-5 sentences), "
+            "combined_confidence (float 0..1), risk_factors (string[])."
+        )
+        result = await self._ollama.analyze_prop(prompt=prompt, timeout_s=60, system=parlay_system)
+        picks_indices: list[int] = []
+        raw_picks = result.get("picks", [])
+        if isinstance(raw_picks, list):
+            for idx in raw_picks:
+                if isinstance(idx, (int, float)) and 1 <= int(idx) <= len(candidates):
+                    picks_indices.append(int(idx) - 1)
+
+        if len(picks_indices) != legs:
+            picks_indices = list(range(min(legs, len(candidates))))
+
+        selected_props = [candidates[i] for i in picks_indices if i < len(candidates)]
+
+        return {
+            "legs": legs,
+            "props": [p.model_dump() for p in selected_props],
+            "parlay_summary": result.get("parlay_summary", ""),
+            "combined_confidence": result.get("combined_confidence", 0),
+            "risk_factors": result.get("risk_factors", []),
+            "combined_model_prob": round(
+                math.prod(p.model_prob or 0.5 for p in selected_props), 6
+            ) if selected_props else 0.0,
+        }
 
     async def _apply_espn_model(self, props: list[Prop]) -> None:
         assert self._espn is not None
