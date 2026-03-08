@@ -302,7 +302,15 @@ class Ranker:
                 raise RuntimeError("Ollama not available.")
 
             # --- Step 1: AI selection — let AI pick the best N from top candidates ---
-            candidate_pool = props[:min(40, len(props))]
+            # Deduplicate candidate pool: one prop per player (best score)
+            _seen_players: set[str] = set()
+            _deduped_pool: list[Prop] = []
+            for p in props:
+                if p.player_name not in _seen_players:
+                    _seen_players.add(p.player_name)
+                    _deduped_pool.append(p)
+            candidate_pool = _deduped_pool[:min(40, len(_deduped_pool))]
+
             await _emit_stage("ai_select", f"AI selecting best {require_ai_count} from {len(candidate_pool)} candidates...")
 
             ai_selected_indices = await self._ai_select_props(
@@ -310,16 +318,19 @@ class Ranker:
             )
 
             ai_picks: list[Prop] = []
+            seen_pick_players: set[str] = set()
             if ai_selected_indices:
                 for idx in ai_selected_indices:
                     if 0 <= idx < len(candidate_pool):
-                        ai_picks.append(candidate_pool[idx])
+                        p = candidate_pool[idx]
+                        if p.player_name not in seen_pick_players:
+                            seen_pick_players.add(p.player_name)
+                            ai_picks.append(p)
             if len(ai_picks) < require_ai_count:
-                used_ids = {p.underdog_option_id for p in ai_picks}
                 for p in candidate_pool:
-                    if p.underdog_option_id not in used_ids:
+                    if p.player_name not in seen_pick_players:
+                        seen_pick_players.add(p.player_name)
                         ai_picks.append(p)
-                        used_ids.add(p.underdog_option_id)
                         if len(ai_picks) >= require_ai_count:
                             break
 
