@@ -29,11 +29,17 @@ export type Prop = {
   rest_days?: number | null;
   avg_minutes?: number | null;
 
-  // trend
+  // trend / profile
   trend_short_avg?: number | null;
   trend_direction?: string | null;
   hit_rate_last10?: number | null;
   hit_rate_str?: string | null;
+  stat_median?: number | null;
+  stat_floor?: number | null;
+  stat_ceiling?: number | null;
+  stat_consistency?: number | null;
+  current_streak?: number | null;
+  line_percentile?: number | null;
 
   // odds
   american_price?: number | null;

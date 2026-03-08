@@ -17,8 +17,10 @@ from app.services.underdog_normalizer import (
 from app.services.stat_model import (
     NormalParams,
     bayesian_shrink,
+    compute_stat_profile,
     fit_normal_weighted,
     is_low_count_stat,
+    line_percentile,
     poisson_prob_over,
     prob_over,
 )
@@ -154,9 +156,14 @@ def _compute_confidence_tier(p: Prop) -> str:
         score += 1
     if p.hit_rate_last10 is not None and p.hit_rate_last10 >= 0.6:
         score += 1
-    if score >= 3:
+    if p.stat_consistency is not None and p.stat_consistency >= 0.6:
+        score += 1
+    if p.current_streak is not None and abs(p.current_streak) >= 3:
+        if (p.side == "over" and p.current_streak > 0) or (p.side == "under" and p.current_streak < 0):
+            score += 1
+    if score >= 4:
         return "high"
-    if score >= 1:
+    if score >= 2:
         return "medium"
     return "low"
 
@@ -189,6 +196,20 @@ class Ranker:
         require_ai_count: int = 10,
         on_ai_progress: Any | None = None,
     ) -> list[Prop]:
+        async def _emit_stage(stage: str, detail: str = "") -> None:
+            if on_ai_progress is None:
+                return
+            try:
+                await on_ai_progress({
+                    "type": "stage",
+                    "stage": stage,
+                    "detail": detail,
+                })
+            except Exception:
+                pass
+
+        await _emit_stage("fetch", "Fetching props from Underdog...")
+
         cache_key = f"underdog:over_under_lines:{scope}"
         payload: dict[str, Any] | None = None
         if not refresh:
@@ -201,6 +222,8 @@ class Ranker:
         if sport != "UNKNOWN":
             props = [p for p in props if p.sport == sport]
 
+        await _emit_stage("fetch", f"Found {len(props)} props")
+
         for p in props:
             if p.american_price is None:
                 p.american_price = -110
@@ -210,7 +233,11 @@ class Ranker:
                 p.implied_prob = ud_american_to_implied_prob(p.american_price)
 
         if self._espn is not None:
+            unique_count = len({p.player_name for p in props})
+            await _emit_stage("espn", f"Resolving ESPN data for {unique_count} players...")
             await self._apply_espn_model(props)
+            modeled = sum(1 for p in props if p.model_prob is not None)
+            await _emit_stage("espn", f"ESPN model applied to {modeled}/{len(props)} props")
 
         for p in props:
             if p.model_prob is None:
@@ -241,6 +268,8 @@ class Ranker:
             z_by_option[p.underdog_option_id] = (edge_z[i], ev_z[i], vol_z[i])
             p.score = self._cfg.w_edge * edge_z[i] + self._cfg.w_ev * ev_z[i] - self._cfg.w_vol * vol_z[i]
 
+        await _emit_stage("rank", "Scoring and ranking props...")
+
         props.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
 
         # --- Deduplicate over/under for same player+stat (#14) ---
@@ -253,8 +282,11 @@ class Ranker:
                 deduped.append(p)
         props = deduped
 
+        await _emit_stage("rank", f"Ranked {len(props)} unique player+stat props")
+
         selected: list[Prop] = []
         if require_ai and self._ollama is not None and ai_limit > 0:
+            await _emit_stage("ai", f"Starting AI analysis for top {require_ai_count} props...")
             if not await self._ollama.is_available():
                 raise RuntimeError("Ollama not available.")
 
@@ -502,6 +534,18 @@ class Ranker:
             p.hit_rate_last10 = hits / len(series)
             p.hit_rate_str = f"{hits}/{len(series)}"
 
+            # Stat profile (median, floor, ceiling, consistency, streak)
+            profile = compute_stat_profile(series, line=p.line, side=p.side)
+            if profile:
+                p.stat_median = profile.median
+                p.stat_floor = profile.floor
+                p.stat_ceiling = profile.ceiling
+                p.stat_consistency = profile.consistency
+                p.current_streak = profile.current_streak
+
+            # Line percentile
+            p.line_percentile = line_percentile(line=p.line, params=params)
+
             # Average minutes (#9)
             if p.sport in ("NBA",):
                 mins = self._espn.extract_stat_series(gamelog, field_name="minutes", last_n=self._cfg.last_n)
@@ -664,6 +708,16 @@ class Ranker:
             p.hit_rate_last10 = hits / len(series)
             p.hit_rate_str = f"{hits}/{len(series)}"
 
+            # Stat profile
+            profile = compute_stat_profile(series, line=p.line, side=p.side)
+            if profile:
+                p.stat_median = profile.median
+                p.stat_floor = profile.floor
+                p.stat_ceiling = profile.ceiling
+                p.stat_consistency = profile.consistency
+                p.current_streak = profile.current_streak
+            p.line_percentile = line_percentile(line=p.line, params=params)
+
             # Poisson for low-count MMA stats (#3)
             if is_low_count_stat(field_used):
                 p_over = poisson_prob_over(line=p.line, lam=params.mu)
@@ -687,7 +741,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v9"
+        AI_PROMPT_VERSION = "v10"
         sem = asyncio.Semaphore(2)
 
         def _mean(xs: list[float]) -> float | None:
@@ -935,7 +989,7 @@ class Ranker:
                 recent_label = "Recent games (most recent first):"
                 vs_label = "Vs this opponent (current season, if available):"
 
-            # Enriched context lines (#10, #13)
+            # Enriched context lines
             context_extras: list[str] = []
             if p.is_home is not None:
                 context_extras.append(f"Venue: {'HOME' if p.is_home else 'AWAY'}")
@@ -952,8 +1006,31 @@ class Ranker:
                 )
             if p.hit_rate_str:
                 context_extras.append(f"Hit rate vs line: {p.hit_rate_str} ({p.side} {p.line})")
+            if p.current_streak and p.current_streak != 0:
+                streak_dir = "overs" if p.current_streak > 0 else "unders"
+                context_extras.append(f"Current streak: {abs(p.current_streak)} consecutive {streak_dir}")
 
             context_extras_str = "\n".join(f"- {x}" for x in context_extras) if context_extras else "- none"
+
+            # Rich stat distribution context
+            dist_lines: list[str] = []
+            dist_lines.append(f"recent_avg (weighted): {last10_avg}")
+            if p.stat_median is not None:
+                dist_lines.append(f"median: {p.stat_median}")
+            if p.stat_floor is not None and p.stat_ceiling is not None:
+                dist_lines.append(f"range: floor(10th pctl)={p.stat_floor}, ceiling(90th pctl)={p.stat_ceiling}")
+            if p.stat_consistency is not None:
+                dist_lines.append(f"consistency (% within 1 sigma): {p.stat_consistency:.0%}")
+            if p.line_percentile is not None:
+                pctl = p.line_percentile
+                dist_lines.append(
+                    f"line {p.line} sits at {pctl:.0%} of distribution "
+                    f"({'above average' if pctl > 0.55 else 'below average' if pctl < 0.45 else 'near average'})"
+                )
+            dist_lines.append(f"volatility (sigma): {p.volatility}")
+            dist_lines.append(f"recent_hit_rate_vs_line: {last10_hit}")
+            dist_lines.append(f"vs_opp_avg: {vs_avg}")
+            dist_lines.append(f"vs_opp_hit_rate_vs_line: {vs_hit}")
 
             prompt = (
                 "Analyze an Underdog Pick'em prop.\n"
@@ -962,7 +1039,9 @@ class Ranker:
                 + sport_rules
                 + "- Cite at least two numbers from the stats context.\n"
                 "- Do NOT just restate model_prob/edge; explain *why*.\n"
-                "- Consider trend direction, home/away, rest, and hit rate when forming your analysis.\n\n"
+                "- Consider trend, streak, consistency, floor/ceiling range, and situational factors.\n"
+                "- If the player has a hot/cold streak, mention it and whether you expect regression.\n"
+                "- If the line is significantly above or below the player's median, note this.\n\n"
                 f"Sport: {p.sport}\n"
                 f"{context_label}\n"
                 f"Pick: {p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
@@ -982,11 +1061,9 @@ class Ranker:
                     + "\n\n"
                     if not is_mma else ""
                 )
-                + "Stats context:\n"
-                f"- recent_avg: {last10_avg}\n"
-                f"- recent_hit_rate_vs_line: {last10_hit}\n"
-                f"- vs_opp_avg: {vs_avg}\n"
-                f"- vs_opp_hit_rate_vs_line: {vs_hit}\n\n"
+                + "STATISTICAL_PROFILE:\n"
+                + "\n".join(f"- {x}" for x in dist_lines)
+                + "\n\n"
                 f"{recent_label}\n"
                 + "\n".join(
                     [
@@ -1006,11 +1083,10 @@ class Ranker:
                     or "- none"
                 )
                 + "\n\n"
-                "Stats model:\n"
+                "MODEL_OUTPUT:\n"
                 f"- model_prob: {p.model_prob}\n"
                 f"- implied_prob: {p.implied_prob}\n"
-                f"- edge: {p.edge}\n"
-                f"- volatility: {p.volatility}\n\n"
+                f"- edge: {p.edge}\n\n"
                 "Return JSON only."
             )
 

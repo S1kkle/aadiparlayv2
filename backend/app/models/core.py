@@ -66,11 +66,17 @@ class Prop(BaseModel):
     rest_days: int | None = None
     avg_minutes: float | None = None
 
-    # trend
+    # trend / profile
     trend_short_avg: float | None = None  # last 3 game average
     trend_direction: str | None = None  # "up" | "down" | "flat"
     hit_rate_last10: float | None = None  # fraction 0..1
     hit_rate_str: str | None = None  # e.g. "7/10"
+    stat_median: float | None = None
+    stat_floor: float | None = None  # 10th percentile
+    stat_ceiling: float | None = None  # 90th percentile
+    stat_consistency: float | None = None  # 0..1
+    current_streak: int | None = None  # +N = N overs in a row, -N = unders
+    line_percentile: float | None = None  # where line sits in distribution
 
     # odds/prices
     american_price: int | None = None

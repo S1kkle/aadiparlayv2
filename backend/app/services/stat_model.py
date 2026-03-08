@@ -10,6 +10,19 @@ class NormalParams:
     sigma: float
 
 
+@dataclass(frozen=True)
+class StatProfile:
+    """Rich statistical profile computed from a game series."""
+    mean: float
+    median: float
+    sigma: float
+    floor: float  # 10th percentile value
+    ceiling: float  # 90th percentile value
+    consistency: float  # 0..1, how often within 1 sigma of mean
+    current_streak: int  # positive = consecutive overs, negative = unders
+    cv: float  # coefficient of variation (sigma/mean), lower = more consistent
+
+
 LOW_COUNT_STATS = frozenset({
     "blocks", "steals", "knockDowns", "takedownsLanded",
     "submissions", "advances", "interceptions",
@@ -47,6 +60,56 @@ def fit_normal_weighted(
     var = sum(w * (x - mu) ** 2 for w, x in zip(weights, series)) / w_sum
     sigma = math.sqrt(var) if var > 0 else 0.0
     return NormalParams(mu=mu, sigma=max(sigma_floor, sigma))
+
+
+def compute_stat_profile(series: list[float], *, line: float, side: str) -> StatProfile | None:
+    """Compute a full statistical profile from game values (index 0 = most recent)."""
+    if not series:
+        return None
+    n = len(series)
+    mean = sum(series) / n
+    sorted_vals = sorted(series)
+    median = sorted_vals[n // 2] if n % 2 else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+
+    sigma = 0.0
+    if n >= 2:
+        var = sum((x - mean) ** 2 for x in series) / (n - 1)
+        sigma = math.sqrt(var) if var > 0 else 0.0
+
+    floor_idx = max(0, int(n * 0.1))
+    ceil_idx = min(n - 1, int(n * 0.9))
+    floor_val = sorted_vals[floor_idx]
+    ceil_val = sorted_vals[ceil_idx]
+
+    within_1sigma = sum(1 for v in series if abs(v - mean) <= max(sigma, 0.01))
+    consistency = within_1sigma / n
+
+    streak = 0
+    for v in series:
+        hit = (v > line) if side == "over" else (v < line)
+        if hit:
+            if streak >= 0:
+                streak += 1
+            else:
+                break
+        else:
+            if streak <= 0:
+                streak -= 1
+            else:
+                break
+
+    cv = (sigma / abs(mean)) if abs(mean) > 0.01 else 0.0
+
+    return StatProfile(
+        mean=round(mean, 2),
+        median=round(median, 2),
+        sigma=round(sigma, 2),
+        floor=round(floor_val, 2),
+        ceiling=round(ceil_val, 2),
+        consistency=round(consistency, 3),
+        current_streak=streak,
+        cv=round(cv, 3),
+    )
 
 
 def normal_cdf(x: float) -> float:
@@ -91,3 +154,11 @@ def bayesian_shrink(
 ) -> float:
     """Shrink sample_mean toward prior_mean when n is small."""
     return (n * sample_mean + shrinkage_k * prior_mean) / (n + shrinkage_k)
+
+
+def line_percentile(*, line: float, params: NormalParams) -> float:
+    """What percentile of the distribution the line sits at.  0.5 = mean."""
+    if params.sigma <= 0:
+        return 0.5
+    z = (line - params.mu) / params.sigma
+    return normal_cdf(z)

@@ -218,6 +218,17 @@ async def start_props_job(req: dict) -> dict[str, str]:
 
             async def on_ai_progress(ev: dict) -> None:
                 nonlocal attempted, succeeded
+                if ev.get("type") == "stage":
+                    await job.emit({
+                        "type": "progress",
+                        "stage": ev.get("stage", ""),
+                        "detail": ev.get("detail", ""),
+                        "ai_succeeded": succeeded,
+                        "ai_attempted": attempted,
+                        "ai_target": r.require_ai_count,
+                        "analyzed": 0,
+                    })
+                    return
                 if ev.get("type") == "ai_prop_done":
                     attempted += 1
                     if ev.get("ok"):
