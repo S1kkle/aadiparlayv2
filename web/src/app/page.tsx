@@ -350,17 +350,23 @@ export default function Home() {
   const displayProps = allProps.length ? allProps : modelProps;
   const aiFinished = !!data;
   const availableStats = useMemo(() => getUniqueStats(displayProps), [displayProps]);
+
+  const hasAi = (p: Prop) => typeof p.ai_summary === "string" && p.ai_summary.trim().length > 0;
+
   const topProps = useMemo(() => {
     let list = displayProps;
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
-    return sortProps(list, sortKey, sortAsc).slice(0, 10);
+    const withAi = sortProps(list.filter(hasAi), sortKey, sortAsc);
+    return withAi.slice(0, 10);
   }, [displayProps, statFilter, sortKey, sortAsc]);
+
   const remainingProps = useMemo(() => {
     let list = displayProps;
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
-    const sorted = sortProps(list, sortKey, sortAsc);
-    return sorted.slice(10);
-  }, [displayProps, statFilter, sortKey, sortAsc]);
+    const topIds = new Set(topProps.map((p) => p.underdog_option_id));
+    return sortProps(list.filter((p) => !topIds.has(p.underdog_option_id)), sortKey, sortAsc);
+  }, [displayProps, statFilter, sortKey, sortAsc, topProps]);
+
   const filteredProps = topProps;
 
   // Parlay computations
