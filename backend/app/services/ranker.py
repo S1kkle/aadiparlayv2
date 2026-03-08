@@ -354,8 +354,10 @@ class Ranker:
                 except Exception:
                     pass
 
+            # Keep all AI-selected props; those with summaries first, then the rest
             with_ai = [p for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip()]
-            selected = with_ai if with_ai else ai_picks
+            without_ai = [p for p in ai_picks if not (isinstance(p.ai_summary, str) and p.ai_summary.strip())]
+            selected = with_ai + without_ai
         else:
             selected = props[:max_props] if max_props > 0 else props
             if self._ollama is not None and ai_limit > 0:
@@ -915,7 +917,7 @@ class Ranker:
             return
 
         AI_PROMPT_VERSION = "v10"
-        sem = asyncio.Semaphore(2)
+        sem = asyncio.Semaphore(3)
 
         def _mean(xs: list[float]) -> float | None:
             if not xs:

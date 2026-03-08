@@ -147,6 +147,12 @@ async def _warm_league_matchup_caches() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # Purge stale gamelog caches from old key formats (v1, v2) on startup
+    cache.clear_prefix("espn:gamelog:v2:")
+    cache.clear_prefix("espn:gamelog:basketball:")
+    cache.clear_prefix("espn:gamelog:football:")
+    cache.clear_prefix("espn:gamelog:hockey:")
+    cache.clear_prefix("ai_select:")
     asyncio.create_task(_warm_league_matchup_caches())
 
 
@@ -182,6 +188,15 @@ async def clear_cache() -> dict[str, int | str]:
     deleted = cache.clear()
     asyncio.create_task(_warm_league_matchup_caches())
     return {"status": "ok", "deleted": deleted}
+
+
+@app.post("/cache/clear-gamelogs")
+async def clear_gamelogs() -> dict[str, int | str]:
+    """Clear only gamelog + AI selection caches (keeps matchup snapshots)."""
+    d1 = cache.clear_prefix("espn:gamelog:")
+    d2 = cache.clear_prefix("ai_select:")
+    d3 = cache.clear_prefix("ollama:prop:")
+    return {"status": "ok", "deleted": d1 + d2 + d3}
 
 
 @app.post("/props/job")

@@ -78,6 +78,17 @@ class SqliteTTLCache:
                 conn.commit()
                 return int(cur.rowcount or 0)
 
+    def clear_prefix(self, prefix: str) -> int:
+        """Delete all cache entries whose key starts with the given prefix."""
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM cache WHERE key LIKE ?",
+                    (prefix + "%",),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
+
     def _ensure_history_table(self) -> None:
         with self._lock:
             with self._connect() as conn:
