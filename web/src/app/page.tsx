@@ -515,7 +515,7 @@ export default function Home() {
                 )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-col gap-2 w-full sm:w-auto">
                 {data ? (
                   <div className="text-xs text-zinc-600 dark:text-zinc-400">
                     Updated{" "}
@@ -523,36 +523,38 @@ export default function Home() {
                   </div>
                 ) : null}
 
-                <button
-                  className="h-9 rounded-md bg-zinc-900 px-4 text-sm font-medium text-white shadow-sm hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-50 dark:text-black dark:hover:bg-zinc-200"
-                  onClick={() => void load(true)}
-                  disabled={loading}
-                >
-                  {loading ? "Loading…" : "Refresh"}
-                </button>
+                <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+                  <button
+                    className="h-9 rounded-md bg-zinc-900 px-4 text-sm font-medium text-white shadow-sm hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-50 dark:text-black dark:hover:bg-zinc-200"
+                    onClick={() => void load(true)}
+                    disabled={loading}
+                  >
+                    {loading ? "Loading…" : "Refresh"}
+                  </button>
 
-                <button
-                  className="h-9 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900"
-                  onClick={() => void clearCacheAndReload()}
-                  disabled={loading || clearing}
-                  title="Clears backend cache and reloads"
-                >
-                  {clearing ? "Clearing…" : "Clear cache"}
-                </button>
+                  <button
+                    className="h-9 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900"
+                    onClick={() => void clearCacheAndReload()}
+                    disabled={loading || clearing}
+                    title="Clears backend cache and reloads"
+                  >
+                    {clearing ? "Clearing…" : "Clear cache"}
+                  </button>
 
-                <button
-                  className="h-9 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 shadow-sm hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900"
-                  onClick={() => void loadHistory()}
-                >
-                  History
-                </button>
+                  <button
+                    className="h-9 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 shadow-sm hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900"
+                    onClick={() => void loadHistory()}
+                  >
+                    History
+                  </button>
 
-                <button
-                  className="h-9 rounded-md border border-violet-300 bg-violet-50 px-3 text-sm font-medium text-violet-900 shadow-sm hover:bg-violet-100 dark:border-violet-800 dark:bg-violet-950/50 dark:text-violet-200 dark:hover:bg-violet-900/50"
-                  onClick={() => void openLearning()}
-                >
-                  Learning
-                </button>
+                  <button
+                    className="h-9 rounded-md border border-violet-300 bg-violet-50 px-3 text-sm font-medium text-violet-900 shadow-sm hover:bg-violet-100 dark:border-violet-800 dark:bg-violet-950/50 dark:text-violet-200 dark:hover:bg-violet-900/50"
+                    onClick={() => void openLearning()}
+                  >
+                    Learning
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -645,30 +647,32 @@ export default function Home() {
           ) : null}
 
           {(data || modelProps.length > 0) ? (
-            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-4 text-sm text-zinc-600 dark:text-zinc-400">
-                <div>
-                  Top <span className="font-mono text-xs">{filteredProps.length}</span> picks
-                  {!aiFinished && modelProps.length > 0 && (
-                    <span className="ml-2 text-xs text-amber-600 dark:text-amber-400">(stat model — AI loading...)</span>
+            <div className="mt-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-4 text-sm text-zinc-600 dark:text-zinc-400">
+                  <div>
+                    Top <span className="font-mono text-xs">{filteredProps.length}</span> picks
+                    {!aiFinished && modelProps.length > 0 && (
+                      <span className="ml-2 text-xs text-amber-600 dark:text-amber-400">(stat model — AI loading...)</span>
+                    )}
+                  </div>
+                  {remainingProps.length > 0 && (
+                    <div className="text-xs text-zinc-400">
+                      +{remainingProps.length} more below
+                    </div>
                   )}
                 </div>
-                {remainingProps.length > 0 && (
-                  <div className="text-xs text-zinc-400">
-                    +{remainingProps.length} more below
-                  </div>
-                )}
               </div>
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex w-full gap-2">
                 <button
-                  className="h-8 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  className="h-9 flex-1 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40 sm:flex-none sm:h-8"
                   onClick={() => void loadParlayRec(2)}
                   disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
                 >
                   {parlayRecLoading ? "Building..." : "Best 2-Leg Parlay"}
                 </button>
                 <button
-                  className="h-8 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                  className="h-9 flex-1 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40 sm:flex-none sm:h-8"
                   onClick={() => void loadParlayRec(5)}
                   disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
                 >
