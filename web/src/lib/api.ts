@@ -1,4 +1,4 @@
-import { HistoryEntry, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import { HistoryEntry, LearningEntry, LearningReport, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
@@ -92,6 +92,49 @@ export async function saveHistory(entry: { sport: string; props: any[] }): Promi
     body: JSON.stringify(entry),
     cache: "no-store",
   });
+}
+
+// ── Learning Mode ─────────────────────────────────────────────────────
+
+export async function runFullLearning(): Promise<{
+  resolve: { resolved: number; already_done: number; failed_lookup: number };
+  analyze: { analyzed: number; total_unanalyzed?: number; message?: string };
+  report: LearningReport | { error: string };
+}> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/learning/run-full", backend).toString(), {
+    method: "POST",
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
+  }
+  return await res.json();
+}
+
+export async function fetchLearningEntries(params?: {
+  resolved?: boolean;
+  limit?: number;
+}): Promise<LearningEntry[]> {
+  const backend = getBackendUrl();
+  const url = new URL("/learning/entries", backend);
+  if (params?.resolved) url.searchParams.set("resolved", "true");
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data?.entries ?? []) as LearningEntry[];
+}
+
+export async function fetchLearningReports(limit?: number): Promise<LearningReport[]> {
+  const backend = getBackendUrl();
+  const url = new URL("/learning/reports", backend);
+  if (limit) url.searchParams.set("limit", String(limit));
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data?.reports ?? []) as LearningReport[];
 }
 
 export async function recommendParlay(params: {

@@ -127,3 +127,132 @@ class SqliteTTLCache:
                     for r in rows
                 ]
 
+    # ── Learning log ───────────────────────────────────────────────────
+
+    def _ensure_learning_table(self) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS learning_log (
+                      id TEXT PRIMARY KEY,
+                      history_id TEXT NOT NULL,
+                      timestamp TEXT NOT NULL,
+                      player_name TEXT NOT NULL,
+                      sport TEXT NOT NULL,
+                      stat TEXT NOT NULL,
+                      line REAL NOT NULL,
+                      side TEXT NOT NULL,
+                      model_prob REAL,
+                      implied_prob REAL,
+                      edge REAL,
+                      ai_bias INTEGER,
+                      ai_confidence REAL,
+                      actual_value REAL,
+                      hit INTEGER,
+                      miss_reason TEXT,
+                      miss_category TEXT,
+                      resolved INTEGER DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS learning_reports (
+                      id TEXT PRIMARY KEY,
+                      week_start TEXT NOT NULL,
+                      week_end TEXT NOT NULL,
+                      created_at TEXT NOT NULL,
+                      total_picks INTEGER,
+                      hits INTEGER,
+                      misses INTEGER,
+                      hit_rate REAL,
+                      miss_breakdown_json TEXT,
+                      suggestions_json TEXT
+                    )
+                    """
+                )
+                conn.commit()
+
+    def save_learning_entry(self, entry: dict[str, Any]) -> None:
+        self._ensure_learning_table()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO learning_log
+                    (id, history_id, timestamp, player_name, sport, stat, line, side,
+                     model_prob, implied_prob, edge, ai_bias, ai_confidence,
+                     actual_value, hit, miss_reason, miss_category, resolved)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry["id"], entry["history_id"], entry["timestamp"],
+                        entry["player_name"], entry["sport"], entry["stat"],
+                        entry["line"], entry["side"],
+                        entry.get("model_prob"), entry.get("implied_prob"),
+                        entry.get("edge"), entry.get("ai_bias"),
+                        entry.get("ai_confidence"), entry.get("actual_value"),
+                        entry.get("hit"), entry.get("miss_reason"),
+                        entry.get("miss_category"), entry.get("resolved", 0),
+                    ),
+                )
+                conn.commit()
+
+    def get_learning_entries(self, *, resolved_only: bool = False, limit: int = 200) -> list[dict[str, Any]]:
+        self._ensure_learning_table()
+        where = "WHERE resolved = 1" if resolved_only else ""
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM learning_log {where} ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+
+    def get_unresolved_learning_entries(self) -> list[dict[str, Any]]:
+        self._ensure_learning_table()
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM learning_log WHERE resolved = 0 ORDER BY timestamp ASC",
+                ).fetchall()
+                return [dict(r) for r in rows]
+
+    def save_learning_report(self, report: dict[str, Any]) -> None:
+        self._ensure_learning_table()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO learning_reports
+                    (id, week_start, week_end, created_at, total_picks, hits, misses,
+                     hit_rate, miss_breakdown_json, suggestions_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report["id"], report["week_start"], report["week_end"],
+                        report["created_at"], report["total_picks"],
+                        report["hits"], report["misses"], report["hit_rate"],
+                        report.get("miss_breakdown_json", "{}"),
+                        report.get("suggestions_json", "[]"),
+                    ),
+                )
+                conn.commit()
+
+    def get_learning_reports(self, limit: int = 10) -> list[dict[str, Any]]:
+        self._ensure_learning_table()
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM learning_reports ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["miss_breakdown"] = json.loads(d.pop("miss_breakdown_json", "{}"))
+                    d["suggestions"] = json.loads(d.pop("suggestions_json", "[]"))
+                    out.append(d)
+                return out
+

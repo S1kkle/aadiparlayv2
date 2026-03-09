@@ -17,6 +17,7 @@ from app.clients.underdog import UnderdogClient, UnderdogConfig
 from app.db import SqliteTTLCache
 from app.models.core import HealthResponse, Prop, RankedPropsResponse, SportId
 from app.props_jobs import PropsJobRequest, PropsJobStore, sse_format
+from app.services.learning import LearningService
 from app.services.ranker import Ranker, RankerConfig
 
 
@@ -117,6 +118,8 @@ ranker = Ranker(
 )
 
 jobs = PropsJobStore()
+
+learning_svc = LearningService(cache=cache, espn=espn_client, llm=llm_client)
 
 async def _warm_league_matchup_caches() -> None:
     nba_keys = ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]
@@ -392,6 +395,56 @@ async def recommend_parlay(req: dict):
         return result
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ── Learning Mode endpoints ───────────────────────────────────────────
+
+@app.post("/learning/resolve")
+async def learning_resolve():
+    """Check actual game results for past picks and mark them as hits/misses."""
+    result = await learning_svc.resolve_outcomes()
+    return result
+
+
+@app.post("/learning/analyze-misses")
+async def learning_analyze_misses():
+    """Run AI analysis on missed picks to diagnose why they missed."""
+    result = await learning_svc.analyze_misses()
+    return result
+
+
+@app.post("/learning/weekly-report")
+async def learning_weekly_report():
+    """Generate a weekly improvement report from miss patterns."""
+    result = await learning_svc.generate_weekly_report()
+    return result
+
+
+@app.get("/learning/entries")
+async def learning_entries(resolved: bool = Query(False), limit: int = Query(100)):
+    """Get learning log entries."""
+    entries = cache.get_learning_entries(resolved_only=resolved, limit=limit)
+    return {"entries": entries}
+
+
+@app.get("/learning/reports")
+async def learning_reports(limit: int = Query(5)):
+    """Get weekly learning reports."""
+    reports = cache.get_learning_reports(limit=limit)
+    return {"reports": reports}
+
+
+@app.post("/learning/run-full")
+async def learning_run_full():
+    """Run the entire learning pipeline: resolve -> analyze misses -> weekly report."""
+    resolve_result = await learning_svc.resolve_outcomes()
+    analyze_result = await learning_svc.analyze_misses()
+    report = await learning_svc.generate_weekly_report()
+    return {
+        "resolve": resolve_result,
+        "analyze": analyze_result,
+        "report": report,
+    }
 
 
 @app.get("/debug/player/{sport}/{player_name}")

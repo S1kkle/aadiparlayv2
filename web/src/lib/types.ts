@@ -87,3 +87,42 @@ export type ParlayRecommendation = {
   risk_factors: string[];
   combined_model_prob: number;
 };
+
+export type LearningEntry = {
+  id: string;
+  history_id: string;
+  timestamp: string;
+  player_name: string;
+  sport: string;
+  stat: string;
+  line: number;
+  side: string;
+  model_prob: number | null;
+  implied_prob: number | null;
+  edge: number | null;
+  ai_bias: number | null;
+  ai_confidence: number | null;
+  actual_value: number | null;
+  hit: number;
+  miss_reason: string | null;
+  miss_category: string | null;
+  resolved: number;
+};
+
+export type LearningReport = {
+  id: string;
+  week_start: string;
+  week_end: string;
+  created_at: string;
+  total_picks: number;
+  hits: number;
+  misses: number;
+  hit_rate: number;
+  miss_breakdown: Record<string, number>;
+  suggestions: {
+    stat_model: string[];
+    ai_prompt: string[];
+    general_insights: string[];
+    biggest_blind_spot: string;
+  };
+};
