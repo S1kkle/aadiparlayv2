@@ -5,6 +5,7 @@ and generates weekly improvement reports.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,8 @@ from app.clients.espn import EspnClient
 from app.clients.groq import GroqClient
 from app.clients.ollama import OllamaClient
 from app.db import SqliteTTLCache
+
+log = logging.getLogger(__name__)
 
 
 class LearningService:
@@ -33,9 +36,16 @@ class LearningService:
     async def resolve_outcomes(self) -> dict[str, Any]:
         """Look up actual results for past picks that haven't been resolved yet."""
         history = self._cache.get_history(limit=50)
+        if not history:
+            return {"resolved": 0, "already_done": 0, "failed_lookup": 0, "skipped_future": 0, "detail": "No history entries found."}
+
+        existing_entries = self._cache.get_learning_entries(limit=5000)
+        existing_ids: set[str] = {e["id"] for e in existing_entries}
+
         resolved_count = 0
         already_done = 0
         failed = 0
+        skipped_future = 0
 
         for entry in history:
             hid = entry["id"]
@@ -47,10 +57,13 @@ class LearningService:
             for p in props:
                 if not isinstance(p, dict):
                     continue
-                lid = f"{hid}:{p.get('underdog_option_id', '')}"
 
-                existing = self._cache.get_learning_entries(limit=1000)
-                if any(e["id"] == lid for e in existing):
+                option_id = p.get("underdog_option_id", "")
+                if not option_id:
+                    continue
+                lid = f"{hid}:{option_id}"
+
+                if lid in existing_ids:
                     already_done += 1
                     continue
 
@@ -58,7 +71,8 @@ class LearningService:
                 if scheduled:
                     try:
                         game_time = datetime.fromisoformat(str(scheduled).replace("Z", "+00:00"))
-                        if game_time > datetime.now(timezone.utc) - timedelta(hours=2):
+                        if game_time > datetime.now(timezone.utc) - timedelta(hours=3):
+                            skipped_future += 1
                             continue
                     except Exception:
                         pass
@@ -92,28 +106,49 @@ class LearningService:
                     "miss_category": None,
                     "resolved": 1 if hit else 0,
                 })
+                existing_ids.add(lid)
                 resolved_count += 1
 
         return {
             "resolved": resolved_count,
             "already_done": already_done,
             "failed_lookup": failed,
+            "skipped_future": skipped_future,
         }
 
     async def _lookup_actual_value(self, prop: dict[str, Any]) -> float | None:
-        """Fetch the player's actual stat value for the game from ESPN."""
+        """Fetch the player's actual stat value for the game from ESPN.
+
+        Strategy:
+        1. If espn_athlete_id + stat_field present, use direct gamelog lookup.
+        2. Otherwise, search ESPN by player name and use the stat name to find a field.
+        """
         sport = prop.get("sport", "")
         athlete_id = prop.get("espn_athlete_id")
         stat_field = prop.get("stat_field")
         scheduled_at = prop.get("scheduled_at")
-
-        if not athlete_id or not stat_field:
-            return None
+        player_name = prop.get("player_name", "")
 
         sl = self._espn.sport_league_for_scope(sport)
         if sl is None:
             return None
         sport_slug, league_slug = sl
+
+        if not athlete_id and player_name:
+            try:
+                athlete_id = await self._espn.find_best_athlete_id(
+                    sport=sport_slug, league=league_slug, full_name=player_name
+                )
+            except Exception:
+                pass
+
+        if not athlete_id:
+            return None
+
+        if not stat_field:
+            stat_field = self._guess_stat_field(prop.get("stat", ""), sport)
+            if not stat_field:
+                return None
 
         try:
             gamelog = await self._espn.fetch_gamelog(
@@ -133,12 +168,48 @@ class LearningService:
                 target = datetime.fromisoformat(str(scheduled_at).replace("Z", "+00:00"))
                 for g in lines:
                     gd = g.get("game_date")
-                    if gd and abs((gd - target).total_seconds()) < 24 * 3600:
+                    if gd and abs((gd - target).total_seconds()) < 36 * 3600:
                         return float(g["value"])
             except Exception:
                 pass
 
         return float(lines[0]["value"]) if lines else None
+
+    @staticmethod
+    def _guess_stat_field(stat_name: str, sport: str) -> str | None:
+        """Map common Underdog stat names to ESPN gamelog field names."""
+        s = stat_name.lower().strip()
+        mapping: dict[str, str] = {
+            "points": "points",
+            "pts": "points",
+            "rebounds": "totalRebounds",
+            "total rebounds": "totalRebounds",
+            "rebs": "totalRebounds",
+            "assists": "assists",
+            "asts": "assists",
+            "steals": "steals",
+            "blocks": "blocks",
+            "turnovers": "turnovers",
+            "3-pointers made": "threePointFieldGoalsMade",
+            "3-pt made": "threePointFieldGoalsMade",
+            "three pointers made": "threePointFieldGoalsMade",
+            "pts + rebs": "points",
+            "pts + asts": "points",
+            "pts + rebs + asts": "points",
+            "fantasy points": "points",
+            "passing yards": "passingYards",
+            "rushing yards": "rushingYards",
+            "receiving yards": "receivingYards",
+            "receptions": "receptions",
+            "passing touchdowns": "passingTouchdowns",
+            "rush + rec yards": "rushingYards",
+            "goals": "goals",
+            "shots": "shots",
+            "shots on goal": "shotsOnGoal",
+            "saves": "saves",
+            "goals against": "goalsAgainst",
+        }
+        return mapping.get(s)
 
     # ── Step 2: AI miss analysis ──────────────────────────────────────
 
@@ -154,6 +225,7 @@ class LearningService:
             return {"analyzed": 0, "message": "No unanalyzed misses found."}
 
         analyzed = 0
+        errors = 0
         for entry in unanalyzed:
             prompt = (
                 "A sports prop pick MISSED. Analyze WHY it missed and categorize the reason.\n\n"
@@ -191,7 +263,9 @@ class LearningService:
                 result = await self._llm.analyze_prop(
                     prompt=prompt, timeout_s=45, system=miss_system
                 )
-            except Exception:
+            except Exception as exc:
+                log.warning("AI miss analysis failed for %s: %s", entry["id"], exc)
+                errors += 1
                 continue
 
             category = result.get("category", "outlier_performance")
@@ -209,7 +283,7 @@ class LearningService:
             self._cache.save_learning_entry(entry)
             analyzed += 1
 
-        return {"analyzed": analyzed, "total_unanalyzed": len(unanalyzed)}
+        return {"analyzed": analyzed, "total_unanalyzed": len(unanalyzed), "errors": errors}
 
     # ── Step 3: weekly report ─────────────────────────────────────────
 
@@ -227,7 +301,28 @@ class LearningService:
         ]
 
         if not week_entries:
-            return {"error": "No resolved picks in the last 7 days."}
+            all_resolved = self._cache.get_learning_entries(resolved_only=True, limit=500)
+            if all_resolved:
+                week_entries = all_resolved[:50]
+                week_start = week_entries[-1].get("timestamp", week_start) if week_entries else week_start
+            else:
+                return {
+                    "id": str(uuid.uuid4()),
+                    "week_start": week_start,
+                    "week_end": week_end,
+                    "created_at": now.isoformat(),
+                    "total_picks": 0,
+                    "hits": 0,
+                    "misses": 0,
+                    "hit_rate": 0,
+                    "miss_breakdown": {},
+                    "suggestions": {
+                        "stat_model": ["No data available yet — run predictions and wait for games to complete, then resolve outcomes."],
+                        "ai_prompt": [],
+                        "general_insights": [],
+                        "biggest_blind_spot": "No picks resolved yet.",
+                    },
+                }
 
         total = len(week_entries)
         hits = sum(1 for e in week_entries if e.get("hit") == 1)
@@ -295,11 +390,6 @@ class LearningService:
                 "general_insights": [],
                 "biggest_blind_spot": "N/A",
             }
-
-        suggestions = (
-            ai_result.get("stat_model_suggestions", [])
-            + ai_result.get("ai_prompt_suggestions", [])
-        )
 
         report = {
             "id": str(uuid.uuid4()),

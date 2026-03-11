@@ -211,6 +211,7 @@ export default function Home() {
   const [learningEntries, setLearningEntries] = useState<LearningEntry[]>([]);
   const [learningReports, setLearningReports] = useState<LearningReport[]>([]);
   const [learningError, setLearningError] = useState<string | null>(null);
+  const [learningStatus, setLearningStatus] = useState<string | null>(null);
   const [learningTab, setLearningTab] = useState<"overview" | "misses" | "report">("overview");
 
   const toggleParlay = useCallback((id: string) => {
@@ -370,8 +371,19 @@ export default function Home() {
   async function runLearningPipeline() {
     setLearningLoading(true);
     setLearningError(null);
+    setLearningStatus("Resolving outcomes from ESPN...");
     try {
-      await runFullLearning();
+      const result = await runFullLearning();
+      const r = result.resolve;
+      const parts: string[] = [];
+      if (r.resolved > 0) parts.push(`${r.resolved} picks resolved`);
+      if (r.already_done > 0) parts.push(`${r.already_done} already done`);
+      if (r.failed_lookup > 0) parts.push(`${r.failed_lookup} could not look up`);
+      if ((r as any).skipped_future > 0) parts.push(`${(r as any).skipped_future} games not finished yet`);
+      const a = result.analyze;
+      if (a.analyzed > 0) parts.push(`${a.analyzed} misses analyzed by AI`);
+      setLearningStatus(parts.length > 0 ? parts.join(" · ") : "No picks to resolve — run some predictions first and wait for games to finish.");
+
       const [entries, reports] = await Promise.all([
         fetchLearningEntries({ limit: 200 }),
         fetchLearningReports(5),
@@ -380,6 +392,7 @@ export default function Home() {
       setLearningReports(reports);
     } catch (e: any) {
       setLearningError(e?.message ?? "Failed to run learning pipeline");
+      setLearningStatus(null);
     } finally {
       setLearningLoading(false);
     }
@@ -1429,6 +1442,12 @@ export default function Home() {
                 </div>
               )}
 
+              {learningStatus && !learningLoading && (
+                <div className="mt-3 rounded-md border border-violet-200 bg-violet-50 p-3 text-sm text-violet-800 dark:border-violet-800/50 dark:bg-violet-950/30 dark:text-violet-200">
+                  {learningStatus}
+                </div>
+              )}
+
               {/* Sub-tabs */}
               <div className="mt-4 flex gap-1 border-b border-zinc-200 dark:border-zinc-800">
                 {([["overview", "Overview"], ["misses", "Miss Analysis"], ["report", "Weekly Report"]] as const).map(([key, label]) => (
@@ -1450,8 +1469,13 @@ export default function Home() {
               {learningTab === "overview" && (
                 <div className="mt-4">
                   {learningEntries.length === 0 ? (
-                    <div className="text-sm text-zinc-500">
-                      No resolved picks yet. Click &quot;Run Analysis&quot; to resolve outcomes from your prediction history.
+                    <div className="rounded-md border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900/30 dark:text-zinc-400">
+                      <div className="font-medium">No resolved picks yet.</div>
+                      <div className="mt-2 space-y-1 text-xs">
+                        <div>1. Run predictions for a sport (the top 10 picks are saved to history automatically)</div>
+                        <div>2. Wait for those games to finish</div>
+                        <div>3. Click &quot;Run Analysis&quot; to resolve outcomes, diagnose misses, and generate a report</div>
+                      </div>
                     </div>
                   ) : (
                     <>

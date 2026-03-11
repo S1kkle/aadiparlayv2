@@ -439,7 +439,10 @@ async def learning_run_full():
     """Run the entire learning pipeline: resolve -> analyze misses -> weekly report."""
     resolve_result = await learning_svc.resolve_outcomes()
     analyze_result = await learning_svc.analyze_misses()
-    report = await learning_svc.generate_weekly_report()
+    try:
+        report = await learning_svc.generate_weekly_report()
+    except Exception as e:
+        report = {"error": str(e)}
     return {
         "resolve": resolve_result,
         "analyze": analyze_result,
