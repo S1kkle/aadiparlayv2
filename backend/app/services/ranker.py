@@ -1,5 +1,6 @@
 import asyncio
 import math
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +25,14 @@ from app.services.stat_model import (
     poisson_prob_over,
     prob_over,
 )
+
+
+def fmtf(v: float | None, *, signed: bool = False) -> str:
+    if v is None:
+        return "?"
+    if signed:
+        return f"{v:+.3f}"
+    return f"{v:.3f}"
 
 
 @dataclass(frozen=True)
@@ -479,52 +488,104 @@ class Ranker:
         """Ask AI to pick the best N props from a candidate list. Returns 0-indexed indices."""
         assert self._ollama is not None
 
+        # Shuffle presentation order to prevent positional bias (AI picking top-listed)
+        indices = list(range(len(candidates)))
+        rng = random.Random(42)
+        rng.shuffle(indices)
+        idx_to_display: dict[int, int] = {}
+        display_to_idx: dict[int, int] = {}
+        for display_num, real_idx in enumerate(indices, start=1):
+            idx_to_display[real_idx] = display_num
+            display_to_idx[display_num] = real_idx
+
+        ask_count = min(pick_count + 5, len(candidates))
+
         lines: list[str] = []
-        for i, p in enumerate(candidates):
+        for real_idx in indices:
+            p = candidates[real_idx]
+            dn = idx_to_display[real_idx]
+
+            safety_note = ""
+            if p.stat_floor is not None and p.stat_median is not None:
+                if p.side == "over" and p.stat_floor > p.line:
+                    safety_note = "SAFE: even floor beats line. "
+                elif p.side == "over" and p.stat_median < p.line:
+                    safety_note = "RISKY: median below line. "
+                elif p.side == "under" and p.stat_ceiling is not None and p.stat_ceiling < p.line:
+                    safety_note = "SAFE: even ceiling under line. "
+                elif p.side == "under" and p.stat_median > p.line:
+                    safety_note = "RISKY: median above line. "
+
+            streak_note = ""
+            if p.current_streak and abs(p.current_streak) >= 3:
+                direction = "overs" if p.current_streak > 0 else "unders"
+                streak_note = f"{abs(p.current_streak)}-game {direction} streak. "
+
+            b2b_note = ""
+            if p.is_b2b:
+                b2b_note = "BACK-TO-BACK (fatigue risk). "
+            elif p.rest_days is not None and p.rest_days >= 3:
+                b2b_note = f"{p.rest_days}d rest (well-rested). "
+
             lines.append(
-                f"{i+1}. {p.player_name} ({p.sport} {p.team_abbr or '?'} vs {p.opponent_abbr or '?'}) | "
-                f"{p.side.upper()} {p.line} {p.display_stat or p.stat} | "
-                f"model={p.model_prob:.3f} impl={p.implied_prob:.3f} edge={p.edge:+.3f} "
-                f"hit={p.hit_rate_str or '?'} trend={p.trend_direction or '?'} "
-                f"streak={p.current_streak or 0} consistency={p.stat_consistency or '?'} "
-                f"median={p.stat_median or '?'} floor={p.stat_floor or '?'} ceil={p.stat_ceiling or '?'} "
-                f"{'HOME' if p.is_home else 'AWAY' if p.is_home is not None else '?'} "
-                f"{'B2B' if p.is_b2b else f'{p.rest_days}d rest' if p.rest_days else ''}"
+                f"#{dn}. {p.player_name} ({p.sport} | {p.team_abbr or '?'} vs {p.opponent_abbr or '?'}) | "
+                f"{p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
+                f"    Stats: avg={fmtf(p.model_prob and (p.stat_median or 0))}, median={fmtf(p.stat_median)}, "
+                f"floor={fmtf(p.stat_floor)}, ceil={fmtf(p.stat_ceiling)}, consistency={fmtf(p.stat_consistency)}\n"
+                f"    Model: prob={fmtf(p.model_prob)}, implied={fmtf(p.implied_prob)}, edge={fmtf(p.edge, signed=True)}, "
+                f"hit_rate={p.hit_rate_str or '?'}, trend={p.trend_direction or '?'}\n"
+                f"    Context: {'HOME' if p.is_home else 'AWAY' if p.is_home is not None else '?'} "
+                f"{b2b_note}{streak_note}{safety_note}"
             )
 
         prompt = (
-            f"You are selecting the best {pick_count} prop picks from the following {len(candidates)} candidates.\n"
-            f"Each candidate has been ranked by a statistical model. Your job is to apply qualitative reasoning\n"
-            f"to select the {pick_count} picks with the highest realistic chance of hitting.\n\n"
-            "CONSIDER:\n"
-            "- Positive edge (model_prob > implied_prob) is good but not everything\n"
-            "- High hit rate and consistency = reliable\n"
-            "- Hot streaks may continue short-term; cold streaks may mean something is off\n"
-            "- Matchup matters: home vs away, back-to-back, rest days\n"
-            "- Floor/ceiling: a player whose floor is near the line is safer\n"
-            "- Diversify across games/sports when possible\n"
-            "- Avoid props where the line is far above the player's median/ceiling\n\n"
+            f"You are an expert sports betting analyst selecting the {ask_count} BEST prop picks from "
+            f"{len(candidates)} candidates.\n\n"
+            "IMPORTANT: Candidates are in RANDOM order. Do NOT favor lower-numbered candidates.\n"
+            "The statistical model already ranked them, but it misses qualitative factors. "
+            "YOUR VALUE is reasoning about things the model CANNOT capture:\n\n"
+            "REASONING CHECKLIST — evaluate EACH candidate on:\n"
+            "1. LINE vs MEDIAN/FLOOR/CEILING: Is the line realistic given the player's range? "
+            "   A player with median 22 on an OVER 24.5 is risky. A player with floor 18 on OVER 15.5 is safe.\n"
+            "2. MATCHUP CONTEXT: Does home/away matter for this sport? Is the opponent strong or weak defensively?\n"
+            "3. FATIGUE/REST: Back-to-back games hurt production. Well-rested players perform better.\n"
+            "4. STREAK & TREND: Hot streaks in the pick's direction are good. Cold streaks or downtrends are red flags.\n"
+            "5. CONSISTENCY: High consistency (>60%) means the player reliably hits their average. "
+            "   Low consistency means more variance — riskier.\n"
+            "6. HIT RATE: How often has the player actually cleared this line recently?\n"
+            "7. AVOID: Props where the line is above the ceiling, or the player is trending away from the line.\n"
+            "8. DIVERSIFY: Don't load up on one sport or game. Spread picks across matchups.\n\n"
             "CANDIDATES:\n"
             + "\n".join(lines)
             + "\n\n"
-            f"Return ONLY valid JSON: {{\"picks\": [list of {pick_count} candidate numbers (1-indexed)], "
-            f"\"reasoning\": \"brief 2-3 sentence explanation of your selection strategy\"}}"
+            f"Select EXACTLY {ask_count} picks. For each, give a one-sentence reason WHY.\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\n"
+            f'  "picks": [list of {ask_count} candidate numbers (the # numbers above)],\n'
+            '  "reasons": {"<number>": "<one sentence reason>", ...},\n'
+            '  "reasoning": "2-3 sentence overall strategy summary"\n'
+            "}"
         )
 
         select_system = (
-            "You are a sports prop selection expert. "
-            "Return ONLY valid JSON with keys: picks (array of integers), reasoning (string). "
-            "Pick the candidates most likely to hit based on the statistical profile and situational context."
+            "You are a sharp sports prop analyst. Your job is to find the picks most likely to HIT, "
+            "NOT just the ones with the highest model edge. Use matchup logic, line safety, consistency, "
+            "and trend analysis. Candidates are in RANDOM order — do not favor lower numbers. "
+            "Return ONLY valid JSON with keys: picks (array of integers), reasons (object), reasoning (string)."
         )
 
-        cache_key = f"ai_select:{pick_count}:" + ":".join(
+        cache_key = f"ai_select:v2:{ask_count}:" + ":".join(
             p.underdog_option_id for p in candidates[:10]
         )
         cached = self._cache.get_json(cache_key)
         if isinstance(cached, dict) and cached.get("picks"):
             raw = cached["picks"]
             if isinstance(raw, list):
-                return [int(x) - 1 for x in raw if isinstance(x, (int, float)) and 1 <= int(x) <= len(candidates)]
+                return [
+                    display_to_idx[int(x)]
+                    for x in raw
+                    if isinstance(x, (int, float)) and int(x) in display_to_idx
+                ]
 
         try:
             result = await self._ollama.analyze_prop(
@@ -532,18 +593,19 @@ class Ranker:
             )
             self._cache.set_json(cache_key, result, ttl_seconds=10 * 60)
         except Exception:
-            return list(range(min(pick_count, len(candidates))))
+            return list(range(min(ask_count, len(candidates))))
 
         raw_picks = result.get("picks", [])
         if isinstance(raw_picks, list):
-            indices = []
+            real_indices = []
             for x in raw_picks:
-                if isinstance(x, (int, float)) and 1 <= int(x) <= len(candidates):
-                    indices.append(int(x) - 1)
-            if indices:
-                return indices[:pick_count]
+                dn = int(x) if isinstance(x, (int, float)) else None
+                if dn is not None and dn in display_to_idx:
+                    real_indices.append(display_to_idx[dn])
+            if real_indices:
+                return real_indices[:ask_count]
 
-        return list(range(min(pick_count, len(candidates))))
+        return list(range(min(ask_count, len(candidates))))
 
     async def _apply_espn_model(self, props: list[Prop]) -> None:
         assert self._espn is not None

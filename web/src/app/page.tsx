@@ -241,7 +241,7 @@ export default function Home() {
         refresh,
         maxProps: 200,
         aiLimit: 10,
-        requireAiCount: 10,
+        requireAiCount: 15,
       });
 
       const es = new EventSource(
@@ -413,10 +413,14 @@ export default function Home() {
   const topProps = useMemo(() => {
     let list = displayProps;
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
-    const withAi = sortProps(list.filter(hasAi), sortKey, sortAsc);
+    const withAiAgree = sortProps(
+      list.filter((p) => hasAi(p) && p.model_ai_agree === true),
+      sortKey,
+      sortAsc,
+    );
     const seenPlayers = new Set<string>();
     const deduped: Prop[] = [];
-    for (const p of withAi) {
+    for (const p of withAiAgree) {
       if (seenPlayers.has(p.player_name)) continue;
       seenPlayers.add(p.player_name);
       deduped.push(p);
