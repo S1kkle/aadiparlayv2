@@ -9,8 +9,10 @@ import {
   fetchPropsJobResult,
   fetchRankedProps,
   getBackendUrl,
+  learningAnalyzeMisses,
+  learningResolve,
+  learningWeeklyReport,
   recommendParlay,
-  runFullLearning,
   saveHistory,
   startPropsJob,
 } from "@/lib/api";
@@ -371,28 +373,60 @@ export default function Home() {
   async function runLearningPipeline() {
     setLearningLoading(true);
     setLearningError(null);
-    setLearningStatus("Resolving outcomes from ESPN...");
-    try {
-      const result = await runFullLearning();
-      const r = result.resolve;
-      const parts: string[] = [];
-      if (r.resolved > 0) parts.push(`${r.resolved} picks resolved`);
-      if (r.already_done > 0) parts.push(`${r.already_done} already done`);
-      if (r.failed_lookup > 0) parts.push(`${r.failed_lookup} could not look up`);
-      if ((r as any).skipped_future > 0) parts.push(`${(r as any).skipped_future} games not finished yet`);
-      const a = result.analyze;
-      if (a.analyzed > 0) parts.push(`${a.analyzed} misses analyzed by AI`);
-      setLearningStatus(parts.length > 0 ? parts.join(" · ") : "No picks to resolve — run some predictions first and wait for games to finish.");
+    const summaryParts: string[] = [];
 
-      const [entries, reports] = await Promise.all([
+    try {
+      // Step 1: Resolve outcomes
+      setLearningStatus("Step 1/3 — Resolving outcomes from ESPN game logs...");
+      const r = await learningResolve();
+      const resolveParts: string[] = [];
+      if (r.resolved > 0) resolveParts.push(`${r.resolved} new picks resolved`);
+      if (r.already_done > 0) resolveParts.push(`${r.already_done} already done`);
+      if (r.failed_lookup > 0) resolveParts.push(`${r.failed_lookup} couldn't look up`);
+      if (r.skipped_future > 0) resolveParts.push(`${r.skipped_future} games not finished yet`);
+      const resolveMsg = resolveParts.length > 0 ? resolveParts.join(", ") : "no new picks to resolve";
+      summaryParts.push(`Resolve: ${resolveMsg}`);
+
+      // Refresh entries after resolve so we see hits/misses
+      const entriesAfterResolve = await fetchLearningEntries({ limit: 200 });
+      setLearningEntries(entriesAfterResolve);
+
+      const missCount = entriesAfterResolve.filter(e => e.hit === 0 && e.resolved === 0).length;
+
+      // Step 2: Analyze misses
+      if (missCount > 0) {
+        setLearningStatus(`Step 2/3 — AI analyzing ${missCount} missed pick${missCount === 1 ? "" : "s"}...`);
+      } else {
+        setLearningStatus("Step 2/3 — Checking for unanalyzed misses...");
+      }
+      const a = await learningAnalyzeMisses();
+      if (a.analyzed > 0) {
+        summaryParts.push(`Misses: ${a.analyzed} analyzed by AI`);
+      } else {
+        summaryParts.push(`Misses: ${a.message || "none to analyze"}`);
+      }
+
+      // Refresh entries after miss analysis
+      const entriesAfterAnalysis = await fetchLearningEntries({ limit: 200 });
+      setLearningEntries(entriesAfterAnalysis);
+
+      // Step 3: Weekly report
+      setLearningStatus("Step 3/3 — Generating weekly improvement report...");
+      await learningWeeklyReport();
+      summaryParts.push("Report: generated");
+
+      // Final refresh
+      const [finalEntries, reports] = await Promise.all([
         fetchLearningEntries({ limit: 200 }),
         fetchLearningReports(5),
       ]);
-      setLearningEntries(entries);
+      setLearningEntries(finalEntries);
       setLearningReports(reports);
+
+      setLearningStatus(summaryParts.join(" · "));
     } catch (e: any) {
       setLearningError(e?.message ?? "Failed to run learning pipeline");
-      setLearningStatus(null);
+      setLearningStatus(summaryParts.length > 0 ? summaryParts.join(" · ") + " (stopped due to error)" : null);
     } finally {
       setLearningLoading(false);
     }

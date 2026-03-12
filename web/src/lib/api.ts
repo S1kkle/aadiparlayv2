@@ -96,19 +96,52 @@ export async function saveHistory(entry: { sport: string; props: any[] }): Promi
 
 // ── Learning Mode ─────────────────────────────────────────────────────
 
-export async function runFullLearning(): Promise<{
-  resolve: { resolved: number; already_done: number; failed_lookup: number };
-  analyze: { analyzed: number; total_unanalyzed?: number; message?: string };
-  report: LearningReport | { error: string };
+export async function learningResolve(): Promise<{
+  resolved: number;
+  already_done: number;
+  failed_lookup: number;
+  skipped_future: number;
+  detail?: string;
 }> {
   const backend = getBackendUrl();
-  const res = await fetch(new URL("/learning/run-full", backend).toString(), {
+  const res = await fetch(new URL("/learning/resolve", backend).toString(), {
     method: "POST",
     cache: "no-store",
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Backend error ${res.status}: ${text || res.statusText}`);
+    throw new Error(`Resolve failed ${res.status}: ${text || res.statusText}`);
+  }
+  return await res.json();
+}
+
+export async function learningAnalyzeMisses(): Promise<{
+  analyzed: number;
+  total_unanalyzed?: number;
+  errors?: number;
+  message?: string;
+}> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/learning/analyze-misses", backend).toString(), {
+    method: "POST",
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Analyze failed ${res.status}: ${text || res.statusText}`);
+  }
+  return await res.json();
+}
+
+export async function learningWeeklyReport(): Promise<LearningReport | { error: string }> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/learning/weekly-report", backend).toString(), {
+    method: "POST",
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Report failed ${res.status}: ${text || res.statusText}`);
   }
   return await res.json();
 }
