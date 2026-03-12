@@ -1470,7 +1470,7 @@ export default function Home() {
                     <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-500 opacity-75" />
                     <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-violet-600" />
                   </span>
-                  Resolving outcomes, analyzing misses, generating report… This may take a minute.
+                  {learningStatus || "Starting..."}
                 </div>
               )}
 
