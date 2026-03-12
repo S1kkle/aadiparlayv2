@@ -307,6 +307,24 @@ async def start_props_job(req: dict) -> dict[str, str]:
             resp = RankedPropsResponse(
                 scope=f"{r.scope}:{r.sport}", updated_at=datetime.now(timezone.utc), props=props
             )
+
+            # Auto-save top picks to history so Learning Mode can resolve them later
+            try:
+                top_for_history = [p for p in props if isinstance(p.ai_summary, str) and p.ai_summary.strip()][:15]
+                if not top_for_history:
+                    top_for_history = props[:15]
+                if top_for_history:
+                    entry_id = str(_uuid.uuid4())
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    cache.save_history(
+                        entry_id,
+                        timestamp,
+                        r.sport,
+                        _json.dumps([p.model_dump(mode="json") for p in top_for_history], default=str),
+                    )
+            except Exception:
+                pass
+
             await jobs.set_done(job, resp)
         except Exception as e:
             await jobs.set_error(job, str(e))
@@ -355,7 +373,7 @@ import uuid as _uuid
 @app.get("/history")
 async def get_history():
     entries = cache.get_history(limit=30)
-    return {"entries": entries}
+    return {"count": len(entries), "entries": entries}
 
 
 @app.post("/history")
