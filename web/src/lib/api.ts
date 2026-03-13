@@ -94,6 +94,18 @@ export async function saveHistory(entry: { sport: string; props: any[] }): Promi
   });
 }
 
+export async function seedHistory(entries: HistoryEntry[]): Promise<{ seeded: number }> {
+  const backend = getBackendUrl();
+  const res = await fetch(new URL("/history/seed", backend).toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries }),
+    cache: "no-store",
+  });
+  if (!res.ok) return { seeded: 0 };
+  return await res.json();
+}
+
 // ── Learning Mode ─────────────────────────────────────────────────────
 
 export async function learningResolve(): Promise<{

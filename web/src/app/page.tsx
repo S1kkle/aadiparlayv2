@@ -14,9 +14,32 @@ import {
   learningWeeklyReport,
   recommendParlay,
   saveHistory,
+  seedHistory,
   startPropsJob,
 } from "@/lib/api";
 import type { HistoryEntry, LearningEntry, LearningReport, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+
+// ── localStorage history persistence ──────────────────────────────────
+const LS_HISTORY_KEY = "parlay_prediction_history";
+
+function lsGetHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(LS_HISTORY_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function lsSaveHistoryEntry(entry: HistoryEntry) {
+  try {
+    const existing = lsGetHistory();
+    const merged = [entry, ...existing.filter((e) => e.id !== entry.id)].slice(0, 100);
+    localStorage.setItem(LS_HISTORY_KEY, JSON.stringify(merged));
+  } catch {}
+}
 
 const SPORT_OPTIONS: { id: SportId; label: string }[] = [
   { id: "UNKNOWN", label: "All sports" },
@@ -299,8 +322,18 @@ export default function Home() {
             setModelProps([]);
             setLoading(false);
             setJobProgress(null);
+            // Save to localStorage (survives browser close + Render restarts)
+            const historyProps = res.props.slice(0, 15);
+            const historyEntry: HistoryEntry = {
+              id: `local-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              sport,
+              props: historyProps as any,
+            };
+            lsSaveHistoryEntry(historyEntry);
+            // Also save to backend (best-effort)
             try {
-              await saveHistory({ sport, props: res.props.slice(0, 10) });
+              await saveHistory({ sport, props: historyProps });
             } catch {}
           }
         } catch {}
@@ -348,11 +381,19 @@ export default function Home() {
   }
 
   async function loadHistory() {
+    const local = lsGetHistory();
+    let remote: HistoryEntry[] = [];
     try {
-      const h = await fetchHistory();
-      setHistory(h);
-      setShowHistory(true);
+      remote = await fetchHistory();
     } catch {}
+    // Merge: combine both, deduplicate by id, sort newest first
+    const byId = new Map<string, HistoryEntry>();
+    for (const e of [...remote, ...local]) byId.set(e.id, e);
+    const merged = [...byId.values()].sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+    setHistory(merged);
+    setShowHistory(true);
   }
 
   async function openLearning() {
@@ -376,6 +417,15 @@ export default function Home() {
     const summaryParts: string[] = [];
 
     try {
+      // Step 0: Re-seed backend with localStorage history (survives Render restarts)
+      setLearningStatus("Syncing prediction history to backend...");
+      const localHistory = lsGetHistory();
+      if (localHistory.length > 0) {
+        try {
+          await seedHistory(localHistory);
+        } catch {}
+      }
+
       // Step 1: Resolve outcomes
       setLearningStatus("Step 1/3 — Resolving outcomes from ESPN game logs...");
       const r = await learningResolve();

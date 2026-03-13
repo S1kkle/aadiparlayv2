@@ -378,12 +378,36 @@ async def get_history():
 
 @app.post("/history")
 async def save_history(req: dict):
-    entry_id = str(_uuid.uuid4())
-    timestamp = datetime.now(timezone.utc).isoformat()
+    entry_id = req.get("id") or str(_uuid.uuid4())
+    timestamp = req.get("timestamp") or datetime.now(timezone.utc).isoformat()
     sport = req.get("sport", "UNKNOWN")
     props_list = req.get("props", [])
     cache.save_history(entry_id, timestamp, sport, _json.dumps(props_list, default=str))
     return {"status": "ok", "id": entry_id}
+
+
+@app.post("/history/seed")
+async def seed_history(req: dict):
+    """Bulk-seed history entries from localStorage. Skips entries that already exist."""
+    entries = req.get("entries", [])
+    if not isinstance(entries, list):
+        return {"status": "ok", "seeded": 0}
+    existing = cache.get_history(limit=500)
+    existing_ids = {e["id"] for e in existing}
+    seeded = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        eid = entry.get("id", "")
+        if eid in existing_ids:
+            continue
+        sport = entry.get("sport", "UNKNOWN")
+        props_list = entry.get("props", [])
+        timestamp = entry.get("timestamp", datetime.now(timezone.utc).isoformat())
+        cache.save_history(eid, timestamp, sport, _json.dumps(props_list, default=str))
+        existing_ids.add(eid)
+        seeded += 1
+    return {"status": "ok", "seeded": seeded}
 
 
 @app.post("/parlay/recommend")
