@@ -46,9 +46,13 @@ export type Prop = {
   decimal_price?: number | null;
   model_prob?: number | null;
   implied_prob?: number | null;
+  no_vig_prob?: number | null;
   edge?: number | null;
   ev?: number | null;
   volatility?: number | null;
+  kelly_fraction?: number | null;
+  edge_confidence?: number | null;
+  per_minute_rate?: number | null;
 
   // ai
   ai_bias?: number | null;

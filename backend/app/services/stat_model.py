@@ -162,3 +162,125 @@ def line_percentile(*, line: float, params: NormalParams) -> float:
         return 0.5
     z = (line - params.mu) / params.sigma
     return normal_cdf(z)
+
+
+# ── Sharp betting additions ───────────────────────────────────────────
+
+
+def devig_multiplicative(implied_over: float, implied_under: float) -> tuple[float, float]:
+    """Remove vig using the multiplicative (proportional) method.
+
+    Sportsbooks inflate both sides so they sum to >1.  This divides each
+    side by the total overround to recover true probabilities.
+    """
+    total = implied_over + implied_under
+    if total <= 0:
+        return (0.5, 0.5)
+    return (implied_over / total, implied_under / total)
+
+
+def devig_power(implied_over: float, implied_under: float, *, tol: float = 1e-8, max_iter: int = 50) -> tuple[float, float]:
+    """Remove vig using the power method (better for favorite-longshot bias).
+
+    Finds exponent k such that implied_over^k + implied_under^k = 1.
+    """
+    if implied_over <= 0 or implied_under <= 0:
+        return devig_multiplicative(implied_over, implied_under)
+
+    lo, hi = 0.5, 2.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        s = implied_over ** mid + implied_under ** mid
+        if abs(s - 1.0) < tol:
+            break
+        if s > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    return (implied_over ** mid, implied_under ** mid)
+
+
+def kelly_fraction(
+    model_prob: float,
+    decimal_odds: float,
+    *,
+    fraction: float = 0.25,
+) -> float:
+    """Fractional Kelly criterion — optimal bet sizing as fraction of bankroll.
+
+    Full Kelly = (p * b - q) / b, where p = win prob, q = 1-p, b = net decimal odds.
+    We return fraction * full_kelly (default 25% = quarter Kelly, standard for sharps).
+    Returns 0 if edge is non-positive.
+    """
+    if model_prob <= 0 or model_prob >= 1 or decimal_odds <= 1:
+        return 0.0
+    b = decimal_odds - 1.0
+    q = 1.0 - model_prob
+    full_kelly = (model_prob * b - q) / b
+    if full_kelly <= 0:
+        return 0.0
+    return round(min(full_kelly * fraction, 0.10), 4)  # cap at 10% of bankroll
+
+
+def per_minute_rate(total: float, minutes: float) -> float | None:
+    """Compute per-minute production rate. Returns None if insufficient minutes."""
+    if minutes < 5:
+        return None
+    return total / minutes
+
+
+def projected_value(per_min_rate: float, projected_minutes: float) -> float:
+    """Project stat value from per-minute rate and expected minutes."""
+    return per_min_rate * projected_minutes
+
+
+def blowout_minutes_discount(spread: float, avg_minutes: float) -> float:
+    """Estimate minutes reduction for blowouts.
+
+    Sharp principle: spreads >10 pts reduce starter minutes by ~10-15%.
+    Returns projected minutes after discount.
+    """
+    abs_spread = abs(spread)
+    if abs_spread <= 7:
+        return avg_minutes
+    if abs_spread <= 10:
+        return avg_minutes * 0.95
+    if abs_spread <= 14:
+        return avg_minutes * 0.90
+    return avg_minutes * 0.85
+
+
+def edge_confidence(
+    edge: float,
+    n_games: int,
+    cv: float,
+) -> float:
+    """Variance-weighted edge confidence.
+
+    Sharps don't just look at raw edge — they weight it by:
+    1. Sample size (more games = more reliable)
+    2. Player consistency (low CV = more reliable edge)
+
+    Returns a 0..1 confidence score.
+    """
+    sample_factor = min(1.0, n_games / 15.0)
+
+    cv_factor = 1.0
+    if cv > 0:
+        cv_factor = max(0.3, 1.0 - (cv - 0.3) * 0.7)
+        cv_factor = min(1.0, cv_factor)
+
+    raw = abs(edge) * sample_factor * cv_factor
+    return round(min(1.0, raw * 10.0), 3)
+
+
+def continuous_shrinkage(sample_mean: float, n: int, prior_mean: float) -> float:
+    """Continuous Bayesian shrinkage that scales smoothly with sample size.
+
+    Unlike the current binary shrinkage (only for n<5), this always applies
+    some shrinkage, but it diminishes as sample size grows.
+    Equivalent to a prior with strength ~8 games.
+    """
+    k = 8.0
+    weight = n / (n + k)
+    return weight * sample_mean + (1 - weight) * prior_mean

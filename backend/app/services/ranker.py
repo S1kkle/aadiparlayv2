@@ -18,12 +18,19 @@ from app.services.underdog_normalizer import (
 from app.services.stat_model import (
     NormalParams,
     bayesian_shrink,
+    blowout_minutes_discount,
     compute_stat_profile,
+    continuous_shrinkage,
+    devig_power,
+    edge_confidence as compute_edge_confidence,
     fit_normal_weighted,
     is_low_count_stat,
+    kelly_fraction as compute_kelly,
     line_percentile,
+    per_minute_rate as compute_per_min,
     poisson_prob_over,
     prob_over,
+    projected_value,
 )
 
 
@@ -170,9 +177,14 @@ def _compute_confidence_tier(p: Prop) -> str:
     if p.current_streak is not None and abs(p.current_streak) >= 3:
         if (p.side == "over" and p.current_streak > 0) or (p.side == "under" and p.current_streak < 0):
             score += 1
-    if score >= 4:
+    # Sharp additions
+    if (p.kelly_fraction or 0) > 0.01:
+        score += 1
+    if (p.edge_confidence or 0) > 0.5:
+        score += 1
+    if score >= 5:
         return "high"
-    if score >= 2:
+    if score >= 3:
         return "medium"
     return "low"
 
@@ -259,24 +271,60 @@ class Ranker:
                         f"Model not supported for {p.sport} yet (experimental); using implied probability."
                     )
 
+        # Vig removal — compute true no-vig probabilities (sharp principle #1)
+        for p in props:
+            impl = p.implied_prob or 0.5
+            impl_other = 1.0 - impl
+            if impl > 0 and impl_other > 0:
+                nv_side, _ = devig_power(impl, impl_other)
+                p.no_vig_prob = round(nv_side, 4)
+            else:
+                p.no_vig_prob = impl
+
         edge_vals: list[float] = []
         ev_vals: list[float] = []
         vol_vals: list[float] = []
         for p in props:
-            p.edge = (p.model_prob or 0.0) - (p.implied_prob or 0.0)
+            # Edge against no-vig line (sharps measure edge vs true prob, not vs vigged line)
+            p.edge = (p.model_prob or 0.0) - (p.no_vig_prob or p.implied_prob or 0.0)
             p.ev = (p.model_prob or 0.0) * ((p.decimal_price or 1.0) - 1.0) - (1.0 - (p.model_prob or 0.0))
             edge_vals.append(p.edge or 0.0)
             ev_vals.append(p.ev or 0.0)
             vol_vals.append(float(p.volatility or 0.0))
 
+            # Kelly fraction — optimal bet sizing signal
+            p.kelly_fraction = compute_kelly(
+                p.model_prob or 0.0,
+                p.decimal_price or 1.0,
+                fraction=0.25,
+            )
+
+            # Edge confidence — variance-weighted reliability of the edge
+            n_games = len(p.recent_games) if p.recent_games else 0
+            cv = 0.0
+            if p.stat_consistency is not None:
+                cv = max(0.0, 1.0 - p.stat_consistency)
+            p.edge_confidence = compute_edge_confidence(p.edge or 0.0, n_games, cv)
+
         edge_z = _zscore(edge_vals)
         ev_z = _zscore(ev_vals)
         vol_z = _zscore(vol_vals)
+        kelly_vals = [p.kelly_fraction or 0.0 for p in props]
+        kelly_z = _zscore(kelly_vals)
+        ec_vals = [p.edge_confidence or 0.0 for p in props]
+        ec_z = _zscore(ec_vals)
 
         z_by_option: dict[str, tuple[float, float, float]] = {}
         for i, p in enumerate(props):
             z_by_option[p.underdog_option_id] = (edge_z[i], ev_z[i], vol_z[i])
-            p.score = self._cfg.w_edge * edge_z[i] + self._cfg.w_ev * ev_z[i] - self._cfg.w_vol * vol_z[i]
+            # Sharp composite: standard factors + Kelly sizing signal + edge reliability
+            p.score = (
+                self._cfg.w_edge * edge_z[i]
+                + self._cfg.w_ev * ev_z[i]
+                - self._cfg.w_vol * vol_z[i]
+                + 0.15 * kelly_z[i]   # Kelly signal — sharps bet bigger on better edges
+                + 0.10 * ec_z[i]      # Edge confidence — trust edges backed by more data
+            )
 
         await _emit_stage("rank", "Scoring and ranking props...")
 
@@ -809,6 +857,24 @@ class Ranker:
                     p.rest_days = max(0, days)
                     p.is_b2b = (days <= 1)
 
+            # Per-minute rate (NBA) — sharps normalize by playing time
+            if p.sport == "NBA" and p.avg_minutes and p.avg_minutes > 10 and field_used:
+                recent_vals = series[:5] if len(series) >= 5 else series
+                recent_mins = self._espn.extract_stat_series(
+                    gamelog, field_name="minutes", last_n=len(recent_vals)
+                )
+                if recent_mins and len(recent_mins) == len(recent_vals):
+                    total_stat = sum(recent_vals)
+                    total_min = sum(recent_mins)
+                    rate = compute_per_min(total_stat, total_min)
+                    if rate is not None:
+                        p.per_minute_rate = round(rate, 4)
+
+            # Continuous Bayesian shrinkage — sharps always regress toward the mean
+            n = len(series)
+            shrunk_mu = continuous_shrinkage(params.mu, n, p.line)
+            params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
+
             # Model probability — Poisson for low-count stats (#3), normal otherwise
             if is_low_count_stat(field_used):
                 p_over = poisson_prob_over(line=p.line, lam=params.mu)
@@ -989,7 +1055,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v10"
+        AI_PROMPT_VERSION = "v11"
         sem = asyncio.Semaphore(3)
 
         def _mean(xs: list[float]) -> float | None:
@@ -1279,9 +1345,18 @@ class Ranker:
             dist_lines.append(f"recent_hit_rate_vs_line: {last10_hit}")
             dist_lines.append(f"vs_opp_avg: {vs_avg}")
             dist_lines.append(f"vs_opp_hit_rate_vs_line: {vs_hit}")
+            # Sharp betting context
+            if p.no_vig_prob is not None:
+                dist_lines.append(f"no_vig_true_prob: {p.no_vig_prob:.3f} (vig-removed market probability)")
+            if p.kelly_fraction is not None and p.kelly_fraction > 0:
+                dist_lines.append(f"kelly_fraction: {p.kelly_fraction:.2%} of bankroll (fractional Kelly)")
+            if p.edge_confidence is not None:
+                dist_lines.append(f"edge_confidence: {p.edge_confidence:.1%} (variance-weighted reliability)")
+            if p.per_minute_rate is not None:
+                dist_lines.append(f"per_minute_rate: {p.per_minute_rate:.3f} (production per minute played)")
 
             prompt = (
-                "Analyze an Underdog Pick'em prop.\n"
+                "Analyze an Underdog Pick'em prop using SHARP BETTING principles.\n"
                 "Write a concise, logically-reasoned summary that weighs matchup context and recent form.\n"
                 "Rules:\n"
                 + sport_rules
@@ -1289,7 +1364,15 @@ class Ranker:
                 "- Do NOT just restate model_prob/edge; explain *why*.\n"
                 "- Consider trend, streak, consistency, floor/ceiling range, and situational factors.\n"
                 "- If the player has a hot/cold streak, mention it and whether you expect regression.\n"
-                "- If the line is significantly above or below the player's median, note this.\n\n"
+                "- If the line is significantly above or below the player's median, note this.\n"
+                "- SHARP PRINCIPLES to apply:\n"
+                "  * Compare edge against the NO-VIG probability (true market price), not the vigged line.\n"
+                "  * A positive Kelly fraction means the edge is real enough to bet on. Zero Kelly = no edge.\n"
+                "  * High edge_confidence means the edge is backed by consistent data; low means unreliable.\n"
+                "  * Per-minute rate is more reliable than raw totals — if minutes drop, production drops.\n"
+                "  * Small samples (< 10 games) should be treated skeptically; edge could be noise.\n"
+                "  * Extreme edges (>15%) against efficient markets are usually model error, not real value.\n"
+                "  * Lines near the player's median are hardest to beat; lines far from median may have real edge.\n\n"
                 f"Sport: {p.sport}\n"
                 f"{context_label}\n"
                 f"Pick: {p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
@@ -1334,7 +1417,10 @@ class Ranker:
                 "MODEL_OUTPUT:\n"
                 f"- model_prob: {p.model_prob}\n"
                 f"- implied_prob: {p.implied_prob}\n"
-                f"- edge: {p.edge}\n\n"
+                f"- no_vig_prob: {p.no_vig_prob}\n"
+                f"- edge (vs no-vig): {p.edge}\n"
+                f"- kelly_fraction: {p.kelly_fraction}\n"
+                f"- edge_confidence: {p.edge_confidence}\n\n"
                 "Return JSON only."
             )
 

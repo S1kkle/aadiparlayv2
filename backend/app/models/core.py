@@ -85,9 +85,13 @@ class Prop(BaseModel):
     # model outputs
     model_prob: float | None = None
     implied_prob: float | None = None
+    no_vig_prob: float | None = None  # true implied prob after vig removal
     edge: float | None = None
     ev: float | None = None
     volatility: float | None = None
+    kelly_fraction: float | None = None  # fractional Kelly bet size (0..0.10)
+    edge_confidence: float | None = None  # variance-weighted edge confidence (0..1)
+    per_minute_rate: float | None = None  # stat production per minute played
 
     # ai outputs
     ai_bias: int | None = None  # -1,0,1

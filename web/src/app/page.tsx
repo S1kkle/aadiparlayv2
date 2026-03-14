@@ -1148,6 +1148,36 @@ export default function Home() {
                                           </span>
                                         </div>
                                       )}
+                                      {p.no_vig_prob != null && (
+                                        <div>
+                                          <span className="text-zinc-500">No-vig:</span>{" "}
+                                          <span className="font-mono text-zinc-800 dark:text-zinc-100">{(p.no_vig_prob * 100).toFixed(1)}%</span>
+                                        </div>
+                                      )}
+                                      {p.kelly_fraction != null && p.kelly_fraction > 0 && (
+                                        <div>
+                                          <span className="text-zinc-500">Kelly:</span>{" "}
+                                          <span className="font-mono text-emerald-600 dark:text-emerald-400">{(p.kelly_fraction * 100).toFixed(1)}%</span>
+                                        </div>
+                                      )}
+                                      {p.edge_confidence != null && (
+                                        <div>
+                                          <span className="text-zinc-500">Edge conf:</span>{" "}
+                                          <span className={`font-mono ${
+                                            p.edge_confidence > 0.5 ? "text-emerald-600 dark:text-emerald-400"
+                                            : p.edge_confidence < 0.2 ? "text-rose-600 dark:text-rose-400"
+                                            : "text-zinc-800 dark:text-zinc-100"
+                                          }`}>
+                                            {(p.edge_confidence * 100).toFixed(0)}%
+                                          </span>
+                                        </div>
+                                      )}
+                                      {p.per_minute_rate != null && (
+                                        <div>
+                                          <span className="text-zinc-500">Per-min:</span>{" "}
+                                          <span className="font-mono text-zinc-800 dark:text-zinc-100">{p.per_minute_rate.toFixed(3)}</span>
+                                        </div>
+                                      )}
                                     </div>
                                   </div>
 
