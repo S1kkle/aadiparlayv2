@@ -1055,8 +1055,8 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v11"
-        sem = asyncio.Semaphore(3)
+        AI_PROMPT_VERSION = "v12"
+        sem = asyncio.Semaphore(5)
 
         def _mean(xs: list[float]) -> float | None:
             if not xs:

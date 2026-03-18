@@ -10,6 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 
+from app.clients.claude import ClaudeClient, ClaudeConfig
 from app.clients.espn import EspnClient, EspnConfig
 from app.clients.groq import GroqClient, GroqConfig
 from app.clients.ollama import OllamaClient, OllamaConfig
@@ -74,10 +75,19 @@ espn_client = EspnClient(
     cache=cache,
 )
 
-# LLM: Groq (cloud, always-on) if API key set; else Ollama (local)
+# LLM priority: Claude (smartest, best rate limits) > Groq (free) > Ollama (local)
+_claude_key = _env("ANTHROPIC_API_KEY")
 _groq_key = _env("GROQ_API_KEY")
-if _groq_key and _groq_key.strip():
-    llm_client: OllamaClient | GroqClient = GroqClient(
+
+if _claude_key and _claude_key.strip():
+    llm_client: OllamaClient | GroqClient | ClaudeClient = ClaudeClient(
+        ClaudeConfig(
+            api_key=_claude_key,
+            model=_env("ANTHROPIC_MODEL", "claude-sonnet-4-20250514") or "claude-sonnet-4-20250514",
+        )
+    )
+elif _groq_key and _groq_key.strip():
+    llm_client = GroqClient(
         GroqConfig(
             api_key=_groq_key,
             model=_env("GROQ_MODEL", "llama-3.1-8b-instant") or "llama-3.1-8b-instant",

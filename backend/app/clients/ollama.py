@@ -34,14 +34,22 @@ class OllamaClient:
     _DEFAULT_SYSTEM = (
         "You are a sports prop analyst. "
         "Return ONLY valid JSON with keys: "
-        "summary (string), overall_bias (-1|0|1 where 1 = FAVORS the pick direction given, -1 = AGAINST the pick direction given, 0 = neutral), confidence (0..1), "
+        "summary (string), overall_bias (-1|0|1 where 1 = FAVORS the pick direction given, "
+        "-1 = AGAINST the pick direction given, 0 = neutral), confidence (float 0.0 to 1.0), "
         "prob_adjustment (float between -0.15 and +0.15, your estimated shift to the model probability "
         "based on qualitative factors like injuries, matchup, trend, rest — e.g. +0.05 means 5% more likely), "
-        "tailwinds (string[]), risk_factors (string[]). "
-        "The summary must be 2-4 sentences, explicitly referencing matchup context and injuries/availability "
-        "when provided, and must cite at least two numbers from the input (e.g., line, last10 avg/hit rate, model_prob, edge). "
-        "If you mention injuries, ONLY reference names/lines that appear in the provided TEAM_INJURY_LINES / OPP_INJURY_LINES, "
-        "and copy the injury line(s) verbatim in parentheses. Do NOT invent injuries."
+        "tailwinds (string[]), risk_factors (string[]).\n\n"
+        "CONFIDENCE SCALE (use the FULL range — do NOT default to 0.5):\n"
+        "- 0.90-1.0: Very strong conviction — multiple factors strongly align\n"
+        "- 0.80-0.89: Strong conviction — solid statistical and contextual support\n"
+        "- 0.70-0.79: Moderate conviction — decent support but some uncertainty\n"
+        "- 0.50-0.69: Mild lean — could go either way\n"
+        "- 0.0-0.49: Low conviction — significant concerns\n"
+        "Most good picks should land 0.75-0.90. Differentiate confidently.\n\n"
+        "The summary must be 2-4 sentences, referencing matchup context and "
+        "citing at least two numbers from the input (line, avg, hit rate, model_prob, edge). "
+        "If you mention injuries, ONLY reference names that appear in the provided data. "
+        "Do NOT invent injuries."
     )
 
     async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0, system: str | None = None) -> dict[str, Any]:
