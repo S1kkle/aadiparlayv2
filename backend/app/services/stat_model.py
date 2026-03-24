@@ -284,3 +284,90 @@ def continuous_shrinkage(sample_mean: float, n: int, prior_mean: float) -> float
     k = 8.0
     weight = n / (n + k)
     return weight * sample_mean + (1 - weight) * prior_mean
+
+
+# ── Learning-driven refinements ───────────────────────────────────────
+
+
+STAT_VOLATILITY: dict[str, float] = {
+    "assists": 1.35,
+    "steals": 1.40,
+    "blocks": 1.40,
+    "turnovers": 1.25,
+    "three_points_made": 1.30,
+    "threePointFieldGoalsMade": 1.30,
+    "double_doubles": 1.50,
+    "triple_doubles": 1.60,
+    "goals": 1.35,
+    "knockDowns": 1.50,
+    "submissions": 1.50,
+}
+
+
+def stat_volatility_multiplier(field_name: str | None) -> float:
+    """Inflate sigma for inherently noisy stat types.
+
+    Assists depend on teammate shot-making, steals/blocks on opponent behavior.
+    These stats have higher game-to-game variance than points or rebounds.
+    """
+    if field_name is None:
+        return 1.0
+    return STAT_VOLATILITY.get(field_name, 1.0)
+
+
+def line_proximity_penalty(*, line: float, median: float, sigma: float) -> float:
+    """Penalize picks where the line is very close to the player's median.
+
+    When |line - median| < 0.5*sigma, the pick is essentially a coin flip
+    regardless of what the model says. Returns a 0..1 multiplier on the
+    excess probability (amount above 0.5).
+    """
+    if sigma <= 0:
+        return 1.0
+    gap = abs(line - median) / sigma
+    if gap >= 0.75:
+        return 1.0
+    if gap <= 0.15:
+        return 0.4
+    return 0.4 + (gap - 0.15) / (0.75 - 0.15) * 0.6
+
+
+def edge_skepticism(edge: float) -> float:
+    """Dampen extreme edges — edges >15% against efficient markets are usually model error.
+
+    Sportsbooks are good at setting lines. A 27% edge on a role player's points
+    almost certainly means the model is wrong, not that the book is.
+    """
+    abs_e = abs(edge)
+    if abs_e <= 0.10:
+        return edge
+    if abs_e <= 0.20:
+        damped = 0.10 + (abs_e - 0.10) * 0.5
+    else:
+        damped = 0.15 + (abs_e - 0.20) * 0.25
+    return math.copysign(min(damped, 0.20), edge)
+
+
+def integer_line_adjustment(
+    *, line: float, mu: float, sigma: float, is_integer_stat: bool
+) -> float:
+    """Adjust probability for the discrete nature of integer stats.
+
+    OVER 2.5 assists means the player needs 3+ (not 2.51). The normal
+    distribution treats 2.5 as a continuous threshold, but in reality
+    there's a meaningful jump from 2 to 3.
+
+    Returns a probability adjustment (positive = helps over, negative = helps under).
+    """
+    if not is_integer_stat or sigma <= 0:
+        return 0.0
+    frac = line - math.floor(line)
+    if abs(frac - 0.5) > 0.01:
+        return 0.0
+
+    threshold = math.ceil(line)
+    z_threshold = (threshold - mu) / sigma
+    z_line = (line - mu) / sigma
+    p_threshold = 1.0 - normal_cdf(z_threshold)
+    p_line = 1.0 - normal_cdf(z_line)
+    return round(p_threshold - p_line, 4)

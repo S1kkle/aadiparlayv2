@@ -23,14 +23,18 @@ from app.services.stat_model import (
     continuous_shrinkage,
     devig_power,
     edge_confidence as compute_edge_confidence,
+    edge_skepticism,
     fit_normal_weighted,
+    integer_line_adjustment,
     is_low_count_stat,
     kelly_fraction as compute_kelly,
     line_percentile,
+    line_proximity_penalty,
     per_minute_rate as compute_per_min,
     poisson_prob_over,
     prob_over,
     projected_value,
+    stat_volatility_multiplier,
 )
 
 
@@ -285,8 +289,8 @@ class Ranker:
         ev_vals: list[float] = []
         vol_vals: list[float] = []
         for p in props:
-            # Edge against no-vig line (sharps measure edge vs true prob, not vs vigged line)
-            p.edge = (p.model_prob or 0.0) - (p.no_vig_prob or p.implied_prob or 0.0)
+            raw_edge = (p.model_prob or 0.0) - (p.no_vig_prob or p.implied_prob or 0.0)
+            p.edge = edge_skepticism(raw_edge)
             p.ev = (p.model_prob or 0.0) * ((p.decimal_price or 1.0) - 1.0) - (1.0 - (p.model_prob or 0.0))
             edge_vals.append(p.edge or 0.0)
             ev_vals.append(p.ev or 0.0)
@@ -603,6 +607,14 @@ class Ranker:
             "6. HIT RATE: How often has the player actually cleared this line recently?\n"
             "7. AVOID: Props where the line is above the ceiling, or the player is trending away from the line.\n"
             "8. DIVERSIFY: Don't load up on one sport or game. Spread picks across matchups.\n\n"
+            "RED FLAGS (data-driven, from past misses):\n"
+            "- ASSIST PROPS ARE VOLATILE: Assists depend on teammate shot-making — they miss far more often "
+            "  than points/rebounds. Require HIGHER safety margins (floor > line, hit rate > 60%).\n"
+            "- TIGHT LINES: If the line is within ~1 unit of the median, it's essentially a coin flip. "
+            "  Prefer picks where median clearly clears the line (by 2+ units for points, 1+ for low-volume stats).\n"
+            "- ROLE PLAYERS / ROOKIES: Their stat lines are less predictable. Prefer established starters.\n"
+            "- SUSPICIOUS EDGES (>20%): These are usually model error, not real value. Treat with skepticism.\n"
+            "- LOW-VOLUME STATS (steals, blocks, assists under 3.5): Very high variance — one play changes outcome.\n\n"
             "CANDIDATES:\n"
             + "\n".join(lines)
             + "\n\n"
@@ -756,6 +768,11 @@ class Ranker:
                 p.notes.append("Unable to fit distribution (insufficient ESPN data).")
                 continue
 
+            # Inflate sigma for inherently noisy stat types (assists, steals, blocks)
+            vol_mult = stat_volatility_multiplier(field_used)
+            if vol_mult != 1.0:
+                params = NormalParams(mu=params.mu, sigma=params.sigma * vol_mult)
+
             # Bayesian shrinkage for small samples (#6)
             if len(series) < 5:
                 shrunk_mu = bayesian_shrink(params.mu, len(series), p.line, shrinkage_k=3.0)
@@ -881,6 +898,24 @@ class Ranker:
             else:
                 p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
+
+            # Line proximity penalty — picks where line ≈ median are coin flips
+            if p.stat_median is not None and params.sigma > 0:
+                prox_penalty = line_proximity_penalty(
+                    line=p.line, median=p.stat_median, sigma=params.sigma,
+                )
+                if prox_penalty < 1.0:
+                    excess = (p.model_prob or 0.5) - 0.5
+                    p.model_prob = round(0.5 + excess * prox_penalty, 4)
+
+            # Integer-stat adjustment — OVER 2.5 needs 3+, not 2.51
+            is_integer = field_used not in ("minutes", "fieldGoalPercentage", "freeThrowPercentage")
+            int_adj = integer_line_adjustment(
+                line=p.line, mu=params.mu, sigma=params.sigma, is_integer_stat=is_integer,
+            )
+            if int_adj != 0.0:
+                adj = int_adj if p.side == "over" else -int_adj
+                p.model_prob = round(max(0.01, min(0.99, (p.model_prob or 0.5) + adj)), 4)
 
     async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
         """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog."""
@@ -1055,7 +1090,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v12"
+        AI_PROMPT_VERSION = "v13"
         sem = asyncio.Semaphore(5)
 
         def _mean(xs: list[float]) -> float | None:
@@ -1372,7 +1407,18 @@ class Ranker:
                 "  * Per-minute rate is more reliable than raw totals — if minutes drop, production drops.\n"
                 "  * Small samples (< 10 games) should be treated skeptically; edge could be noise.\n"
                 "  * Extreme edges (>15%) against efficient markets are usually model error, not real value.\n"
-                "  * Lines near the player's median are hardest to beat; lines far from median may have real edge.\n\n"
+                "  * Lines near the player's median are hardest to beat; lines far from median may have real edge.\n"
+                "- LESSONS FROM PAST MISSES (penalize accordingly in confidence):\n"
+                "  * ASSIST PROPS are the #1 source of misses — they depend on teammate shot-making and "
+                "    are inherently more volatile than points/rebounds. Set confidence LOWER for assist props.\n"
+                "  * TIGHT LINES (line within ~1 of median) are essentially coin flips. If median ≈ line, "
+                "    reduce confidence significantly regardless of model edge.\n"
+                "  * LOW-VOLUME STATS (steals, blocks, assists under 3.5) have extreme variance. "
+                "    One play changes the outcome. Flag these as higher risk.\n"
+                "  * ROOKIE/ROLE PLAYERS have less predictable stat lines. Prefer established starters.\n"
+                "  * GUARD REBOUNDS are extremely volatile (positioning-dependent). Be skeptical.\n"
+                "  * OVER props that miss by 0.5 (OVER 2.5, player gets 2) happen frequently on .5 lines — "
+                "    the player needs a whole integer jump. Weight this in your assessment.\n\n"
                 f"Sport: {p.sport}\n"
                 f"{context_label}\n"
                 f"Pick: {p.side.upper()} {p.line} {p.display_stat or p.stat}\n"
