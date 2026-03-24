@@ -290,17 +290,17 @@ def continuous_shrinkage(sample_mean: float, n: int, prior_mean: float) -> float
 
 
 STAT_VOLATILITY: dict[str, float] = {
-    "assists": 1.35,
-    "steals": 1.40,
-    "blocks": 1.40,
-    "turnovers": 1.25,
-    "three_points_made": 1.30,
-    "threePointFieldGoalsMade": 1.30,
-    "double_doubles": 1.50,
-    "triple_doubles": 1.60,
-    "goals": 1.35,
-    "knockDowns": 1.50,
-    "submissions": 1.50,
+    "assists": 1.20,
+    "steals": 1.25,
+    "blocks": 1.25,
+    "turnovers": 1.15,
+    "three_points_made": 1.20,
+    "threePointFieldGoalsMade": 1.20,
+    "double_doubles": 1.35,
+    "triple_doubles": 1.45,
+    "goals": 1.20,
+    "knockDowns": 1.30,
+    "submissions": 1.30,
 }
 
 
@@ -318,18 +318,18 @@ def stat_volatility_multiplier(field_name: str | None) -> float:
 def line_proximity_penalty(*, line: float, median: float, sigma: float) -> float:
     """Penalize picks where the line is very close to the player's median.
 
-    When |line - median| < 0.5*sigma, the pick is essentially a coin flip
-    regardless of what the model says. Returns a 0..1 multiplier on the
-    excess probability (amount above 0.5).
+    When |line - median| < 0.3*sigma, the pick is essentially a coin flip.
+    Returns a 0..1 multiplier on the excess probability (amount above 0.5).
+    Kept gentle since continuous_shrinkage already regresses mu toward the line.
     """
     if sigma <= 0:
         return 1.0
     gap = abs(line - median) / sigma
-    if gap >= 0.75:
+    if gap >= 0.5:
         return 1.0
-    if gap <= 0.15:
-        return 0.4
-    return 0.4 + (gap - 0.15) / (0.75 - 0.15) * 0.6
+    if gap <= 0.1:
+        return 0.65
+    return 0.65 + (gap - 0.1) / (0.5 - 0.1) * 0.35
 
 
 def edge_skepticism(edge: float) -> float:

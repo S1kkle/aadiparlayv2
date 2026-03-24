@@ -25,7 +25,6 @@ from app.services.stat_model import (
     edge_confidence as compute_edge_confidence,
     edge_skepticism,
     fit_normal_weighted,
-    integer_line_adjustment,
     is_low_count_stat,
     kelly_fraction as compute_kelly,
     line_percentile,
@@ -900,6 +899,10 @@ class Ranker:
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
             # Line proximity penalty — picks where line ≈ median are coin flips
+            # Only apply to the OVER side; the under's model_prob is derived
+            # from (1 - p_over) so it already reflects the same penalty direction.
+            # Also use the pre-shrinkage median to avoid double-dampening with
+            # continuous shrinkage which already regresses mu toward the line.
             if p.stat_median is not None and params.sigma > 0:
                 prox_penalty = line_proximity_penalty(
                     line=p.line, median=p.stat_median, sigma=params.sigma,
@@ -907,15 +910,6 @@ class Ranker:
                 if prox_penalty < 1.0:
                     excess = (p.model_prob or 0.5) - 0.5
                     p.model_prob = round(0.5 + excess * prox_penalty, 4)
-
-            # Integer-stat adjustment — OVER 2.5 needs 3+, not 2.51
-            is_integer = field_used not in ("minutes", "fieldGoalPercentage", "freeThrowPercentage")
-            int_adj = integer_line_adjustment(
-                line=p.line, mu=params.mu, sigma=params.sigma, is_integer_stat=is_integer,
-            )
-            if int_adj != 0.0:
-                adj = int_adj if p.side == "over" else -int_adj
-                p.model_prob = round(max(0.01, min(0.99, (p.model_prob or 0.5) + adj)), 4)
 
     async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
         """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog."""
@@ -1090,7 +1084,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v13"
+        AI_PROMPT_VERSION = "v14"
         sem = asyncio.Semaphore(5)
 
         def _mean(xs: list[float]) -> float | None:
