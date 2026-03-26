@@ -348,26 +348,29 @@ def edge_skepticism(edge: float) -> float:
     return math.copysign(min(damped, 0.20), edge)
 
 
-def integer_line_adjustment(
-    *, line: float, mu: float, sigma: float, is_integer_stat: bool
-) -> float:
-    """Adjust probability for the discrete nature of integer stats.
+MODEL_PROB_CAP: dict[str, float] = {
+    "assists": 0.72,
+    "steals": 0.68,
+    "blocks": 0.68,
+    "turnovers": 0.72,
+    "knockDowns": 0.68,
+    "submissions": 0.68,
+    "double_doubles": 0.65,
+    "triple_doubles": 0.60,
+    "three_points_made": 0.72,
+    "threePointFieldGoalsMade": 0.72,
+}
 
-    OVER 2.5 assists means the player needs 3+ (not 2.51). The normal
-    distribution treats 2.5 as a continuous threshold, but in reality
-    there's a meaningful jump from 2 to 3.
+DEFAULT_MODEL_PROB_CAP = 0.82
 
-    Returns a probability adjustment (positive = helps over, negative = helps under).
+
+def model_prob_cap(field_name: str | None) -> float:
+    """Maximum model probability by stat type.
+
+    Volatile stats (assists, steals, blocks) should never show 80%+ confidence
+    because their game-to-game variance is too high. Even points/rebounds are
+    capped at 82% — no single-game prop deserves higher certainty.
     """
-    if not is_integer_stat or sigma <= 0:
-        return 0.0
-    frac = line - math.floor(line)
-    if abs(frac - 0.5) > 0.01:
-        return 0.0
-
-    threshold = math.ceil(line)
-    z_threshold = (threshold - mu) / sigma
-    z_line = (line - mu) / sigma
-    p_threshold = 1.0 - normal_cdf(z_threshold)
-    p_line = 1.0 - normal_cdf(z_line)
-    return round(p_threshold - p_line, 4)
+    if field_name is None:
+        return DEFAULT_MODEL_PROB_CAP
+    return MODEL_PROB_CAP.get(field_name, DEFAULT_MODEL_PROB_CAP)

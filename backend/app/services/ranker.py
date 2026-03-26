@@ -26,6 +26,7 @@ from app.services.stat_model import (
     edge_skepticism,
     fit_normal_weighted,
     is_low_count_stat,
+    model_prob_cap,
     kelly_fraction as compute_kelly,
     line_percentile,
     line_proximity_penalty,
@@ -898,6 +899,11 @@ class Ranker:
                 p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
+            # Cap model probability — no stat type deserves 85%+ confidence
+            cap = model_prob_cap(field_used)
+            if p.model_prob > cap:
+                p.model_prob = cap
+
             # Line proximity penalty — picks where line ≈ median are coin flips
             # Only apply to the OVER side; the under's model_prob is derived
             # from (1 - p_over) so it already reflects the same penalty direction.
@@ -1068,6 +1074,11 @@ class Ranker:
                 p_over = prob_over(line=p.line, params=params)
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
+            # Cap model probability for MMA stats too
+            cap = model_prob_cap(field_used)
+            if p.model_prob > cap:
+                p.model_prob = cap
+
     async def _apply_ollama(
         self,
         props: list[Prop],
@@ -1084,7 +1095,7 @@ class Ranker:
                 p.notes.append("Ollama not available (skipping qualitative analysis).")
             return
 
-        AI_PROMPT_VERSION = "v14"
+        AI_PROMPT_VERSION = "v15"
         sem = asyncio.Semaphore(5)
 
         def _mean(xs: list[float]) -> float | None:
