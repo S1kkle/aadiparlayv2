@@ -1,0 +1,30 @@
+{
+  "accuracy": 0.8,
+  "default_accuracy": 0.5527950310559007,
+  "total_predictions": 60,
+  "params": {
+    "decay": 0.98,
+    "shrinkage_k": 4.5,
+    "vol_assists": 1.0899999999999996,
+    "vol_steals": 1.0399999999999996,
+    "vol_blocks": 1.0399999999999996,
+    "vol_3pm": 1.0899999999999996,
+    "prob_cap": 0.7,
+    "prox_penalty_min": 0.3,
+    "pick_threshold": 0.7
+  },
+  "by_stat": {
+    "blocks": {
+      "accuracy": 0.7872340425531915,
+      "total": 47
+    },
+    "steals": {
+      "accuracy": 0.8333333333333334,
+      "total": 12
+    },
+    "totalRebounds": {
+      "accuracy": 1.0,
+      "total": 1
+    }
+  }
+}

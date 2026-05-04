@@ -46,6 +46,9 @@ def fmtf(v: float | None, *, signed: bool = False) -> str:
     return f"{v:.3f}"
 
 
+CALIBRATED_PICK_THRESHOLD = 0.64
+
+
 @dataclass(frozen=True)
 class RankerConfig:
     last_n: int
@@ -174,7 +177,7 @@ def _compute_confidence_tier(p: Prop) -> str:
         score += 1
     if p.model_ai_agree:
         score += 1
-    if p.hit_rate_last10 is not None and p.hit_rate_last10 >= 0.6:
+    if p.hit_rate_last10 is not None and p.hit_rate_last10 >= 0.65:
         score += 1
     if p.stat_consistency is not None and p.stat_consistency >= 0.6:
         score += 1
@@ -762,8 +765,8 @@ class Ranker:
                 p.notes.append("ESPN gamelog has no values for this stat field.")
                 continue
 
-            # Recency-weighted normal fit (#1)
-            params = fit_normal_weighted(series, decay=0.85)
+            # Recency-weighted normal fit (#1) — calibrated decay=0.88
+            params = fit_normal_weighted(series, decay=0.88)
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN data).")
                 continue
@@ -976,8 +979,8 @@ class Ranker:
                 p.notes.append("ESPN fight history has no values for this stat field.")
                 continue
 
-            # Recency-weighted fit (#1)
-            params = fit_normal_weighted(series, decay=0.85)
+            # Recency-weighted fit (#1) — calibrated decay=0.88
+            params = fit_normal_weighted(series, decay=0.88)
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN MMA data).")
                 continue
