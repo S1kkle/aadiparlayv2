@@ -1570,7 +1570,20 @@ class Ranker:
             return out
 
         async def run_one(p: Prop) -> None:
-            cache_key = f"ollama:prop:{AI_PROMPT_VERSION}:{p.underdog_option_id}:{p.side}:{p.line}"
+            # Cache key includes the most-recent-game date and game count so a
+            # newly-finished box score invalidates yesterday's AI summary. Without
+            # this, the 30-min TTL would happily reuse a summary written before
+            # tonight's game finished. Falls back to a plain (option, side, line)
+            # key when no game date is available.
+            recent_dates = [
+                str(getattr(g, "game_date", "")) for g in (p.recent_games or [])[:1]
+            ]
+            most_recent = recent_dates[0] if recent_dates else "?"
+            n_games = len(p.recent_games or [])
+            cache_key = (
+                f"ollama:prop:{AI_PROMPT_VERSION}:{p.underdog_option_id}:"
+                f"{p.side}:{p.line}:{most_recent}:{n_games}"
+            )
             cached = self._cache.get_json(cache_key)
             if isinstance(cached, dict) and cached:
                 self._apply_ai_to_prop(p, cached)
@@ -1787,7 +1800,11 @@ class Ranker:
                         except Exception:
                             pass
                     return
-            self._cache.set_json(cache_key, result, ttl_seconds=30 * 60)
+            # 10 min: long enough to dedupe rapid re-runs in the same session,
+            # short enough that a fresh box score or injury swap forces a re-ask
+            # within the betting window. The cache key already invalidates on
+            # most-recent-game date change, this TTL is a fallback.
+            self._cache.set_json(cache_key, result, ttl_seconds=10 * 60)
             self._apply_ai_to_prop(p, result)
             if on_prop_done is not None:
                 try:

@@ -1102,7 +1102,10 @@ class EspnClient:
                 pass
 
         if data:
-            self._cache.set_json(cache_key, data, ttl_seconds=2 * 60 * 60)
+            # 15 minutes — short enough to pick up tonight's box scores within
+            # minutes of game-end; long enough to dampen ESPN load on bursty
+            # ranking jobs. Two-hour TTL meant a 7pm fetch hid all 8-10pm games.
+            self._cache.set_json(cache_key, data, ttl_seconds=15 * 60)
         return data
 
     async def fetch_league_injuries(self, *, sport: EspnSport, league: EspnLeague) -> dict[str, Any]:
@@ -1117,7 +1120,9 @@ class EspnClient:
 
         url = f"{self._cfg.site_api_base}/apis/site/v2/sports/{sport}/{league}/injuries"
         data = await self._get_json(url)
-        self._cache.set_json(cache_key, data, ttl_seconds=10 * 60)
+        # 3 minutes — injury statuses (Out / Questionable / Probable) flip in
+        # the 60-90 minute pregame window. 10 min was too long for live use.
+        self._cache.set_json(cache_key, data, ttl_seconds=3 * 60)
         return data
 
     async def get_team_injuries_summary(
@@ -1186,32 +1191,59 @@ class EspnClient:
         return out
 
     @staticmethod
-    def _select_regular_season_block(season_types: list[Any]) -> dict[str, Any] | None:
-        """Pick the regular-season block from ESPN's seasonTypes list.
+    def _iter_in_season_categories(season_types: list[Any]) -> list[list[Any]]:
+        """Return all category-lists from in-season blocks (regular + post),
+        with postseason first when both are present.
 
         ESPN seasonType IDs: 1 = preseason, 2 = regular season, 3 = postseason.
-        Order is NOT guaranteed across endpoints / weeks. Falls back to the
-        first dict block (legacy behavior) if no explicit type is identified.
+        We EXCLUDE preseason but INCLUDE both regular and postseason — playoff
+        games are real production and need to flow into the player's series
+        once the regular season is over (e.g. NBA in May).
         """
         if not isinstance(season_types, list) or not season_types:
-            return None
-        regular: dict[str, Any] | None = None
-        first_dict: dict[str, Any] | None = None
+            return []
+        regular_cats: list[Any] | None = None
+        post_cats: list[Any] | None = None
+        first_dict_cats: list[Any] | None = None
         for st in season_types:
             if not isinstance(st, dict):
                 continue
-            if first_dict is None:
-                first_dict = st
+            cats = st.get("categories")
+            if not isinstance(cats, list):
+                continue
+            if first_dict_cats is None:
+                first_dict_cats = cats
             type_id = st.get("type")
             type_name = (st.get("displayName") or st.get("name") or "").lower()
             try:
                 tid_int = int(type_id) if type_id is not None else None
             except (TypeError, ValueError):
                 tid_int = None
+            if tid_int == 1 or "preseason" in type_name:
+                continue
             if tid_int == 2 or "regular" in type_name:
-                regular = st
-                break
-        return regular or first_dict
+                regular_cats = cats
+            elif tid_int == 3 or "postseason" in type_name or "playoff" in type_name:
+                post_cats = cats
+        # Postseason is more recent → list it first so most-recent games are
+        # iterated first by callers (which break after `last_n`).
+        out: list[list[Any]] = []
+        if post_cats is not None:
+            out.append(post_cats)
+        if regular_cats is not None:
+            out.append(regular_cats)
+        if not out and first_dict_cats is not None:
+            out.append(first_dict_cats)
+        return out
+
+    @staticmethod
+    def _select_regular_season_block(season_types: list[Any]) -> dict[str, Any] | None:
+        """DEPRECATED in favor of `_iter_in_season_categories`. Kept for any
+        external caller. Returns the first non-preseason block."""
+        cats_lists = EspnClient._iter_in_season_categories(season_types)
+        if not cats_lists:
+            return None
+        return {"categories": cats_lists[0]}
 
     @staticmethod
     def extract_stat_series(gamelog: dict[str, Any], *, field_name: str, last_n: int) -> list[float]:
@@ -1229,38 +1261,35 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        # Filter to regular season explicitly — preseason/playoff blocks can show
-        # up at index 0 in some payloads and pollute the series.
-        st0 = EspnClient._select_regular_season_block(season_types)
-        if not isinstance(st0, dict):
-            return []
-        categories = st0.get("categories") or []
-        if not isinstance(categories, list):
+        # Skip preseason; iterate postseason first (most recent), then regular.
+        category_lists = EspnClient._iter_in_season_categories(season_types)
+        if not category_lists:
             return []
 
         # Gather events in the order provided (typically most recent first).
         values: list[float] = []
-        for cat in categories:
-            if not isinstance(cat, dict):
-                continue
-            events = cat.get("events") or []
-            if not isinstance(events, list):
-                continue
-            for ev in events:
-                if not isinstance(ev, dict):
+        for categories in category_lists:
+            for cat in categories:
+                if not isinstance(cat, dict):
                     continue
-                stats = ev.get("stats")
-                if not isinstance(stats, list) or idx >= len(stats):
+                events = cat.get("events") or []
+                if not isinstance(events, list):
                     continue
-                raw = stats[idx]
-                if raw is None:
-                    continue
-                try:
-                    values.append(float(raw))
-                except (TypeError, ValueError):
-                    continue
-                if len(values) >= last_n:
-                    return values
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    stats = ev.get("stats")
+                    if not isinstance(stats, list) or idx >= len(stats):
+                        continue
+                    raw = stats[idx]
+                    if raw is None:
+                        continue
+                    try:
+                        values.append(float(raw))
+                    except (TypeError, ValueError):
+                        continue
+                    if len(values) >= last_n:
+                        return values
         return values
 
     @staticmethod
@@ -1278,11 +1307,8 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        st0 = EspnClient._select_regular_season_block(season_types)
-        if not isinstance(st0, dict):
-            return []
-        categories = st0.get("categories") or []
-        if not isinstance(categories, list):
+        category_lists = EspnClient._iter_in_season_categories(season_types)
+        if not category_lists:
             return []
 
         events_meta = gamelog.get("events") or {}
@@ -1290,44 +1316,45 @@ class EspnClient:
             events_meta = {}
 
         out: list[dict[str, Any]] = []
-        for cat in categories:
-            if not isinstance(cat, dict):
-                continue
-            events = cat.get("events") or []
-            if not isinstance(events, list):
-                continue
-            for ev in events:
-                if not isinstance(ev, dict):
+        for categories in category_lists:
+            for cat in categories:
+                if not isinstance(cat, dict):
                     continue
-                event_id = ev.get("eventId")
-                stats = ev.get("stats")
-                if not isinstance(event_id, str) or not isinstance(stats, list) or idx >= len(stats):
+                events = cat.get("events") or []
+                if not isinstance(events, list):
                     continue
-                raw = stats[idx]
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    continue
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    event_id = ev.get("eventId")
+                    stats = ev.get("stats")
+                    if not isinstance(event_id, str) or not isinstance(stats, list) or idx >= len(stats):
+                        continue
+                    raw = stats[idx]
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError):
+                        continue
 
-                meta = events_meta.get(event_id) if isinstance(event_id, str) else None
-                game_date = None
-                opp_abbr = None
-                if isinstance(meta, dict):
-                    dt_raw = meta.get("gameDate")
-                    if isinstance(dt_raw, str):
-                        try:
-                            game_date = datetime.fromisoformat(dt_raw.replace("Z", "+00:00"))
-                        except ValueError:
-                            game_date = None
-                    opp = meta.get("opponent")
-                    if isinstance(opp, dict):
-                        oa = opp.get("abbreviation")
-                        if isinstance(oa, str):
-                            opp_abbr = oa
+                    meta = events_meta.get(event_id) if isinstance(event_id, str) else None
+                    game_date = None
+                    opp_abbr = None
+                    if isinstance(meta, dict):
+                        dt_raw = meta.get("gameDate")
+                        if isinstance(dt_raw, str):
+                            try:
+                                game_date = datetime.fromisoformat(dt_raw.replace("Z", "+00:00"))
+                            except ValueError:
+                                game_date = None
+                        opp = meta.get("opponent")
+                        if isinstance(opp, dict):
+                            oa = opp.get("abbreviation")
+                            if isinstance(oa, str):
+                                opp_abbr = oa
 
-                out.append({"game_date": game_date, "opponent_abbr": opp_abbr, "value": value})
-                if len(out) >= last_n:
-                    return out
+                    out.append({"game_date": game_date, "opponent_abbr": opp_abbr, "value": value})
+                    if len(out) >= last_n:
+                        return out
         return out
 
     @staticmethod
@@ -1345,11 +1372,8 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        st0 = EspnClient._select_regular_season_block(season_types)
-        if not isinstance(st0, dict):
-            return []
-        categories = st0.get("categories") or []
-        if not isinstance(categories, list):
+        category_lists = EspnClient._iter_in_season_categories(season_types)
+        if not category_lists:
             return []
 
         events_meta = gamelog.get("events") or {}
@@ -1357,7 +1381,8 @@ class EspnClient:
             events_meta = {}
 
         matches: list[dict[str, Any]] = []
-        for cat in categories:
+        flat_categories = [c for cats in category_lists for c in cats]
+        for cat in flat_categories:
             if not isinstance(cat, dict):
                 continue
             events = cat.get("events") or []

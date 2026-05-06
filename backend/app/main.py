@@ -247,11 +247,14 @@ async def clear_cache() -> dict[str, int | str]:
 
 @app.post("/cache/clear-gamelogs")
 async def clear_gamelogs() -> dict[str, int | str]:
-    """Clear only gamelog + AI selection caches (keeps matchup snapshots)."""
+    """Clear gamelog + injury + AI selection + per-prop AI summary caches.
+    Use before a betting session if you suspect stale data (e.g. fresh box
+    scores or injury status changes haven't propagated yet)."""
     d1 = cache.clear_prefix("espn:gamelog:")
     d2 = cache.clear_prefix("ai_select:")
     d3 = cache.clear_prefix("ollama:prop:")
-    return {"status": "ok", "deleted": d1 + d2 + d3}
+    d4 = cache.clear_prefix("espn:injuries:")
+    return {"status": "ok", "deleted": d1 + d2 + d3 + d4}
 
 
 @app.post("/props/job")
