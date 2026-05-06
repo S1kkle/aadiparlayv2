@@ -28,6 +28,10 @@ export type Prop = {
   is_b2b?: boolean | null;
   rest_days?: number | null;
   avg_minutes?: number | null;
+  projected_minutes?: number | null;
+  vegas_total?: number | null;
+  vegas_spread?: number | null;
+  blowout_risk?: boolean | null;
 
   // trend / profile
   trend_short_avg?: number | null;
@@ -44,6 +48,10 @@ export type Prop = {
   // odds
   american_price?: number | null;
   decimal_price?: number | null;
+  payout_multiplier?: number | null;
+  selection_subheader?: string | null;
+  is_boosted?: boolean | null;
+  breakeven_prob?: number | null;
   model_prob?: number | null;
   implied_prob?: number | null;
   no_vig_prob?: number | null;
@@ -90,6 +98,12 @@ export type ParlayRecommendation = {
   combined_confidence: number;
   risk_factors: string[];
   combined_model_prob: number;
+  combined_model_prob_adjusted?: number;
+  correlation_factor?: number;
+  correlation_notes?: string[];
+  entry_payout_multiplier?: number | null;
+  ev_independent?: number | null;
+  ev_corr_adjusted?: number | null;
 };
 
 export type LearningEntry = {

@@ -111,6 +111,7 @@ export async function seedHistory(entries: HistoryEntry[]): Promise<{ seeded: nu
 export async function learningResolve(): Promise<{
   resolved: number;
   already_done: number;
+  deduped?: number;
   failed_lookup: number;
   skipped_future: number;
   detail?: string;

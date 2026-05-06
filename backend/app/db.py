@@ -152,10 +152,28 @@ class SqliteTTLCache:
                       hit INTEGER,
                       miss_reason TEXT,
                       miss_category TEXT,
-                      resolved INTEGER DEFAULT 0
+                      resolved INTEGER DEFAULT 0,
+                      series_json TEXT,
+                      stat_field TEXT,
+                      position TEXT,
+                      decimal_price REAL,
+                      payout_multiplier REAL
                     )
                     """
                 )
+                # Add new columns to pre-existing tables (additive migration; keeps old DBs alive).
+                for col, ddl in [
+                    ("series_json", "ALTER TABLE learning_log ADD COLUMN series_json TEXT"),
+                    ("stat_field", "ALTER TABLE learning_log ADD COLUMN stat_field TEXT"),
+                    ("position", "ALTER TABLE learning_log ADD COLUMN position TEXT"),
+                    ("decimal_price", "ALTER TABLE learning_log ADD COLUMN decimal_price REAL"),
+                    ("payout_multiplier", "ALTER TABLE learning_log ADD COLUMN payout_multiplier REAL"),
+                ]:
+                    try:
+                        conn.execute(ddl)
+                    except sqlite3.OperationalError:
+                        # Column already exists — fine.
+                        pass
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS learning_reports (
@@ -183,8 +201,9 @@ class SqliteTTLCache:
                     INSERT OR REPLACE INTO learning_log
                     (id, history_id, timestamp, player_name, sport, stat, line, side,
                      model_prob, implied_prob, edge, ai_bias, ai_confidence,
-                     actual_value, hit, miss_reason, miss_category, resolved)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     actual_value, hit, miss_reason, miss_category, resolved,
+                     series_json, stat_field, position, decimal_price, payout_multiplier)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         entry["id"], entry["history_id"], entry["timestamp"],
@@ -195,6 +214,9 @@ class SqliteTTLCache:
                         entry.get("ai_confidence"), entry.get("actual_value"),
                         entry.get("hit"), entry.get("miss_reason"),
                         entry.get("miss_category"), entry.get("resolved", 0),
+                        entry.get("series_json"), entry.get("stat_field"),
+                        entry.get("position"), entry.get("decimal_price"),
+                        entry.get("payout_multiplier"),
                     ),
                 )
                 conn.commit()
@@ -253,6 +275,78 @@ class SqliteTTLCache:
                     d = dict(r)
                     d["miss_breakdown"] = json.loads(d.pop("miss_breakdown_json", "{}"))
                     d["suggestions"] = json.loads(d.pop("suggestions_json", "[]"))
+                    out.append(d)
+                return out
+
+    # ── Calibration runs ──────────────────────────────────────────────
+
+    def _ensure_calibration_table(self) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS calibration_runs (
+                      id TEXT PRIMARY KEY,
+                      created_at TEXT NOT NULL,
+                      accuracy_real REAL,
+                      accuracy_synthetic REAL,
+                      total_real INTEGER,
+                      total_synthetic INTEGER,
+                      params_json TEXT NOT NULL,
+                      applied INTEGER DEFAULT 0,
+                      source TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+
+    def save_calibration_run(self, run: dict[str, Any]) -> None:
+        self._ensure_calibration_table()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO calibration_runs
+                    (id, created_at, accuracy_real, accuracy_synthetic,
+                     total_real, total_synthetic, params_json, applied, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run["id"], run["created_at"],
+                        run.get("accuracy_real"), run.get("accuracy_synthetic"),
+                        run.get("total_real"), run.get("total_synthetic"),
+                        run["params_json"], run.get("applied", 0),
+                        run.get("source", "scheduled"),
+                    ),
+                )
+                conn.commit()
+
+    def get_latest_calibration(self, *, applied_only: bool = True) -> dict[str, Any] | None:
+        self._ensure_calibration_table()
+        where = "WHERE applied = 1" if applied_only else ""
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"SELECT * FROM calibration_runs {where} ORDER BY created_at DESC LIMIT 1",
+                ).fetchone()
+                if row is None:
+                    return None
+                d = dict(row)
+                d["params"] = json.loads(d.pop("params_json"))
+                return d
+
+    def get_calibration_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        self._ensure_calibration_table()
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM calibration_runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["params"] = json.loads(d.pop("params_json"))
                     out.append(d)
                 return out
 

@@ -65,6 +65,10 @@ class Prop(BaseModel):
     is_b2b: bool | None = None
     rest_days: int | None = None
     avg_minutes: float | None = None
+    projected_minutes: float | None = None  # avg_minutes after blowout/rest adjustment
+    vegas_total: float | None = None  # game over/under total when known
+    vegas_spread: float | None = None  # team-perspective point spread (negative = favorite)
+    blowout_risk: bool | None = None
 
     # trend / profile
     trend_short_avg: float | None = None  # last 3 game average
@@ -81,6 +85,10 @@ class Prop(BaseModel):
     # odds/prices
     american_price: int | None = None
     decimal_price: float | None = None
+    payout_multiplier: float | None = None  # actual per-leg multiplier from Underdog (truth, when present)
+    selection_subheader: str | None = None  # e.g. "Boost", "Rescue" — flags non-standard payouts
+    is_boosted: bool | None = None
+    breakeven_prob: float | None = None  # 1/decimal_price — break-even win rate per leg
 
     # model outputs
     model_prob: float | None = None

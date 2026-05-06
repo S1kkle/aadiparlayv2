@@ -18,6 +18,7 @@ from app.clients.underdog import UnderdogClient, UnderdogConfig
 from app.db import SqliteTTLCache
 from app.models.core import HealthResponse, Prop, RankedPropsResponse, SportId
 from app.props_jobs import PropsJobRequest, PropsJobStore, sse_format
+from app.services.calibration import CalibrationService
 from app.services.learning import LearningService
 from app.services.ranker import Ranker, RankerConfig
 
@@ -131,6 +132,32 @@ jobs = PropsJobStore()
 
 learning_svc = LearningService(cache=cache, espn=espn_client, llm=llm_client)
 
+calibration_svc = CalibrationService(cache=cache)
+
+_CALIBRATION_INTERVAL_HOURS = _env_int("CALIBRATION_INTERVAL_HOURS", 48)
+
+
+async def _calibration_loop() -> None:
+    """Background loop that runs model calibration on a schedule."""
+    import logging
+    _log = logging.getLogger("calibration.scheduler")
+    while True:
+        await asyncio.sleep(_CALIBRATION_INTERVAL_HOURS * 3600)
+        try:
+            _log.info("Scheduled calibration starting...")
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: calibration_svc.run_calibration(source="scheduled")
+            )
+            _log.info(
+                "Scheduled calibration complete: applied=%s, synth=%.2f%%, real=%s",
+                result["applied"],
+                result["accuracy_synthetic"] * 100,
+                f"{result['accuracy_real'] * 100:.2f}%" if result["accuracy_real"] is not None else "N/A",
+            )
+        except Exception:
+            _log.exception("Scheduled calibration failed")
+
+
 async def _warm_league_matchup_caches() -> None:
     nba_keys = ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]
     for k in nba_keys:
@@ -167,6 +194,21 @@ async def _startup() -> None:
     cache.clear_prefix("espn:gamelog:hockey:")
     cache.clear_prefix("ai_select:")
     asyncio.create_task(_warm_league_matchup_caches())
+
+    calibration_svc.load_active_params_from_db()
+
+    # Restore the trained confidence-tier model if one exists; falls back
+    # silently to the heuristic when absent or corrupt.
+    try:
+        from app.services.stat_model import set_tier_model
+        saved_tier = cache.get_json("tier_model:v1")
+        if isinstance(saved_tier, dict) and isinstance(saved_tier.get("weights"), list):
+            set_tier_model(saved_tier["weights"], metrics=saved_tier.get("metrics") or {})
+            log.info("Loaded saved tier model with %d features", len(saved_tier["weights"]))
+    except Exception as exc:
+        log.warning("Failed to restore tier model: %s", exc)
+
+    asyncio.create_task(_calibration_loop())
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -664,4 +706,71 @@ async def debug_mma(fighter_name: str):
         trace["steps"].append({"step": "career_stats", "error": str(e)})
 
     return trace
+
+
+# ── Calibration endpoints ─────────────────────────────────────────────
+
+@app.post("/calibration/run")
+async def calibration_run():
+    """Manually trigger a model calibration run."""
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: calibration_svc.run_calibration(source="manual")
+    )
+    return result
+
+
+@app.get("/calibration/current")
+async def calibration_current():
+    """View the currently active calibrated parameters."""
+    return calibration_svc.get_current_params()
+
+
+@app.get("/calibration/history")
+async def calibration_history(limit: int = Query(20, ge=1, le=100)):
+    """View past calibration runs."""
+    return {"runs": calibration_svc.get_history(limit=limit)}
+
+
+# ── Confidence-tier model (logistic regression on resolved picks) ─────
+
+
+@app.post("/calibration/tier-model/train")
+async def calibration_train_tier_model(min_rows: int = Query(30, ge=10, le=10000)):
+    """Train the logistic regression confidence-tier model on resolved learning_log entries.
+
+    Replaces the heuristic 6-flag tiering with actual probability of hitting,
+    learned from your own resolved picks. Without this, the legacy heuristic
+    is used (fallback)."""
+    from app.services.stat_model import fit_tier_logistic, _tier_features_from_dict
+
+    entries = cache.get_learning_entries(resolved_only=True, limit=10000)
+    rows = []
+    for e in entries:
+        if e.get("hit") not in (0, 1):
+            continue
+        feats = _tier_features_from_dict(e)
+        rows.append({"features": feats, "hit": int(e["hit"])})
+    if len(rows) < min_rows:
+        return {"trained": False, "reason": f"Only {len(rows)} resolved rows; need >= {min_rows}"}
+
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: fit_tier_logistic(rows)
+    )
+    if result is None:
+        return {"trained": False, "reason": "fit_tier_logistic returned None"}
+    cache.set_json("tier_model:v1", {
+        "weights": result["weights"],
+        "feature_names": result["feature_names"],
+        "metrics": result["metrics"],
+    }, ttl_seconds=10 * 365 * 24 * 3600)  # ~10 years; effectively permanent
+    return {"trained": True, **result}
+
+
+@app.get("/calibration/tier-model")
+async def calibration_get_tier_model():
+    from app.services.stat_model import get_tier_model
+    m = get_tier_model()
+    if m is None:
+        return {"trained": False}
+    return {"trained": True, **m}
 

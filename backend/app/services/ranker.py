@@ -12,7 +12,10 @@ from app.clients.underdog import UnderdogClient
 from app.db import SqliteTTLCache
 from app.models.core import GameStat, Prop, SportId
 from app.services.underdog_normalizer import (
+    UD_DEFAULT_LEG_DECIMAL,
     american_to_implied_prob as ud_american_to_implied_prob,
+    decimal_to_american as ud_decimal_to_american,
+    decimal_to_implied_prob as ud_decimal_to_implied_prob,
     normalize_underdog_over_under_lines,
 )
 from app.services.stat_model import (
@@ -25,15 +28,21 @@ from app.services.stat_model import (
     edge_confidence as compute_edge_confidence,
     edge_skepticism,
     fit_normal_weighted,
+    get_calibrated_params,
+    get_tier_model,
     is_low_count_stat,
+    league_prior_mean,
     model_prob_cap,
     kelly_fraction as compute_kelly,
     line_percentile,
     line_proximity_penalty,
     per_minute_rate as compute_per_min,
     poisson_prob_over,
+    predict_hit_prob,
     prob_over,
+    prob_over_for_field,
     projected_value,
+    stat_distribution_family,
     stat_volatility_multiplier,
 )
 
@@ -46,7 +55,8 @@ def fmtf(v: float | None, *, signed: bool = False) -> str:
     return f"{v:.3f}"
 
 
-CALIBRATED_PICK_THRESHOLD = 0.64
+def _pick_threshold() -> float:
+    return get_calibrated_params().get("pick_threshold", 0.64)
 
 
 @dataclass(frozen=True)
@@ -90,6 +100,45 @@ def _zscore(values: list[float]) -> list[float]:
     if std == 0.0:
         return [0.0 for _ in values]
     return [(v - mean) / std for v in values]
+
+
+def _zscore_grouped(
+    values: list[float],
+    keys: list[tuple],
+    *,
+    min_group_size: int = 4,
+) -> list[float]:
+    """Z-score within (key)-cohorts; falls back to global z-score when a cohort
+    has fewer than min_group_size members. Prevents NBA points edges from being
+    z-scored against MMA strike edges, which have completely different scales.
+    """
+    if not values:
+        return []
+    n = len(values)
+    out = [0.0] * n
+    cohorts: dict[tuple, list[int]] = {}
+    for i, k in enumerate(keys):
+        cohorts.setdefault(k, []).append(i)
+
+    fallback_global: list[float] | None = None
+    for k, idxs in cohorts.items():
+        if len(idxs) < min_group_size:
+            if fallback_global is None:
+                fallback_global = _zscore(values)
+            for i in idxs:
+                out[i] = fallback_global[i]
+            continue
+        sub = [values[i] for i in idxs]
+        mean = sum(sub) / len(sub)
+        var = sum((v - mean) ** 2 for v in sub) / max(1, (len(sub) - 1))
+        std = math.sqrt(var) if var > 0 else 0.0
+        if std == 0.0:
+            for i in idxs:
+                out[i] = 0.0
+        else:
+            for i, v in zip(idxs, sub):
+                out[i] = (v - mean) / std
+    return out
 
 
 def american_to_decimal(american: int) -> float:
@@ -170,6 +219,20 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
 
 
 def _compute_confidence_tier(p: Prop) -> str:
+    """Tier the pick by predicted hit-probability when a logistic model is trained,
+    otherwise fall back to the legacy 6-feature heuristic.
+    """
+    # Prefer trained logistic regression: tier = empirical hit probability.
+    if get_tier_model() is not None:
+        prop_dict = p.model_dump() if hasattr(p, "model_dump") else dict(p)
+        prob = predict_hit_prob(prop_dict)
+        if prob is not None:
+            if prob >= 0.62:
+                return "high"
+            if prob >= 0.55:
+                return "medium"
+            return "low"
+
     score = 0
     if p.recent_games and len(p.recent_games) >= 8:
         score += 1
@@ -253,13 +316,22 @@ class Ranker:
 
         await _emit_stage("fetch", f"Found {len(props)} props")
 
+        # Pricing fallback: prefer real Underdog payout_multiplier > decimal_price >
+        # american_price > documented Pick'em default (~55% break-even, NOT -110).
         for p in props:
+            if p.decimal_price is None or p.decimal_price <= 1.0:
+                if p.payout_multiplier and p.payout_multiplier > 1.0:
+                    p.decimal_price = float(p.payout_multiplier)
+                elif isinstance(p.american_price, int):
+                    p.decimal_price = american_to_decimal(p.american_price)
+                else:
+                    p.decimal_price = UD_DEFAULT_LEG_DECIMAL
             if p.american_price is None:
-                p.american_price = -110
-            if p.decimal_price is None:
-                p.decimal_price = american_to_decimal(p.american_price)
+                p.american_price = ud_decimal_to_american(p.decimal_price)
             if p.implied_prob is None:
-                p.implied_prob = ud_american_to_implied_prob(p.american_price)
+                p.implied_prob = ud_decimal_to_implied_prob(p.decimal_price)
+            if p.breakeven_prob is None:
+                p.breakeven_prob = ud_decimal_to_implied_prob(p.decimal_price)
 
         if self._espn is not None:
             unique_count = len({p.player_name for p in props})
@@ -278,15 +350,41 @@ class Ranker:
                         f"Model not supported for {p.sport} yet (experimental); using implied probability."
                     )
 
-        # Vig removal — compute true no-vig probabilities (sharp principle #1)
+        # Vig removal — pair OVER/UNDER for the same (player, stat, line) and run
+        # power-method de-vig on the two real implied probabilities. Previously the
+        # code passed (impl, 1-impl), which is a tautology and produced no-op output.
+        pair_key = lambda pr: (pr.underdog_player_id or pr.player_name, pr.stat, pr.line)
+        impl_by_key: dict[tuple, dict[str, float]] = {}
         for p in props:
-            impl = p.implied_prob or 0.5
-            impl_other = 1.0 - impl
-            if impl > 0 and impl_other > 0:
-                nv_side, _ = devig_power(impl, impl_other)
-                p.no_vig_prob = round(nv_side, 4)
-            else:
-                p.no_vig_prob = impl
+            if p.implied_prob is None:
+                continue
+            k = pair_key(p)
+            slot = impl_by_key.setdefault(k, {})
+            slot[p.side] = float(p.implied_prob)
+
+        for p in props:
+            impl_self = float(p.implied_prob) if p.implied_prob is not None else 0.5
+            slot = impl_by_key.get(pair_key(p), {})
+            other_side = "under" if p.side == "over" else "over"
+            impl_other = slot.get(other_side)
+            if impl_other is None:
+                # No paired side available — best we can do is treat the leg as a single
+                # one-sided market. For Underdog Pick'em with symmetric pricing the
+                # implied is already the break-even, so no_vig == implied.
+                p.no_vig_prob = round(impl_self, 4)
+                continue
+            total = impl_self + impl_other
+            if total <= 0:
+                p.no_vig_prob = round(impl_self, 4)
+                continue
+            if abs(total - 1.0) < 1e-6:
+                # Already vig-free (e.g., symmetric Pick'em legs at 0.55/0.45 sum != 1
+                # but if equal at 0.5/0.5 the multiplicative collapse equals input).
+                p.no_vig_prob = round(impl_self, 4)
+                continue
+            # Power method handles favorite-longshot bias better than multiplicative.
+            nv_self, nv_other = devig_power(impl_self, impl_other)
+            p.no_vig_prob = round(nv_self, 4)
 
         edge_vals: list[float] = []
         ev_vals: list[float] = []
@@ -313,13 +411,15 @@ class Ranker:
                 cv = max(0.0, 1.0 - p.stat_consistency)
             p.edge_confidence = compute_edge_confidence(p.edge or 0.0, n_games, cv)
 
-        edge_z = _zscore(edge_vals)
-        ev_z = _zscore(ev_vals)
-        vol_z = _zscore(vol_vals)
+        # Cohort z-scoring by (sport, stat) — prevents cross-sport scale bleed.
+        cohort_keys: list[tuple] = [(p.sport, (p.stat_field or p.stat)) for p in props]
+        edge_z = _zscore_grouped(edge_vals, cohort_keys)
+        ev_z = _zscore_grouped(ev_vals, cohort_keys)
+        vol_z = _zscore_grouped(vol_vals, cohort_keys)
         kelly_vals = [p.kelly_fraction or 0.0 for p in props]
-        kelly_z = _zscore(kelly_vals)
+        kelly_z = _zscore_grouped(kelly_vals, cohort_keys)
         ec_vals = [p.edge_confidence or 0.0 for p in props]
-        ec_z = _zscore(ec_vals)
+        ec_z = _zscore_grouped(ec_vals, cohort_keys)
 
         z_by_option: dict[str, tuple[float, float, float]] = {}
         for i, p in enumerate(props):
@@ -438,16 +538,40 @@ class Ranker:
             if self._ollama is not None and ai_limit > 0:
                 await self._apply_ollama(selected)
 
-        # Final score (stats + AI) for selected only
+        # Final score (stats + AI) for selected only.
+        # Per arxiv 2512.05998 / 2509.04664: frontier LLMs are systematically
+        # overconfident on prediction tasks (27% error at >90% confidence). We
+        # treat the LLM as ONE small bounded probability nudge, not three additive
+        # signals. The nudge is also applied directly to model_prob so the
+        # displayed probability matches the score.
+        AI_MAX_PROB_NUDGE = 0.05
         for p in selected:
             ez, evz, vz = z_by_option.get(p.underdog_option_id, (0.0, 0.0, 0.0))
-            ai_signal = float((p.ai_bias or 0) * (p.ai_confidence or 0.0))
-            ai_adj = float(p.ai_prob_adjustment or 0.0)
+            ai_adj_raw = float(p.ai_prob_adjustment or 0.0)
+            # Hard cap to ±0.05; the schema lets the LLM emit ±0.15 but we don't
+            # trust uncalibrated nudges that large.
+            ai_adj = max(-AI_MAX_PROB_NUDGE, min(AI_MAX_PROB_NUDGE, ai_adj_raw))
+            p.ai_prob_adjustment = round(ai_adj, 4)
+
+            # Apply nudge to model_prob so EV/edge/score all reflect the same
+            # number. Recompute edge against the (already de-vigged) market price.
+            if p.model_prob is not None and ai_adj != 0.0:
+                adjusted_prob = max(0.01, min(0.99, p.model_prob + ai_adj))
+                p.model_prob = round(adjusted_prob, 4)
+                # Re-derive edge / EV / Kelly with the post-nudge probability so
+                # the user-visible numbers stay coherent.
+                no_vig = p.no_vig_prob if p.no_vig_prob is not None else (p.implied_prob or 0.5)
+                p.edge = edge_skepticism(p.model_prob - no_vig)
+                p.ev = p.model_prob * ((p.decimal_price or 1.0) - 1.0) - (1.0 - p.model_prob)
+                p.kelly_fraction = compute_kelly(
+                    p.model_prob, p.decimal_price or 1.0, fraction=0.25,
+                )
+
             p.score = (
                 self._cfg.w_edge * ez
                 + self._cfg.w_ev * evz
                 - self._cfg.w_vol * vz
-                + self._cfg.w_ai * (ai_signal + ai_adj * 3.0)
+                + self._cfg.w_ai * ai_adj * 4.0  # single bounded contribution
             )
 
             model_favorable = (p.edge or 0) > 0
@@ -461,6 +585,53 @@ class Ranker:
         selected_ids = {p.underdog_option_id for p in selected}
         remaining = [p for p in props if p.underdog_option_id not in selected_ids]
         return selected + remaining
+
+    @staticmethod
+    def _correlation_factor(legs: list[Prop]) -> tuple[float, list[str]]:
+        """Heuristic same-game / same-team correlation tax for parlay independence.
+
+        Per Wizard-of-Odds / AgentBets correlation literature, naive product-of-
+        probs systematically over-prices correlated parlays. We apply a small
+        multiplicative penalty per detected correlation pair:
+        - same player (different stat): not allowed; caller filters but penalize anyway
+        - same team:  ~r=0.20, penalty 0.92
+        - same game (opposing team): weaker but real, penalty 0.96
+        Penalties stack multiplicatively. Notes describe the penalties applied.
+        """
+        if len(legs) < 2:
+            return 1.0, []
+        notes: list[str] = []
+        factor = 1.0
+        for i in range(len(legs)):
+            for j in range(i + 1, len(legs)):
+                a, b = legs[i], legs[j]
+                # Same player on the same stat is disallowed; same player different
+                # stats (e.g. points + rebounds) — strong positive correlation.
+                if a.player_name and a.player_name == b.player_name:
+                    factor *= 0.85
+                    notes.append(
+                        f"{a.player_name} appears on both legs (same-player correlation)."
+                    )
+                    continue
+                same_game = (
+                    a.game_title and b.game_title and a.game_title == b.game_title
+                )
+                if not same_game:
+                    continue
+                same_team = (
+                    a.team_abbr and b.team_abbr and a.team_abbr.upper() == b.team_abbr.upper()
+                )
+                if same_team:
+                    factor *= 0.92
+                    notes.append(
+                        f"Same-team legs in {a.game_title} (positive correlation)."
+                    )
+                else:
+                    factor *= 0.96
+                    notes.append(
+                        f"Same-game legs in {a.game_title} (cross-team correlation)."
+                    )
+        return factor, notes
 
     async def recommend_parlay(
         self,
@@ -523,15 +694,40 @@ class Ranker:
 
         selected_props = [candidates[i] for i in picks_indices if i < len(candidates)]
 
+        independence_prob = (
+            math.prod(p.model_prob or 0.5 for p in selected_props)
+            if selected_props
+            else 0.0
+        )
+        corr_factor, corr_notes = self._correlation_factor(selected_props)
+        adjusted_prob = independence_prob * corr_factor
+
+        # Documented payout-implied odds per UD entry size (research-backed):
+        #   2-pick = +200 / 3x; 3-pick = +500 / 6x; 4-pick = +900 / 10x; 5-pick = +1900 / 20x
+        ENTRY_PAYOUT = {2: 3.0, 3: 6.0, 4: 10.0, 5: 20.0, 6: 35.0}
+        entry_payout = ENTRY_PAYOUT.get(int(legs))
+        ev_independent = (
+            (independence_prob * (entry_payout - 1)) - (1 - independence_prob)
+            if entry_payout else None
+        )
+        ev_corrected = (
+            (adjusted_prob * (entry_payout - 1)) - (1 - adjusted_prob)
+            if entry_payout else None
+        )
+
         return {
             "legs": legs,
             "props": [p.model_dump() for p in selected_props],
             "parlay_summary": result.get("parlay_summary", ""),
             "combined_confidence": result.get("combined_confidence", 0),
-            "risk_factors": result.get("risk_factors", []),
-            "combined_model_prob": round(
-                math.prod(p.model_prob or 0.5 for p in selected_props), 6
-            ) if selected_props else 0.0,
+            "risk_factors": list(result.get("risk_factors", [])) + corr_notes,
+            "combined_model_prob": round(independence_prob, 6),
+            "combined_model_prob_adjusted": round(adjusted_prob, 6),
+            "correlation_factor": round(corr_factor, 4),
+            "correlation_notes": corr_notes,
+            "entry_payout_multiplier": entry_payout,
+            "ev_independent": round(ev_independent, 4) if ev_independent is not None else None,
+            "ev_corr_adjusted": round(ev_corrected, 4) if ev_corrected is not None else None,
         }
 
     async def _ai_select_props(
@@ -697,6 +893,39 @@ class Ranker:
         position_by_player: dict[tuple[SportId, str], str | None] = {}
         athlete_id_by_player: dict[tuple[SportId, str], int | None] = {}
 
+        # ── Vegas odds per (sport, team_abbr) — best-effort, errors swallowed. ──
+        unique_teams: set[tuple[SportId, str]] = set()
+        for p in props:
+            if p.team_abbr and p.sport in ("NBA", "NFL", "NHL"):
+                unique_teams.add((p.sport, p.team_abbr.strip().upper()))
+        odds_by_team: dict[tuple[SportId, str], dict[str, float | None]] = {}
+
+        async def fetch_team_odds(sp: SportId, abbr: str) -> None:
+            try:
+                sl = self._espn.sport_league_for_scope(sp)
+                if sl is None:
+                    return
+                sport_slug, league_slug = sl
+                tid = await self._espn._team_id_by_abbr(
+                    sport=sport_slug, league=league_slug, abbr=abbr
+                )
+                if tid is None:
+                    return
+                eid = await self._espn.fetch_upcoming_event_id(
+                    sport=sport_slug, league=league_slug, team_id=tid
+                )
+                if eid is None:
+                    return
+                odds = await self._espn.fetch_event_odds(
+                    sport=sport_slug, league=league_slug, event_id=eid, team_id=tid,
+                )
+                odds_by_team[(sp, abbr)] = odds
+            except Exception:
+                return
+
+        if unique_teams:
+            await asyncio.gather(*(fetch_team_odds(sp, ab) for sp, ab in unique_teams))
+
         sem = asyncio.Semaphore(10)
 
         async def fetch_one(sp: SportId, name: str) -> None:
@@ -765,8 +994,7 @@ class Ranker:
                 p.notes.append("ESPN gamelog has no values for this stat field.")
                 continue
 
-            # Recency-weighted normal fit (#1) — calibrated decay=0.88
-            params = fit_normal_weighted(series, decay=0.88)
+            params = fit_normal_weighted(series, decay=get_calibrated_params().get("decay", 0.88))
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN data).")
                 continue
@@ -776,9 +1004,17 @@ class Ranker:
             if vol_mult != 1.0:
                 params = NormalParams(mu=params.mu, sigma=params.sigma * vol_mult)
 
-            # Bayesian shrinkage for small samples (#6)
+            # Bayesian shrinkage for small samples — shrink toward the LEAGUE/POSITION
+            # baseline, NEVER toward the betting line. Falls back to player's own
+            # mean when no prior is registered for the (sport, stat) cohort.
+            prior_mean = league_prior_mean(
+                sport=p.sport, stat_field=field_used, position=p.player_position,
+                fallback=params.mu,
+            )
+            if prior_mean is None:
+                prior_mean = params.mu
             if len(series) < 5:
-                shrunk_mu = bayesian_shrink(params.mu, len(series), p.line, shrinkage_k=3.0)
+                shrunk_mu = bayesian_shrink(params.mu, len(series), prior_mean, shrinkage_k=3.0)
                 params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
 
             # Opponent adjustment using cached league snapshot (#4)
@@ -868,6 +1104,49 @@ class Ranker:
                 if mins:
                     p.avg_minutes = round(sum(mins) / len(mins), 1)
 
+            # Vegas spread / total — apply blowout minutes discount when known.
+            if p.team_abbr and p.sport in ("NBA", "NFL", "NHL"):
+                team_key = (p.sport, p.team_abbr.strip().upper())
+                odds = odds_by_team.get(team_key)
+                if odds:
+                    spread_val = odds.get("spread")
+                    total_val = odds.get("total")
+                    if isinstance(spread_val, (int, float)):
+                        p.vegas_spread = float(spread_val)
+                    if isinstance(total_val, (int, float)):
+                        p.vegas_total = float(total_val)
+                    if (
+                        p.sport == "NBA"
+                        and p.avg_minutes is not None
+                        and p.avg_minutes > 0
+                        and isinstance(spread_val, (int, float))
+                    ):
+                        adjusted = blowout_minutes_discount(
+                            spread=float(spread_val), avg_minutes=float(p.avg_minutes),
+                        )
+                        if adjusted < p.avg_minutes:
+                            p.projected_minutes = round(adjusted, 1)
+                            p.blowout_risk = abs(float(spread_val)) > 10
+                            # If we have a per-minute rate, re-project mu via reduced
+                            # minutes — captures usage decline in blowouts.
+                            if p.per_minute_rate is None and p.avg_minutes > 10:
+                                # Compute it now if we missed it earlier.
+                                recent_vals = series[:5] if len(series) >= 5 else series
+                                recent_mins = self._espn.extract_stat_series(
+                                    gamelog, field_name="minutes", last_n=len(recent_vals)
+                                )
+                                if recent_mins and len(recent_mins) == len(recent_vals):
+                                    total_min_local = sum(recent_mins)
+                                    if total_min_local >= 5:
+                                        p.per_minute_rate = round(sum(recent_vals) / total_min_local, 4)
+                            if p.per_minute_rate is not None and p.per_minute_rate > 0:
+                                blowout_mu = float(p.per_minute_rate) * float(adjusted)
+                                # Blend 60/40 toward blended estimate to avoid over-correction.
+                                params = NormalParams(
+                                    mu=0.6 * params.mu + 0.4 * blowout_mu,
+                                    sigma=params.sigma,
+                                )
+
             # B2B / rest days detection (#8)
             if p.scheduled_at and p.recent_games:
                 last_game = p.recent_games[0].game_date
@@ -890,16 +1169,20 @@ class Ranker:
                     if rate is not None:
                         p.per_minute_rate = round(rate, 4)
 
-            # Continuous Bayesian shrinkage — sharps always regress toward the mean
+            # Continuous Bayesian shrinkage — regress toward the LEAGUE prior, not
+            # the betting line. The k controls how aggressively small samples are
+            # pulled back to baseline; large n approaches no shrinkage.
             n = len(series)
-            shrunk_mu = continuous_shrinkage(params.mu, n, p.line)
+            shrunk_mu = continuous_shrinkage(params.mu, n, prior_mean)
             params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
 
-            # Model probability — Poisson for low-count stats (#3), normal otherwise
-            if is_low_count_stat(field_used):
-                p_over = poisson_prob_over(line=p.line, lam=params.mu)
-            else:
-                p_over = prob_over(line=p.line, params=params)
+            # Model probability — dispatch by distribution family per stat type.
+            # NB > Poisson for over-dispersed counts (points, rebounds, assists);
+            # Gamma for skewed continuous yards; Normal as fallback.
+            p_over = prob_over_for_field(
+                line=p.line, mean=params.mu, variance=params.sigma * params.sigma,
+                field_name=field_used,
+            )
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
             # Cap model probability — no stat type deserves 85%+ confidence
@@ -907,11 +1190,9 @@ class Ranker:
             if p.model_prob > cap:
                 p.model_prob = cap
 
-            # Line proximity penalty — picks where line ≈ median are coin flips
-            # Only apply to the OVER side; the under's model_prob is derived
-            # from (1 - p_over) so it already reflects the same penalty direction.
-            # Also use the pre-shrinkage median to avoid double-dampening with
-            # continuous shrinkage which already regresses mu toward the line.
+            # Line proximity penalty — picks where line ≈ median are coin flips.
+            # Only apply when shrinkage was meaningful (sigma > 0). Distribution
+            # family is irrelevant for the penalty; it acts on prob, not on mu/sigma.
             if p.stat_median is not None and params.sigma > 0:
                 prox_penalty = line_proximity_penalty(
                     line=p.line, median=p.stat_median, sigma=params.sigma,
@@ -979,15 +1260,20 @@ class Ranker:
                 p.notes.append("ESPN fight history has no values for this stat field.")
                 continue
 
-            # Recency-weighted fit (#1) — calibrated decay=0.88
-            params = fit_normal_weighted(series, decay=0.88)
+            params = fit_normal_weighted(series, decay=get_calibrated_params().get("decay", 0.88))
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN MMA data).")
                 continue
 
-            # Bayesian shrinkage for small MMA samples (#6)
+            # Bayesian shrinkage for small MMA samples — shrink toward fight-stat
+            # baseline (e.g. ~60 sig strikes, ~1.2 takedowns), NOT toward p.line.
+            mma_prior = league_prior_mean(
+                sport="MMA", stat_field=field_used, position=None, fallback=params.mu,
+            )
+            if mma_prior is None:
+                mma_prior = params.mu
             if len(series) < 5:
-                shrunk_mu = bayesian_shrink(params.mu, len(series), p.line, shrinkage_k=3.0)
+                shrunk_mu = bayesian_shrink(params.mu, len(series), mma_prior, shrinkage_k=3.0)
                 params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
 
             p.volatility = float(params.sigma)
@@ -1070,11 +1356,12 @@ class Ranker:
                 p.current_streak = profile.current_streak
             p.line_percentile = line_percentile(line=p.line, params=params)
 
-            # Poisson for low-count MMA stats (#3)
-            if is_low_count_stat(field_used):
-                p_over = poisson_prob_over(line=p.line, lam=params.mu)
-            else:
-                p_over = prob_over(line=p.line, params=params)
+            # Distribution-family dispatch (NegBin for sig-strikes/total-strikes
+            # which are over-dispersed; Poisson for takedowns/knockdowns/subs).
+            p_over = prob_over_for_field(
+                line=p.line, mean=params.mu, variance=params.sigma * params.sigma,
+                field_name=field_used,
+            )
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
             # Cap model probability for MMA stats too
@@ -1530,4 +1817,5 @@ class Ranker:
         if isinstance(risks, list):
             p.ai_risk_factors = [str(x) for x in risks if str(x).strip()][:8]
         if isinstance(prob_adj, (int, float)):
-            p.ai_prob_adjustment = max(-0.15, min(0.15, float(prob_adj)))
+            # Hard cap at ±0.05 to align with the calibrated nudge contract.
+            p.ai_prob_adjustment = max(-0.05, min(0.05, float(prob_adj)))

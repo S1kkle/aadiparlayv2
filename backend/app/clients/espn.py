@@ -38,12 +38,53 @@ class EspnClient:
     def __init__(self, cfg: EspnConfig, *, cache: SqliteTTLCache) -> None:
         self._cfg = cfg
         self._cache = cache
+        self._http: httpx.AsyncClient | None = None
+        self._http_lock = asyncio.Lock()
+
+    async def _client(self) -> httpx.AsyncClient:
+        # Lazily-created shared connection pool. Avoids the previous behavior of
+        # opening + closing a new TLS connection on every single request, which
+        # in MMA paths could mean 30+ handshakes per fighter.
+        if self._http is None or self._http.is_closed:
+            async with self._http_lock:
+                if self._http is None or self._http.is_closed:
+                    self._http = httpx.AsyncClient(
+                        timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0),
+                        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                        headers={"Accept": "application/json", "User-Agent": "aadiparlayv2/1.0"},
+                    )
+        return self._http
 
     async def _get_json(self, url: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers={"Accept": "application/json"})
-            resp.raise_for_status()
-            return resp.json()
+        """GET JSON with bounded retry on 429/5xx + transient network errors.
+
+        Backoff: 0.5s, 1.0s, 2.0s. Caller errors (4xx other than 429) raise
+        immediately. Returns the decoded JSON dict on success.
+        """
+        client = await self._client()
+        backoffs = (0.5, 1.0, 2.0)
+        last_exc: Exception | None = None
+        for attempt in range(len(backoffs) + 1):
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                    if attempt < len(backoffs):
+                        await asyncio.sleep(backoffs[attempt])
+                        continue
+                    resp.raise_for_status()
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+                last_exc = exc
+                if attempt < len(backoffs):
+                    await asyncio.sleep(backoffs[attempt])
+                    continue
+                raise
+            except httpx.HTTPStatusError:
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return {}
 
     async def get_team_abbr_to_id(self, *, sport: EspnSport, league: EspnLeague) -> dict[str, int]:
         """
@@ -491,6 +532,109 @@ class EspnClient:
             return None
         tid = abbr_to_id.get(abbr.upper())
         return int(tid) if isinstance(tid, int) else None
+
+    async def fetch_upcoming_event_id(
+        self,
+        *,
+        sport: EspnSport,
+        league: EspnLeague,
+        team_id: int,
+    ) -> str | None:
+        """Return the next upcoming/scheduled event id for this team, or None."""
+        try:
+            sched = await self.fetch_team_schedule(sport=sport, league=league, team_id=team_id)
+        except Exception:
+            return None
+        events = sched.get("events") or []
+        if not isinstance(events, list):
+            return None
+        from datetime import timezone as _tz, datetime as _dt
+        now = _dt.now(_tz.utc)
+        best: tuple[_dt, str] | None = None
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            comps = ev.get("competitions") or []
+            comp0 = comps[0] if isinstance(comps, list) and comps else None
+            if not isinstance(comp0, dict):
+                continue
+            st = ((comp0.get("status") or {}).get("type") or {})
+            if isinstance(st, dict) and st.get("completed"):
+                continue
+            date_str = ev.get("date")
+            if not isinstance(date_str, str):
+                continue
+            try:
+                game_dt = _dt.fromisoformat(date_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if game_dt < now:
+                continue
+            eid = ev.get("id")
+            if not isinstance(eid, str) or not eid.strip():
+                continue
+            if best is None or game_dt < best[0]:
+                best = (game_dt, eid.strip())
+        return best[1] if best else None
+
+    async def fetch_event_odds(
+        self,
+        *,
+        sport: EspnSport,
+        league: EspnLeague,
+        event_id: str,
+        team_id: int | None = None,
+    ) -> dict[str, float | None]:
+        """Fetch sportsbook spread + total for an upcoming/recent event from ESPN's
+        event summary `pickcenter`. Returns {"spread": ..., "total": ...} where
+        spread is from `team_id`'s perspective (negative = favorite). Best-effort:
+        returns dict with None values rather than raising on missing data.
+        """
+        try:
+            summ = await self.fetch_event_summary(sport=sport, league=league, event_id=event_id)
+        except Exception:
+            return {"spread": None, "total": None}
+        pickcenter = summ.get("pickcenter") or []
+        if not isinstance(pickcenter, list) or not pickcenter:
+            return {"spread": None, "total": None}
+        # Prefer first provider entry that has both fields populated.
+        spread_val: float | None = None
+        total_val: float | None = None
+        spread_team_id: int | None = None
+        for pc in pickcenter:
+            if not isinstance(pc, dict):
+                continue
+            sp = pc.get("spread")
+            ou = pc.get("overUnder")
+            if isinstance(sp, (int, float)) and spread_val is None:
+                spread_val = float(sp)
+                # ESPN's "spread" is from the perspective of "home" or specified favorite.
+                # The summary header has competitors with team ids.
+                home_competitor = pc.get("homeTeamOdds") or {}
+                if isinstance(home_competitor, dict):
+                    fav = home_competitor.get("favorite")
+                    home_team = home_competitor.get("team") or {}
+                    if isinstance(home_team, dict):
+                        try:
+                            spread_team_id = int(home_team.get("id"))
+                        except (TypeError, ValueError):
+                            spread_team_id = None
+                    if fav is False and isinstance(spread_val, (int, float)):
+                        # If "home" is NOT the favorite, sign is negated in some payloads.
+                        pass
+            if isinstance(ou, (int, float)) and total_val is None:
+                total_val = float(ou)
+            if spread_val is not None and total_val is not None:
+                break
+        # Re-orient spread to team_id's perspective if we know both.
+        if (
+            spread_val is not None
+            and team_id is not None
+            and spread_team_id is not None
+            and team_id != spread_team_id
+        ):
+            spread_val = -spread_val
+        return {"spread": spread_val, "total": total_val}
 
     async def fetch_team_schedule(self, *, sport: EspnSport, league: EspnLeague, team_id: int) -> dict[str, Any]:
         cache_key = f"espn:schedule:{sport}:{league}:{team_id}"
@@ -1042,6 +1186,34 @@ class EspnClient:
         return out
 
     @staticmethod
+    def _select_regular_season_block(season_types: list[Any]) -> dict[str, Any] | None:
+        """Pick the regular-season block from ESPN's seasonTypes list.
+
+        ESPN seasonType IDs: 1 = preseason, 2 = regular season, 3 = postseason.
+        Order is NOT guaranteed across endpoints / weeks. Falls back to the
+        first dict block (legacy behavior) if no explicit type is identified.
+        """
+        if not isinstance(season_types, list) or not season_types:
+            return None
+        regular: dict[str, Any] | None = None
+        first_dict: dict[str, Any] | None = None
+        for st in season_types:
+            if not isinstance(st, dict):
+                continue
+            if first_dict is None:
+                first_dict = st
+            type_id = st.get("type")
+            type_name = (st.get("displayName") or st.get("name") or "").lower()
+            try:
+                tid_int = int(type_id) if type_id is not None else None
+            except (TypeError, ValueError):
+                tid_int = None
+            if tid_int == 2 or "regular" in type_name:
+                regular = st
+                break
+        return regular or first_dict
+
+    @staticmethod
     def extract_stat_series(gamelog: dict[str, Any], *, field_name: str, last_n: int) -> list[float]:
         """
         Returns the most recent N values for a given ESPN gamelog field name.
@@ -1057,11 +1229,9 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        if not isinstance(season_types, list) or not season_types:
-            return []
-
-        # Prefer the first seasonType (usually current regular season).
-        st0 = season_types[0]
+        # Filter to regular season explicitly — preseason/playoff blocks can show
+        # up at index 0 in some payloads and pollute the series.
+        st0 = EspnClient._select_regular_season_block(season_types)
         if not isinstance(st0, dict):
             return []
         categories = st0.get("categories") or []
@@ -1108,10 +1278,7 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        if not isinstance(season_types, list) or not season_types:
-            return []
-
-        st0 = season_types[0]
+        st0 = EspnClient._select_regular_season_block(season_types)
         if not isinstance(st0, dict):
             return []
         categories = st0.get("categories") or []
@@ -1178,10 +1345,7 @@ class EspnClient:
         idx = names.index(field_name)
 
         season_types = gamelog.get("seasonTypes") or []
-        if not isinstance(season_types, list) or not season_types:
-            return []
-
-        st0 = season_types[0]
+        st0 = EspnClient._select_regular_season_block(season_types)
         if not isinstance(st0, dict):
             return []
         categories = st0.get("categories") or []

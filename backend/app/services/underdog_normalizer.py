@@ -38,6 +38,26 @@ def american_to_implied_prob(american: int) -> float:
     return 100.0 / (american + 100.0)
 
 
+# Underdog Pick'em per-leg break-even by entry size (research-backed):
+#   2-pick: -136 (~57.7%), 3-pick: -122 (~55.0%), 4-pick: -128 (~56.2%), 5-pick: -122 (~54.9%)
+# Default to 3-pick economics — most common entry size, also one of the best.
+UD_DEFAULT_LEG_DECIMAL = 1.82  # corresponds to ~55% break-even (-122 American)
+
+
+def decimal_to_implied_prob(decimal_price: float) -> float:
+    if decimal_price <= 1.0:
+        return 1.0
+    return 1.0 / decimal_price
+
+
+def decimal_to_american(decimal_price: float) -> int | None:
+    if decimal_price <= 1.0:
+        return None
+    if decimal_price >= 2.0:
+        return int(round((decimal_price - 1.0) * 100.0))
+    return int(round(-100.0 / (decimal_price - 1.0)))
+
+
 def _sport_from_any(player: dict[str, Any] | None, game: dict[str, Any] | None) -> SportId:
     raw = None
     if player:
@@ -162,7 +182,32 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
 
             american = _parse_int(opt.get("american_price"))
             dec = _parse_float(opt.get("decimal_price"))
-            implied = american_to_implied_prob(american) if american is not None else None
+            payout_mult = _parse_float(opt.get("payout_multiplier"))
+            subheader = opt.get("selection_subheader")
+            subheader_str = subheader.strip() if isinstance(subheader, str) else None
+            is_boosted = False
+            if subheader_str:
+                lower_sh = subheader_str.lower()
+                is_boosted = ("boost" in lower_sh) or ("special" in lower_sh) or ("rescue" in lower_sh)
+
+            # Truth hierarchy: payout_multiplier > decimal_price > american_price > Pick'em default.
+            # Pick'em legs typically arrive with NO price fields — we fall back to the documented
+            # 3-pick break-even (~55%, decimal 1.82). This is much closer to reality than -110.
+            if isinstance(payout_mult, (int, float)) and payout_mult > 1.0:
+                effective_decimal = float(payout_mult)
+            elif isinstance(dec, (int, float)) and dec > 1.0:
+                effective_decimal = float(dec)
+            elif isinstance(american, int):
+                effective_decimal = (
+                    1.0 + (100.0 / (-american)) if american < 0 else 1.0 + (american / 100.0)
+                )
+            else:
+                effective_decimal = UD_DEFAULT_LEG_DECIMAL
+
+            implied = decimal_to_implied_prob(effective_decimal)
+            breakeven_prob = implied  # for Pick'em legs, break-even == implied
+            if american is None:
+                american = decimal_to_american(effective_decimal)
 
             resolved_player_name = player_name
             if not resolved_player_name:
@@ -189,7 +234,11 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     line=float(line_value),
                     side=side,  # type: ignore[arg-type]
                     american_price=american,
-                    decimal_price=dec,
+                    decimal_price=effective_decimal,
+                    payout_multiplier=payout_mult if isinstance(payout_mult, (int, float)) else None,
+                    selection_subheader=subheader_str,
+                    is_boosted=is_boosted,
+                    breakeven_prob=breakeven_prob,
                     implied_prob=implied,
                     notes=[],
                 )

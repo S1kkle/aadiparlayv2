@@ -34,18 +34,37 @@ class LearningService:
     # ── Step 1: resolve outcomes ──────────────────────────────────────
 
     async def resolve_outcomes(self) -> dict[str, Any]:
-        """Look up actual results for past picks that haven't been resolved yet."""
+        """Look up actual results for past picks that haven't been resolved yet.
+
+        Deduplication strategy:
+        - Cross-history-entry: same (player, stat, line, side, scheduled-day)
+          resolves once. This prevents 3 prediction runs from creating 3
+          learning_log rows for the same physical prop outcome.
+        - Within-history-entry: also deduped by underdog_option_id.
+        """
         history = self._cache.get_history(limit=50)
         if not history:
             return {"resolved": 0, "already_done": 0, "failed_lookup": 0, "skipped_future": 0, "detail": "No history entries found."}
 
         existing_entries = self._cache.get_learning_entries(limit=5000)
         existing_ids: set[str] = {e["id"] for e in existing_entries}
+        # Build a logical-key index from already-resolved entries so we don't
+        # re-resolve the same physical prop under a different history_id.
+        existing_logical: set[str] = set()
+        for e in existing_entries:
+            ts_raw = e.get("timestamp", "")
+            day_part = (ts_raw or "")[:10]  # YYYY-MM-DD
+            logical = (
+                f"{e.get('player_name', '?')}::{(e.get('stat') or '').lower()}"
+                f"::{float(e.get('line', 0))}::{e.get('side', '?')}::{day_part}"
+            )
+            existing_logical.add(logical)
 
         resolved_count = 0
         already_done = 0
         failed = 0
         skipped_future = 0
+        deduped = 0
 
         for entry in history:
             hid = entry["id"]
@@ -67,6 +86,20 @@ class LearningService:
                     already_done += 1
                     continue
 
+                # Cross-history-entry dedup: skip if this physical prop already
+                # has a resolved row under a different history_id.
+                scheduled_at = p.get("scheduled_at")
+                day_part = ""
+                if isinstance(scheduled_at, str):
+                    day_part = scheduled_at[:10]
+                logical_key = (
+                    f"{p.get('player_name', '?')}::{(p.get('stat') or '').lower()}"
+                    f"::{float(p.get('line', 0))}::{p.get('side', '?')}::{day_part}"
+                )
+                if logical_key in existing_logical:
+                    deduped += 1
+                    continue
+
                 scheduled = p.get("scheduled_at")
                 if scheduled:
                     try:
@@ -85,6 +118,19 @@ class LearningService:
                 line = float(p.get("line", 0))
                 side = p.get("side", "over")
                 hit = (actual > line) if side == "over" else (actual < line)
+
+                # Persist the historical series leading up to the prediction so that
+                # calibration grid search can TRULY re-simulate the prediction under
+                # candidate params, not just re-threshold a frozen model_prob.
+                series_vals: list[float] = []
+                recent = p.get("recent_games") or []
+                if isinstance(recent, list):
+                    for g in recent:
+                        if isinstance(g, dict) and "value" in g:
+                            try:
+                                series_vals.append(float(g["value"]))
+                            except (TypeError, ValueError):
+                                continue
 
                 self._cache.save_learning_entry({
                     "id": lid,
@@ -105,13 +151,20 @@ class LearningService:
                     "miss_reason": None,
                     "miss_category": None,
                     "resolved": 1 if hit else 0,
+                    "series_json": json.dumps(series_vals) if series_vals else None,
+                    "stat_field": p.get("stat_field"),
+                    "position": p.get("player_position"),
+                    "decimal_price": p.get("decimal_price"),
+                    "payout_multiplier": p.get("payout_multiplier"),
                 })
                 existing_ids.add(lid)
+                existing_logical.add(logical_key)
                 resolved_count += 1
 
         return {
             "resolved": resolved_count,
             "already_done": already_done,
+            "deduped": deduped,
             "failed_lookup": failed,
             "skipped_future": skipped_future,
         }
