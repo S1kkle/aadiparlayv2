@@ -12,15 +12,16 @@ import {
   learningAnalyzeMisses,
   learningResolve,
   learningWeeklyReport,
-  recommendParlay,
   saveHistory,
   seedHistory,
   startPropsJob,
 } from "@/lib/api";
-import type { HistoryEntry, LearningEntry, LearningReport, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import type { HistoryEntry, LearningEntry, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 // ── localStorage history persistence ──────────────────────────────────
 const LS_HISTORY_KEY = "parlay_prediction_history";
+const LS_BANKROLL_KEY = "parlay_bankroll";
+const LS_KELLY_DIVISOR_KEY = "parlay_kelly_divisor";
 
 function lsGetHistory(): HistoryEntry[] {
   try {
@@ -39,6 +40,31 @@ function lsSaveHistoryEntry(entry: HistoryEntry) {
     const merged = [entry, ...existing.filter((e) => e.id !== entry.id)].slice(0, 100);
     localStorage.setItem(LS_HISTORY_KEY, JSON.stringify(merged));
   } catch {}
+}
+
+// ── Kelly Criterion (Kelly 1956, Bell System Technical Journal) ───────
+// f* = (b·p − q) / b   maximises log-growth of wealth.
+// Full Kelly is mathematically optimal but produces ~60% drawdowns; the
+// industry standard is a fractional Kelly (quarter-Kelly is the sweet
+// spot — ~44% of the growth, ~6% of the variance).
+function kellyFullFraction(p: number, decimalOdds: number): number {
+  if (!isFinite(p) || !isFinite(decimalOdds)) return 0;
+  if (decimalOdds <= 1) return 0;
+  const b = decimalOdds - 1;
+  const q = 1 - p;
+  const f = (b * p - q) / b;
+  return f;
+}
+
+function fmtMoney(x: number | null | undefined) {
+  if (x === null || x === undefined || !isFinite(x)) return "—";
+  return `$${x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function fmtAmericanFromDecimal(decimal: number): string {
+  if (!isFinite(decimal) || decimal <= 1) return "—";
+  if (decimal >= 2) return `+${Math.round((decimal - 1) * 100)}`;
+  return `${Math.round(-100 / (decimal - 1))}`;
 }
 
 const SPORT_OPTIONS: { id: SportId; label: string }[] = [
@@ -219,9 +245,12 @@ export default function Home() {
   // Parlay builder
   const [parlayIds, setParlayIds] = useState<Set<string>>(new Set());
 
-  // AI parlay recommendation
-  const [parlayRec, setParlayRec] = useState<ParlayRecommendation | null>(null);
-  const [parlayRecLoading, setParlayRecLoading] = useState(false);
+  // Bankroll & Kelly sizing (persisted in localStorage)
+  // Default to quarter Kelly per the literature: ~44% of full-Kelly growth
+  // for ~6% of the variance — the sweet spot that elite bettors use.
+  const [bankroll, setBankroll] = useState<number>(1000);
+  const [bankrollInput, setBankrollInput] = useState<string>("1000");
+  const [kellyDivisor, setKellyDivisor] = useState<number>(4);
 
   // Model-only props (shown before AI finishes)
   const [modelProps, setModelProps] = useState<Prop[]>([]);
@@ -253,7 +282,6 @@ export default function Home() {
     setError(null);
     setJobProgress(null);
     setModelProps([]);
-    setParlayRec(null);
     if (esRef.current) {
       try { esRef.current.close(); } catch {}
       esRef.current = null;
@@ -348,21 +376,6 @@ export default function Home() {
     } catch (e) {
       setData(null);
       setError(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  async function loadParlayRec(legs: number) {
-    const sourceProps = allProps.length ? allProps : modelProps;
-    if (!sourceProps.length) return;
-    setParlayRecLoading(true);
-    setParlayRec(null);
-    try {
-      const rec = await recommendParlay({ sport, legs, props: sourceProps.slice(0, 30) });
-      setParlayRec(rec);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setParlayRecLoading(false);
     }
   }
 
@@ -487,6 +500,43 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sport]);
 
+  // Hydrate bankroll / Kelly fraction from localStorage on mount
+  useEffect(() => {
+    try {
+      const rawBank = localStorage.getItem(LS_BANKROLL_KEY);
+      if (rawBank !== null) {
+        const v = Number(rawBank);
+        if (isFinite(v) && v > 0) {
+          setBankroll(v);
+          setBankrollInput(String(v));
+        }
+      }
+      const rawDiv = localStorage.getItem(LS_KELLY_DIVISOR_KEY);
+      if (rawDiv !== null) {
+        const v = Number(rawDiv);
+        if (isFinite(v) && [1, 2, 4, 8].includes(v)) setKellyDivisor(v);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_BANKROLL_KEY, String(bankroll)); } catch {}
+  }, [bankroll]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_KELLY_DIVISOR_KEY, String(kellyDivisor)); } catch {}
+  }, [kellyDivisor]);
+
+  function commitBankroll(v: string) {
+    const n = Number(v.replace(/[^0-9.]/g, ""));
+    if (isFinite(n) && n >= 0) {
+      setBankroll(n);
+      setBankrollInput(String(n));
+    } else {
+      setBankrollInput(String(bankroll));
+    }
+  }
+
   const allProps = data?.props ?? [];
   const displayProps = allProps.length ? allProps : modelProps;
   const aiFinished = !!data;
@@ -527,14 +577,7 @@ export default function Home() {
     () => displayProps.filter((p) => parlayIds.has(p.underdog_option_id)),
     [displayProps, parlayIds]
   );
-  const parlayDecimalOdds = useMemo(() => {
-    if (!parlayProps.length) return 0;
-    return parlayProps.reduce((acc, p) => acc * (p.decimal_price ?? 1), 1);
-  }, [parlayProps]);
-  const parlayCombinedProb = useMemo(() => {
-    if (!parlayProps.length) return 0;
-    return parlayProps.reduce((acc, p) => acc * (p.model_prob ?? 0.5), 1);
-  }, [parlayProps]);
+
   const parlayCorrelationWarnings = useMemo(() => {
     const warnings: string[] = [];
     const byPlayer = new Map<string, string[]>();
@@ -553,6 +596,64 @@ export default function Home() {
     }
     return warnings;
   }, [parlayProps]);
+
+  // Comprehensive parlay analytics — joint probability, no-vig estimate,
+  // edge, EV, full / fractional Kelly stake, expected profit.
+  const parlayAnalytics = useMemo(() => {
+    const n = parlayProps.length;
+    if (!n) {
+      return {
+        n: 0,
+        decimalOdds: 0,
+        americanOdds: "—",
+        jointModelProb: 0,
+        jointNoVigProb: 0,
+        impliedFromOdds: 0,
+        edge: 0,
+        evPerDollar: 0,
+        kellyFull: 0,
+        kellyUsed: 0,
+        recommendedStake: 0,
+        potentialPayout: 0,
+        potentialProfit: 0,
+        expectedProfit: 0,
+        hasNegativeEdge: false,
+      };
+    }
+    const decimalOdds = parlayProps.reduce((acc, p) => acc * (p.decimal_price ?? 1), 1);
+    const jointModelProb = parlayProps.reduce((acc, p) => acc * (p.model_prob ?? 0.5), 1);
+    const jointNoVigProb = parlayProps.reduce(
+      (acc, p) => acc * (p.no_vig_prob ?? p.implied_prob ?? 1 / Math.max(1.01, p.decimal_price ?? 2)),
+      1,
+    );
+    const impliedFromOdds = decimalOdds > 0 ? 1 / decimalOdds : 0;
+    const b = decimalOdds - 1;
+    const edge = jointModelProb - impliedFromOdds;
+    const evPerDollar = jointModelProb * b - (1 - jointModelProb);
+    const kellyFull = kellyFullFraction(jointModelProb, decimalOdds);
+    const kellyUsed = Math.max(0, kellyFull / Math.max(1, kellyDivisor));
+    const recommendedStake = Math.max(0, bankroll * kellyUsed);
+    const potentialPayout = recommendedStake * decimalOdds;
+    const potentialProfit = recommendedStake * b;
+    const expectedProfit = recommendedStake * evPerDollar;
+    return {
+      n,
+      decimalOdds,
+      americanOdds: fmtAmericanFromDecimal(decimalOdds),
+      jointModelProb,
+      jointNoVigProb,
+      impliedFromOdds,
+      edge,
+      evPerDollar,
+      kellyFull,
+      kellyUsed,
+      recommendedStake,
+      potentialPayout,
+      potentialProfit,
+      expectedProfit,
+      hasNegativeEdge: kellyFull <= 0,
+    };
+  }, [parlayProps, bankroll, kellyDivisor]);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -655,6 +756,55 @@ export default function Home() {
                   >
                     Learning
                   </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* --- Bankroll & Kelly sizing --- */}
+          <div className="rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 shadow-sm dark:border-emerald-800/50 dark:bg-emerald-950/20">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div className="flex flex-wrap items-end gap-4">
+                <label className="flex flex-col gap-1 text-xs">
+                  <span className="font-semibold text-emerald-800 dark:text-emerald-200">Current bankroll</span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-zinc-500">$</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="h-9 w-32 rounded-md border border-emerald-200 bg-white px-2 font-mono text-sm shadow-sm outline-none focus:ring-2 focus:ring-emerald-300 dark:border-emerald-800 dark:bg-zinc-950 dark:focus:ring-emerald-700"
+                      value={bankrollInput}
+                      onChange={(e) => setBankrollInput(e.target.value)}
+                      onBlur={(e) => commitBankroll(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                      placeholder="1000"
+                    />
+                  </div>
+                </label>
+
+                <label className="flex flex-col gap-1 text-xs">
+                  <span className="font-semibold text-emerald-800 dark:text-emerald-200">Kelly fraction</span>
+                  <select
+                    className="h-9 rounded-md border border-emerald-200 bg-white px-2 text-sm shadow-sm outline-none focus:ring-2 focus:ring-emerald-300 dark:border-emerald-800 dark:bg-zinc-950 dark:focus:ring-emerald-700"
+                    value={kellyDivisor}
+                    onChange={(e) => setKellyDivisor(Number(e.target.value))}
+                    title="Lower = safer. Quarter Kelly is the practitioner standard."
+                  >
+                    <option value={1}>Full Kelly (max growth, max variance)</option>
+                    <option value={2}>Half Kelly (75% growth, 50% variance)</option>
+                    <option value={4}>Quarter Kelly (44% growth, 6% variance) — recommended</option>
+                    <option value={8}>Eighth Kelly (very conservative)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="text-xs text-zinc-600 dark:text-zinc-400 sm:text-right">
+                <div>
+                  Stake sizing follows the <span className="font-semibold">Kelly Criterion</span>:{" "}
+                  <span className="font-mono">f* = (b·p − q) / b</span>.
+                </div>
+                <div className="text-[10px] text-zinc-500">
+                  Settings persist locally. Lower fractions trade growth for drawdown protection.
                 </div>
               </div>
             </div>
@@ -764,88 +914,11 @@ export default function Home() {
                   )}
                 </div>
               </div>
-              <div className="flex w-full gap-2">
-                <button
-                  className="h-9 flex-1 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40 sm:flex-none sm:h-8"
-                  onClick={() => void loadParlayRec(2)}
-                  disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
-                >
-                  {parlayRecLoading ? "Building..." : "Best 2-Leg Parlay"}
-                </button>
-                <button
-                  className="h-9 flex-1 rounded-md border border-emerald-300 bg-emerald-50 px-3 text-xs font-medium text-emerald-800 shadow-sm hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/40 sm:flex-none sm:h-8"
-                  onClick={() => void loadParlayRec(5)}
-                  disabled={parlayRecLoading || (!allProps.length && !modelProps.length)}
-                >
-                  {parlayRecLoading ? "Building..." : "Best 5-Leg Parlay"}
-                </button>
+              <div className="rounded-md border border-emerald-200 bg-emerald-50/60 px-3 py-2 text-xs text-emerald-900 dark:border-emerald-800/60 dark:bg-emerald-950/30 dark:text-emerald-200">
+                Tap the <span className="font-mono font-semibold">+</span> next to any pick to add it to your custom parlay. Combined odds, model probability, edge, and your Kelly-sized recommended stake update live in the slip below.
               </div>
             </div>
           ) : null}
-
-          {/* --- AI Parlay Recommendation --- */}
-          {parlayRec && (
-            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/60 p-5 shadow-sm dark:border-emerald-800 dark:bg-emerald-950/30">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
-                  AI-Recommended {parlayRec.legs}-Leg Parlay
-                </h3>
-                <button
-                  className="text-xs text-emerald-700 hover:underline dark:text-emerald-400"
-                  onClick={() => setParlayRec(null)}
-                >
-                  Dismiss
-                </button>
-              </div>
-
-              <div className="mt-3 space-y-2">
-                {parlayRec.props.map((p, i) => (
-                  <div key={p.underdog_option_id ?? i} className="flex items-center justify-between rounded-lg border border-emerald-200 bg-white px-3 py-2 text-sm dark:border-emerald-800 dark:bg-zinc-950">
-                    <div className="flex items-center gap-3">
-                      <span className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-[10px] font-bold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300">
-                        {i + 1}
-                      </span>
-                      <div>
-                        <div className="font-medium">{p.player_name}</div>
-                        <div className="text-xs text-zinc-500">
-                          {p.side?.toUpperCase()} {p.line} {p.display_stat ?? p.stat}
-                          {p.game_title ? ` — ${p.game_title}` : ""}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3 text-xs font-mono">
-                      <span className={edgeColor(p.edge)}>edge {fmtPct(p.edge)}</span>
-                      <span>hit {p.hit_rate_str ?? "?"}</span>
-                      <span>model {fmtPct(p.model_prob)}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-4 dark:border-emerald-800 dark:bg-zinc-950">
-                <div className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 mb-2">AI Parlay Analysis</div>
-                <div className="text-sm leading-6 text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap break-words">
-                  {parlayRec.parlay_summary || "No summary generated."}
-                </div>
-                <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-mono text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
-                    Combined prob: {fmtPct(parlayRec.combined_model_prob)}
-                  </span>
-                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-mono text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
-                    AI confidence: {fmtNum(parlayRec.combined_confidence, 2)}
-                  </span>
-                </div>
-                {parlayRec.risk_factors?.length > 0 && (
-                  <div className="mt-3">
-                    <div className="text-xs font-semibold text-rose-700 dark:text-rose-300">Risks</div>
-                    <ul className="mt-1 list-disc pl-4 text-xs text-zinc-700 dark:text-zinc-300 space-y-0.5">
-                      {parlayRec.risk_factors.map((r, i) => <li key={i}>{r}</li>)}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
 
           {/* --- Main table (desktop) --- */}
           <div className="mt-4 hidden overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm md:block dark:border-zinc-800 dark:bg-zinc-950">
@@ -1462,12 +1535,12 @@ export default function Home() {
             </div>
           )}
 
-          {/* --- Parlay Slip --- */}
+          {/* --- Custom Parlay Slip + Kelly-sized stake --- */}
           {parlayProps.length > 0 && (
             <div className="mt-6 rounded-xl border border-emerald-200 bg-emerald-50/50 p-4 shadow-sm dark:border-emerald-800 dark:bg-emerald-950/30">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-emerald-800 dark:text-emerald-200">
-                  Parlay Slip ({parlayProps.length} pick{parlayProps.length > 1 ? "s" : ""})
+                  Custom Parlay ({parlayAnalytics.n} leg{parlayAnalytics.n > 1 ? "s" : ""})
                 </h3>
                 <button
                   className="text-xs text-emerald-700 hover:underline dark:text-emerald-400"
@@ -1476,20 +1549,37 @@ export default function Home() {
                   Clear all
                 </button>
               </div>
-              <div className="mt-3 space-y-2">
-                {parlayProps.map((p) => (
-                  <div key={p.underdog_option_id} className="flex items-center justify-between text-xs">
-                    <div>
-                      <span className="font-medium">{p.player_name}</span>{" "}
-                      <span className="text-zinc-500">{p.side.toUpperCase()} {p.line} {p.display_stat ?? p.stat}</span>
+
+              {/* Per-leg list */}
+              <div className="mt-3 space-y-1.5">
+                {parlayProps.map((p, i) => (
+                  <div key={p.underdog_option_id} className="flex items-center justify-between rounded-md border border-emerald-100 bg-white px-3 py-2 text-xs dark:border-emerald-900/40 dark:bg-zinc-950">
+                    <div className="flex items-center gap-2">
+                      <span className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-[10px] font-bold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300">
+                        {i + 1}
+                      </span>
+                      <div>
+                        <span className="font-medium">{p.player_name}</span>{" "}
+                        <span className="text-zinc-500">{p.side.toUpperCase()} {p.line} {p.display_stat ?? p.stat}</span>
+                        {p.game_title ? (
+                          <span className="ml-1 text-[10px] text-zinc-400">— {p.game_title}</span>
+                        ) : null}
+                      </div>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                        {fmtPct(p.model_prob)}
+                    <div className="flex items-center gap-3 font-mono text-[11px]">
+                      <span className="text-zinc-600 dark:text-zinc-400" title="Model probability of this leg hitting">
+                        p {fmtPct(p.model_prob)}
+                      </span>
+                      <span className="text-zinc-500" title="Decimal odds of this leg">
+                        {(p.decimal_price ?? 0).toFixed(2)}x
+                      </span>
+                      <span className={edgeColor(p.edge)} title="Edge vs no-vig market price">
+                        {fmtPct(p.edge)}
                       </span>
                       <button
                         className="text-rose-500 hover:text-rose-700"
                         onClick={() => toggleParlay(p.underdog_option_id)}
+                        title="Remove from parlay"
                       >
                         ✕
                       </button>
@@ -1497,23 +1587,103 @@ export default function Home() {
                   </div>
                 ))}
               </div>
-              <div className="mt-3 grid grid-cols-3 gap-3 border-t border-emerald-200 pt-3 text-xs dark:border-emerald-800">
+
+              {/* Top-line metrics */}
+              <div className="mt-4 grid grid-cols-2 gap-3 border-t border-emerald-200 pt-3 text-xs dark:border-emerald-800 sm:grid-cols-4">
                 <div>
-                  <div className="text-emerald-600 dark:text-emerald-400">Combined odds</div>
-                  <div className="font-mono font-semibold">{parlayDecimalOdds.toFixed(2)}x</div>
+                  <div className="text-emerald-700 dark:text-emerald-300" title="Product of each leg's decimal odds">
+                    Combined odds
+                  </div>
+                  <div className="font-mono font-semibold">
+                    {parlayAnalytics.decimalOdds.toFixed(2)}x
+                  </div>
+                  <div className="text-[10px] text-zinc-500 font-mono">
+                    {parlayAnalytics.americanOdds}
+                  </div>
                 </div>
                 <div>
-                  <div className="text-emerald-600 dark:text-emerald-400">Combined prob</div>
-                  <div className="font-mono font-semibold">{fmtPct(parlayCombinedProb)}</div>
+                  <div className="text-emerald-700 dark:text-emerald-300" title="Joint model probability assuming independence">
+                    Model prob
+                  </div>
+                  <div className="font-mono font-semibold">{fmtPct(parlayAnalytics.jointModelProb)}</div>
+                  <div className="text-[10px] text-zinc-500 font-mono" title="No-vig market estimate (de-juiced)">
+                    no-vig {fmtPct(parlayAnalytics.jointNoVigProb)}
+                  </div>
                 </div>
                 <div>
-                  <div className="text-emerald-600 dark:text-emerald-400">Payout ($10)</div>
-                  <div className="font-mono font-semibold">${(10 * parlayDecimalOdds).toFixed(2)}</div>
+                  <div className="text-emerald-700 dark:text-emerald-300" title="Model prob − implied prob from combined odds">
+                    Edge
+                  </div>
+                  <div className={`font-mono font-semibold ${edgeColor(parlayAnalytics.edge)}`}>
+                    {fmtPct(parlayAnalytics.edge)}
+                  </div>
+                  <div className="text-[10px] text-zinc-500 font-mono" title="Expected profit per $1 staked">
+                    EV/$ {parlayAnalytics.evPerDollar >= 0 ? "+" : ""}{parlayAnalytics.evPerDollar.toFixed(3)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-emerald-700 dark:text-emerald-300" title="Full Kelly fraction f* = (b·p − q)/b">
+                    Full Kelly
+                  </div>
+                  <div className={`font-mono font-semibold ${parlayAnalytics.kellyFull > 0 ? "text-emerald-700 dark:text-emerald-300" : "text-rose-600 dark:text-rose-400"}`}>
+                    {(parlayAnalytics.kellyFull * 100).toFixed(2)}%
+                  </div>
+                  <div className="text-[10px] text-zinc-500 font-mono">
+                    1/{kellyDivisor} Kelly: {(parlayAnalytics.kellyUsed * 100).toFixed(2)}%
+                  </div>
                 </div>
               </div>
+
+              {/* Recommended stake */}
+              <div className="mt-3 rounded-lg border border-emerald-300 bg-white p-4 dark:border-emerald-700 dark:bg-zinc-950">
+                {parlayAnalytics.hasNegativeEdge ? (
+                  <div>
+                    <div className="text-xs font-semibold text-rose-700 dark:text-rose-400">
+                      Negative-EV parlay — Kelly says don&apos;t bet
+                    </div>
+                    <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                      The joint model probability ({fmtPct(parlayAnalytics.jointModelProb)}) is below the combined implied
+                      probability ({fmtPct(parlayAnalytics.impliedFromOdds)}). Recommended stake: <span className="font-mono font-semibold">$0.00</span>.
+                      Drop a low-edge leg or wait for a better price.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-end justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                        Recommended stake (1/{kellyDivisor} Kelly)
+                      </div>
+                      <div className="mt-0.5 font-mono text-2xl font-semibold text-emerald-900 dark:text-emerald-100">
+                        {fmtMoney(parlayAnalytics.recommendedStake)}
+                      </div>
+                      <div className="text-[10px] text-zinc-500 font-mono">
+                        {(parlayAnalytics.kellyUsed * 100).toFixed(2)}% of {fmtMoney(bankroll)} bankroll
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
+                      <div className="text-zinc-500">If wins:</div>
+                      <div className="font-mono text-right text-emerald-700 dark:text-emerald-300">
+                        +{fmtMoney(parlayAnalytics.potentialProfit)}
+                      </div>
+                      <div className="text-zinc-500">Total payout:</div>
+                      <div className="font-mono text-right">{fmtMoney(parlayAnalytics.potentialPayout)}</div>
+                      <div className="text-zinc-500">Expected profit:</div>
+                      <div className={`font-mono text-right ${parlayAnalytics.expectedProfit >= 0 ? "text-emerald-700 dark:text-emerald-300" : "text-rose-600 dark:text-rose-400"}`}>
+                        {parlayAnalytics.expectedProfit >= 0 ? "+" : ""}{fmtMoney(parlayAnalytics.expectedProfit)}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className="mt-3 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">
+                  Sizing follows Kelly (1956) <span className="font-mono">f* = (b·p − q)/b</span>, scaled by 1/{kellyDivisor}.
+                  Quarter-Kelly captures ~44% of optimal log-growth at ~6% of full-Kelly variance — the standard for risk-aware bettors.
+                  Joint probability assumes independence; correlation warnings below should reduce your stake further.
+                </div>
+              </div>
+
               {parlayCorrelationWarnings.length > 0 && (
                 <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
-                  <div className="font-semibold">Correlation warnings:</div>
+                  <div className="font-semibold">Correlation warnings (joint prob will overstate true probability):</div>
                   <ul className="mt-1 list-disc pl-4 space-y-0.5">
                     {parlayCorrelationWarnings.map((w, i) => <li key={i}>{w}</li>)}
                   </ul>
