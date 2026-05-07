@@ -19,6 +19,25 @@ class UnderdogConfig:
 class UnderdogClient:
     def __init__(self, cfg: UnderdogConfig) -> None:
         self._cfg = cfg
+        # Long-lived AsyncClient with connection pooling. Previously we
+        # opened a fresh client per call which forced a new TCP/TLS
+        # handshake on every fetch — measurable overhead given the
+        # over-under endpoint is hit on every prop load and every CLV cycle.
+        self._http: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=30,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=8),
+                http2=False,
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+        self._http = None
 
     def _headers(self) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -45,14 +64,14 @@ class UnderdogClient:
         """
         Best-effort: some Underdog deployments return all pregame lines when called without IDs.
         """
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                self._cfg.over_under_lines_url,
-                headers=self._headers(),
-                params=self._base_params(),
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = await self._get_client()
+        resp = await client.get(
+            self._cfg.over_under_lines_url,
+            headers=self._headers(),
+            params=self._base_params(),
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def fetch_over_under_lines_by_ids(self, over_under_ids: Iterable[str]) -> dict[str, Any]:
         ids = list(over_under_ids)
@@ -62,12 +81,12 @@ class UnderdogClient:
         params = self._base_params()
         params["over_under_ids"] = ",".join(ids)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                self._cfg.over_under_lines_url,
-                headers=self._headers(),
-                params=params,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = await self._get_client()
+        resp = await client.get(
+            self._cfg.over_under_lines_url,
+            headers=self._headers(),
+            params=params,
+        )
+        resp.raise_for_status()
+        return resp.json()
 

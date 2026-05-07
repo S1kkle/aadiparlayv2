@@ -32,6 +32,8 @@ export type Prop = {
   vegas_total?: number | null;
   vegas_spread?: number | null;
   blowout_risk?: boolean | null;
+  injury_status?: string | null;
+  injury_haircut_applied?: number | null;
 
   // trend / profile
   trend_short_avg?: number | null;
@@ -69,6 +71,8 @@ export type Prop = {
   ai_tailwinds: string[];
   ai_risk_factors: string[];
   ai_prob_adjustment?: number | null;
+  prompt_version?: string | null;
+  model_params_id?: string | null;
 
   // derived
   confidence_tier?: string | null;
@@ -102,8 +106,18 @@ export type ParlayRecommendation = {
   correlation_factor?: number;
   correlation_notes?: string[];
   entry_payout_multiplier?: number | null;
+  boost_multiplier?: number | null;
   ev_independent?: number | null;
   ev_corr_adjusted?: number | null;
+  recommended_entry_type?: string | null;
+  ev_by_entry_type?: {
+    standard?: number | null;
+    best?: {
+      type: string;
+      ev_per_dollar?: number | null;
+      expected_payout?: number | null;
+    } | null;
+  };
 };
 
 export type LearningEntry = {
@@ -125,6 +139,16 @@ export type LearningEntry = {
   miss_reason: string | null;
   miss_category: string | null;
   resolved: number;
+  line_at_pick?: number | null;
+  close_line?: number | null;
+  close_implied_prob?: number | null;
+  clv_cents?: number | null;
+  stake_amount?: number | null;
+  payout_amount?: number | null;
+  profit?: number | null;
+  prompt_version?: string | null;
+  model_params_id?: string | null;
+  entry_type?: string | null;
 };
 
 export type LearningReport = {

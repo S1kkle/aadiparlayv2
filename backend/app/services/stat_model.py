@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import threading
 from dataclasses import dataclass
 
@@ -598,6 +599,106 @@ def get_default_params() -> dict[str, float]:
     return dict(_DEFAULT_PARAMS)
 
 
+# ── Post-hoc isotonic regression calibrator ───────────────────────────
+#
+# Once we have enough resolved real-world picks, we can train an isotonic
+# regression mapper that takes a raw model_prob in [0, 1] and returns a
+# better-calibrated probability. Isotonic is non-parametric and handles
+# non-linear miscalibration (S-curves, plateaus) better than Platt scaling.
+#
+# We store the calibrator as a list of (input, output) breakpoints; the
+# applied function is a piecewise-linear interpolation over that list,
+# pinned at (0, 0) and (1, 1).
+
+_isotonic_lock = threading.Lock()
+_isotonic_breakpoints: list[tuple[float, float]] | None = None
+
+
+def fit_isotonic(probs: list[float], outcomes: list[int]) -> list[tuple[float, float]] | None:
+    """Fit a monotonic non-decreasing mapping using the pool-adjacent-violators
+    algorithm (PAV). Returns a list of (input, output) breakpoints.
+
+    Requires at least 50 samples to be useful — fewer samples lead to a
+    spiky calibrator that overfits.
+    """
+    if not probs or len(probs) < 50 or len(probs) != len(outcomes):
+        return None
+    pairs = sorted(zip(probs, outcomes))
+    xs = [p for p, _ in pairs]
+    ys = [float(y) for _, y in pairs]
+
+    # PAV: repeatedly merge violating segments.
+    weights = [1.0] * len(ys)
+    i = 0
+    while i < len(ys) - 1:
+        if ys[i] <= ys[i + 1]:
+            i += 1
+            continue
+        # Merge segments i and i+1 by weighted average.
+        new_w = weights[i] + weights[i + 1]
+        new_y = (ys[i] * weights[i] + ys[i + 1] * weights[i + 1]) / new_w
+        ys[i] = new_y
+        weights[i] = new_w
+        del ys[i + 1]
+        del weights[i + 1]
+        del xs[i + 1]
+        if i > 0:
+            i -= 1
+    # Pin endpoints.
+    if xs[0] > 0.0:
+        xs.insert(0, 0.0)
+        ys.insert(0, max(0.0, ys[0] * 0.5))
+    if xs[-1] < 1.0:
+        xs.append(1.0)
+        ys.append(min(1.0, 0.5 + ys[-1] * 0.5))
+    return list(zip(xs, ys))
+
+
+def load_isotonic_calibrator(breakpoints: list[tuple[float, float]] | None) -> None:
+    """Hot-load the isotonic calibrator. Pass None to disable."""
+    global _isotonic_breakpoints
+    with _isotonic_lock:
+        if not breakpoints:
+            _isotonic_breakpoints = None
+            return
+        # Normalise to floats and sort
+        cleaned: list[tuple[float, float]] = []
+        for bp in breakpoints:
+            try:
+                x = float(bp[0])
+                y = float(bp[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            cleaned.append((max(0.0, min(1.0, x)), max(0.0, min(1.0, y))))
+        cleaned.sort()
+        _isotonic_breakpoints = cleaned or None
+
+
+def apply_isotonic(prob: float) -> float:
+    """Apply the loaded isotonic calibrator to a raw model probability."""
+    if not isinstance(prob, (int, float)):
+        return float(prob)
+    p = max(0.0, min(1.0, float(prob)))
+    with _isotonic_lock:
+        bps = _isotonic_breakpoints
+    if not bps or len(bps) < 2:
+        return p
+    # Linear interpolation between bracketing breakpoints
+    if p <= bps[0][0]:
+        return bps[0][1]
+    if p >= bps[-1][0]:
+        return bps[-1][1]
+    for i in range(len(bps) - 1):
+        x0, y0 = bps[i]
+        x1, y1 = bps[i + 1]
+        if x0 <= p <= x1:
+            if x1 == x0:
+                return y0
+            t = (p - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return p
+
+
 # ── Learning-driven refinements ───────────────────────────────────────
 
 _STAT_VOLATILITY_BASE: dict[str, float] = {
@@ -648,13 +749,34 @@ def line_proximity_penalty(*, line: float, median: float, sigma: float) -> float
     return floor + (gap - 0.1) / (0.5 - 0.1) * (1.0 - floor)
 
 
-def edge_skepticism(edge: float) -> float:
+def edge_skepticism(edge: float, *, stat_field: str | None = None) -> float:
     """Dampen extreme edges — edges >15% against efficient markets are usually model error.
 
     Sportsbooks are good at setting lines. A 27% edge on a role player's points
     almost certainly means the model is wrong, not that the book is.
+
+    HIGH-VOLUME, low-variance stats (points, passing yards, rushing yards,
+    receiving yards, total yards) get a looser cap because the underlying
+    distributions are tighter and the model frequently has informational
+    advantages from pace / matchup data the line-makers have less time on.
     """
+    high_volume = {
+        "points",
+        "passingYards",
+        "rushingYards",
+        "receivingYards",
+        "rush_rec_yards",
+    }
     abs_e = abs(edge)
+    if stat_field in high_volume:
+        if abs_e <= 0.12:
+            return edge
+        if abs_e <= 0.25:
+            damped = 0.12 + (abs_e - 0.12) * 0.6
+        else:
+            damped = 0.20 + (abs_e - 0.25) * 0.35
+        return math.copysign(min(damped, 0.28), edge)
+
     if abs_e <= 0.10:
         return edge
     if abs_e <= 0.20:
@@ -780,31 +902,17 @@ def predict_hit_prob(prop_dict: dict) -> float | None:
     return ez / (1.0 + ez)
 
 
-def fit_tier_logistic(
-    rows: list[dict],
+def _train_logistic(
+    X: list[list[float]],
+    y: list[int],
     *,
-    lr: float = 0.1,
-    n_iter: int = 400,
-    l2: float = 0.01,
-) -> dict | None:
-    """Fit a small logistic regression on resolved learning_log rows.
-
-    `rows` shape (per row): {features keyed by _TIER_FEATURE_NAMES (excluding
-    intercept), "hit": 0/1}. Returns metrics dict or None if not enough data.
-
-    Uses plain-Python batch gradient descent; no scipy/sklearn dependency.
-    """
-    if len(rows) < 30:
-        return None
-
-    n_features = len(_TIER_FEATURE_NAMES)
-    X = [row.get("features") for row in rows if isinstance(row.get("features"), list) and len(row["features"]) == n_features]
-    y = [int(row["hit"]) for row in rows if isinstance(row.get("features"), list) and len(row["features"]) == n_features]
-    if len(X) < 30:
-        return None
-    n = len(X)
+    lr: float,
+    n_iter: int,
+    l2: float,
+) -> list[float]:
+    n_features = len(X[0]) if X else 0
     weights = [0.0] * n_features
-
+    n = len(X)
     for _ in range(n_iter):
         grads = [0.0] * n_features
         for xi, yi in zip(X, y):
@@ -817,12 +925,13 @@ def fit_tier_logistic(
             err = p - yi
             for k in range(n_features):
                 grads[k] += err * xi[k]
-        # Update with L2 regularization (skip intercept).
         for k in range(n_features):
             reg = 0.0 if k == 0 else l2 * weights[k]
             weights[k] -= lr * (grads[k] / n + reg)
+    return weights
 
-    # Diagnostics.
+
+def _eval_logistic(weights: list[float], X: list[list[float]], y: list[int]) -> dict:
     correct = 0
     brier = 0.0
     log_loss = 0.0
@@ -838,15 +947,99 @@ def fit_tier_logistic(
         brier += (p - yi) ** 2
         p_clip = max(1e-6, min(1 - 1e-6, p))
         log_loss += -(yi * math.log(p_clip) + (1 - yi) * math.log(1 - p_clip))
-
-    metrics = {
-        "n_train": n,
+    n = max(1, len(X))
+    return {
         "accuracy": correct / n,
         "brier": brier / n,
         "log_loss": log_loss / n,
     }
+
+
+def fit_tier_logistic(
+    rows: list[dict],
+    *,
+    lr: float = 0.1,
+    n_iter: int = 400,
+    l2: float = 0.01,
+    k_folds: int = 5,
+) -> dict | None:
+    """Fit a small logistic regression on resolved learning_log rows with
+    K-fold cross-validation. Reports out-of-fold metrics so the user can tell
+    whether the in-sample fit is over-optimistic.
+
+    `rows` shape: {features (list[float] keyed by _TIER_FEATURE_NAMES), "hit": 0/1}.
+    Returns dict with `weights` (final model trained on full data), in-sample
+    `metrics` and out-of-fold `cv_metrics`.
+
+    Uses plain-Python batch gradient descent; no scipy/sklearn dependency.
+    """
+    if len(rows) < 30:
+        return None
+
+    n_features = len(_TIER_FEATURE_NAMES)
+    X: list[list[float]] = []
+    y: list[int] = []
+    for row in rows:
+        feats = row.get("features")
+        if not isinstance(feats, list) or len(feats) != n_features:
+            continue
+        X.append([float(v) for v in feats])
+        try:
+            y.append(int(row.get("hit", 0)))
+        except (TypeError, ValueError):
+            X.pop()
+    if len(X) < 30:
+        return None
+    n = len(X)
+
+    # K-fold CV — out-of-fold metrics are the honest gauge of generalisation.
+    folds_to_use = max(2, min(k_folds, n // 10))
+    fold_metrics: list[dict] = []
+    if folds_to_use >= 2:
+        order = list(range(n))
+        rng = random.Random(0)  # deterministic CV
+        rng.shuffle(order)
+        fold_size = n // folds_to_use
+        for f in range(folds_to_use):
+            start = f * fold_size
+            end = (start + fold_size) if f < folds_to_use - 1 else n
+            test_idx = set(order[start:end])
+            X_train = [X[i] for i in range(n) if i not in test_idx]
+            y_train = [y[i] for i in range(n) if i not in test_idx]
+            X_test = [X[i] for i in range(n) if i in test_idx]
+            y_test = [y[i] for i in range(n) if i in test_idx]
+            if not X_train or not X_test:
+                continue
+            w_fold = _train_logistic(X_train, y_train, lr=lr, n_iter=n_iter, l2=l2)
+            fold_metrics.append(_eval_logistic(w_fold, X_test, y_test))
+
+    cv_metrics: dict | None = None
+    if fold_metrics:
+        cv_metrics = {
+            "n_folds": len(fold_metrics),
+            "accuracy": sum(m["accuracy"] for m in fold_metrics) / len(fold_metrics),
+            "brier": sum(m["brier"] for m in fold_metrics) / len(fold_metrics),
+            "log_loss": sum(m["log_loss"] for m in fold_metrics) / len(fold_metrics),
+        }
+
+    # Final fit on full data.
+    weights = _train_logistic(X, y, lr=lr, n_iter=n_iter, l2=l2)
+    in_sample = _eval_logistic(weights, X, y)
+
+    metrics = {
+        "n_train": n,
+        "accuracy": in_sample["accuracy"],
+        "brier": in_sample["brier"],
+        "log_loss": in_sample["log_loss"],
+        "cv": cv_metrics,
+    }
     set_tier_model(weights, metrics=metrics)
-    return {"weights": weights, "metrics": metrics, "feature_names": list(_TIER_FEATURE_NAMES)}
+    return {
+        "weights": weights,
+        "metrics": metrics,
+        "cv_metrics": cv_metrics,
+        "feature_names": list(_TIER_FEATURE_NAMES),
+    }
 
 
 def model_prob_cap(field_name: str | None) -> float:

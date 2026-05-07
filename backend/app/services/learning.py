@@ -150,12 +150,28 @@ class LearningService:
                     "hit": 1 if hit else 0,
                     "miss_reason": None,
                     "miss_category": None,
-                    "resolved": 1 if hit else 0,
+                    # Even MISSES are "resolved" — the only reason to re-resolve
+                    # would be a data error. Previously this was 0 for misses,
+                    # which made them eligible for re-lookup forever.
+                    "resolved": 1,
                     "series_json": json.dumps(series_vals) if series_vals else None,
                     "stat_field": p.get("stat_field"),
                     "position": p.get("player_position"),
                     "decimal_price": p.get("decimal_price"),
                     "payout_multiplier": p.get("payout_multiplier"),
+                    # CLV / accounting / provenance — saved at creation when
+                    # available; the closing-line job will fill in close_line +
+                    # clv_cents asynchronously.
+                    "line_at_pick": p.get("line"),
+                    "close_line": None,
+                    "close_implied_prob": None,
+                    "clv_cents": None,
+                    "stake_amount": p.get("stake_amount"),
+                    "payout_amount": p.get("payout_amount"),
+                    "profit": p.get("profit"),
+                    "prompt_version": p.get("prompt_version"),
+                    "model_params_id": p.get("model_params_id"),
+                    "entry_type": p.get("entry_type"),
                 })
                 existing_ids.add(lid)
                 existing_logical.add(logical_key)
@@ -257,10 +273,16 @@ class LearningService:
             "passing touchdowns": "passingTouchdowns",
             "rush + rec yards": "rushingYards",
             "goals": "goals",
-            "shots": "shots",
-            "shots on goal": "shotsOnGoal",
+            # NHL uses ESPN field "shotsTotal" for skater shots — there is no
+            # "shotsOnGoal" key in the ESPN gamelog payload. ranker.py and
+            # calibration.py already canonicalise to "shots" / "shotsTotal".
+            "shots": "shotsTotal",
+            "shots on goal": "shotsTotal",
+            "sog": "shotsTotal",
             "saves": "saves",
             "goals against": "goalsAgainst",
+            # Combo NHL stats fall back to the dominant component
+            "goals + assists": "points",
         }
         return mapping.get(s)
 

@@ -17,11 +17,27 @@ import {
   startPropsJob,
 } from "@/lib/api";
 import type { HistoryEntry, LearningEntry, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import {
+  type EntryType,
+  availableEntryTypes,
+  underdogStandardPayout,
+} from "@/lib/underdog";
+import {
+  allEntryEvs,
+  bestEntryType,
+  entryEv,
+  kellyFullFraction,
+  parlayCorrelationFactor,
+} from "@/lib/parlay-math";
+import { ReliabilityDiagram } from "@/components/ReliabilityDiagram";
+import { BankrollGrowth } from "@/components/BankrollGrowth";
 
 // ── localStorage history persistence ──────────────────────────────────
 const LS_HISTORY_KEY = "parlay_prediction_history";
 const LS_BANKROLL_KEY = "parlay_bankroll";
 const LS_KELLY_DIVISOR_KEY = "parlay_kelly_divisor";
+const LS_ENTRY_TYPE_KEY = "parlay_entry_type";
+const LS_LOCKED_IDS_KEY = "parlay_locked_ids";
 
 function lsGetHistory(): HistoryEntry[] {
   try {
@@ -42,41 +58,8 @@ function lsSaveHistoryEntry(entry: HistoryEntry) {
   } catch {}
 }
 
-// ── Underdog Standard Pick'em payout table ────────────────────────────
-// Underdog Pick'em does NOT multiply per-leg decimal odds. It pays from a
-// fixed payout schedule keyed on entry size. These are the published
-// multipliers for "Standard / Power Play (all-or-nothing)". Insurance,
-// boosts, and demons modify this; let the user override when needed.
-const UD_STANDARD_PAYOUTS: Record<number, number> = {
-  2: 3,
-  3: 6,
-  4: 10,
-  5: 20,
-  6: 37.5,
-  7: 75,
-  8: 150,
-};
-
-function underdogStandardPayout(n: number): number {
-  if (n <= 1) return 0;
-  if (n in UD_STANDARD_PAYOUTS) return UD_STANDARD_PAYOUTS[n];
-  // Rough extrapolation for very large slips (rare).
-  return Math.pow(2, n - 1) * 1.5;
-}
-
-// ── Kelly Criterion (Kelly 1956, Bell System Technical Journal) ───────
-// f* = (b·p − q) / b   maximises log-growth of wealth.
-// Full Kelly is mathematically optimal but produces ~60% drawdowns; the
-// industry standard is a fractional Kelly (quarter-Kelly is the sweet
-// spot — ~44% of the growth, ~6% of the variance).
-function kellyFullFraction(p: number, decimalOdds: number): number {
-  if (!isFinite(p) || !isFinite(decimalOdds)) return 0;
-  if (decimalOdds <= 1) return 0;
-  const b = decimalOdds - 1;
-  const q = 1 - p;
-  const f = (b * p - q) / b;
-  return f;
-}
+// Underdog payout tables and Kelly math are now in @/lib/underdog and
+// @/lib/parlay-math (shared with backend service contract).
 
 function fmtMoney(x: number | null | undefined) {
   if (x === null || x === undefined || !isFinite(x)) return "—";
@@ -279,6 +262,13 @@ export default function Home() {
   const [parlayPayoutOverride, setParlayPayoutOverride] = useState<number | null>(null);
   const [parlayPayoutInput, setParlayPayoutInput] = useState<string>("");
 
+  // Underdog entry-type selector (Standard, Insurance, Flex). Persisted.
+  const [entryType, setEntryType] = useState<EntryType>("standard");
+
+  // "Locked" picks — protected from accidental removal (the 'X' button on a
+  // parlay leg is hidden for locked picks). Stored as a Set of underdog_option_id.
+  const [lockedIds, setLockedIds] = useState<Set<string>>(new Set());
+
   // Model-only props (shown before AI finishes)
   const [modelProps, setModelProps] = useState<Prop[]>([]);
 
@@ -297,6 +287,15 @@ export default function Home() {
 
   const toggleParlay = useCallback((id: string) => {
     setParlayIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleLock = useCallback((id: string) => {
+    setLockedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -543,6 +542,17 @@ export default function Home() {
         const v = Number(rawDiv);
         if (isFinite(v) && [1, 2, 4, 8].includes(v)) setKellyDivisor(v);
       }
+      const rawEt = localStorage.getItem(LS_ENTRY_TYPE_KEY);
+      if (rawEt === "standard" || rawEt === "insurance" || rawEt === "flex") {
+        setEntryType(rawEt);
+      }
+      const rawLocked = localStorage.getItem(LS_LOCKED_IDS_KEY);
+      if (rawLocked) {
+        try {
+          const arr = JSON.parse(rawLocked);
+          if (Array.isArray(arr)) setLockedIds(new Set(arr.filter((x): x is string => typeof x === "string")));
+        } catch {}
+      }
     } catch {}
   }, []);
 
@@ -553,6 +563,14 @@ export default function Home() {
   useEffect(() => {
     try { localStorage.setItem(LS_KELLY_DIVISOR_KEY, String(kellyDivisor)); } catch {}
   }, [kellyDivisor]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_ENTRY_TYPE_KEY, entryType); } catch {}
+  }, [entryType]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_LOCKED_IDS_KEY, JSON.stringify(Array.from(lockedIds))); } catch {}
+  }, [lockedIds]);
 
   function commitBankroll(v: string) {
     const n = Number(v.replace(/[^0-9.]/g, ""));
@@ -662,14 +680,30 @@ export default function Home() {
         potentialProfit: 0,
         expectedProfit: 0,
         hasNegativeEdge: false,
+        availableTypes: [] as EntryType[],
+        evByType: [] as ReturnType<typeof allEntryEvs>,
+        bestType: null as ReturnType<typeof bestEntryType>,
+        boostMultiplier: 1,
       };
     }
     const legProductOdds = parlayProps.reduce((acc, p) => acc * (p.decimal_price ?? 1), 1);
     const standardPayout = underdogStandardPayout(n);
-    const usingOverride = parlayPayoutOverride !== null && parlayPayoutOverride > 1;
-    const decimalOdds = usingOverride ? (parlayPayoutOverride as number) : standardPayout;
 
-    const jointModelProb = parlayProps.reduce((acc, p) => acc * (p.model_prob ?? 0.5), 1);
+    // Per-leg booster multipliers from Underdog (Pick'em Specials, 2x boosts).
+    // We treat any per-leg payout_multiplier > 1.81 as a boost above the
+    // implicit base price.
+    const boostMultiplier = parlayProps.reduce((acc, p) => {
+      const m = p.payout_multiplier ?? 0;
+      return acc * (m > 1.81 ? m / 1.81 : 1);
+    }, 1);
+
+    const usingOverride = parlayPayoutOverride !== null && parlayPayoutOverride > 1;
+    const decimalOdds = usingOverride
+      ? (parlayPayoutOverride as number)
+      : standardPayout * boostMultiplier;
+
+    const legProbs = parlayProps.map((p) => p.model_prob ?? 0.5);
+    const jointModelProb = legProbs.reduce((acc, p) => acc * p, 1);
     const jointNoVigProb = parlayProps.reduce(
       (acc, p) => acc * (p.no_vig_prob ?? p.implied_prob ?? 1 / Math.max(1.01, p.decimal_price ?? 2)),
       1,
@@ -678,6 +712,13 @@ export default function Home() {
     const b = decimalOdds - 1;
     const edge = jointModelProb - impliedFromOdds;
     const evPerDollar = jointModelProb * b - (1 - jointModelProb);
+
+    // Compute EV under every supported entry type so the user can pick the
+    // optimal one for these legs.
+    const evByType = allEntryEvs(n, legProbs);
+    const bestType = bestEntryType(n, legProbs);
+    const availableTypes = availableEntryTypes(n);
+
     const kellyFull = kellyFullFraction(jointModelProb, decimalOdds);
     const kellyUsed = Math.max(0, kellyFull / Math.max(1, kellyDivisor));
     const recommendedStake = Math.max(0, bankroll * kellyUsed);
@@ -703,8 +744,22 @@ export default function Home() {
       potentialProfit,
       expectedProfit,
       hasNegativeEdge: kellyFull <= 0,
+      availableTypes,
+      evByType,
+      bestType,
+      boostMultiplier,
     };
   }, [parlayProps, bankroll, kellyDivisor, parlayPayoutOverride]);
+
+  // Currently-selected entry-type EV (for display in slip header).
+  const selectedEntryEv = useMemo(() => {
+    if (!parlayAnalytics.n) return null;
+    return entryEv(
+      entryType,
+      parlayAnalytics.n,
+      parlayProps.map((p) => p.model_prob ?? 0.5),
+    );
+  }, [entryType, parlayAnalytics.n, parlayProps]);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -1628,9 +1683,27 @@ export default function Home() {
                         {fmtPct(p.edge)}
                       </span>
                       <button
-                        className="text-rose-500 hover:text-rose-700"
-                        onClick={() => toggleParlay(p.underdog_option_id)}
-                        title="Remove from parlay"
+                        onClick={() => toggleLock(p.underdog_option_id)}
+                        className={
+                          lockedIds.has(p.underdog_option_id)
+                            ? "text-amber-500 hover:text-amber-600"
+                            : "text-zinc-300 hover:text-zinc-500 dark:text-zinc-700 dark:hover:text-zinc-500"
+                        }
+                        title={lockedIds.has(p.underdog_option_id) ? "Unlock pick" : "Lock pick (protect from removal)"}
+                      >
+                        {lockedIds.has(p.underdog_option_id) ? "🔒" : "🔓"}
+                      </button>
+                      <button
+                        className={
+                          lockedIds.has(p.underdog_option_id)
+                            ? "cursor-not-allowed text-zinc-300 dark:text-zinc-700"
+                            : "text-rose-500 hover:text-rose-700"
+                        }
+                        disabled={lockedIds.has(p.underdog_option_id)}
+                        onClick={() => {
+                          if (!lockedIds.has(p.underdog_option_id)) toggleParlay(p.underdog_option_id);
+                        }}
+                        title={lockedIds.has(p.underdog_option_id) ? "Pick is locked — unlock to remove" : "Remove from parlay"}
                       >
                         ✕
                       </button>
@@ -1638,6 +1711,79 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+
+              {/* Entry-type selector (Standard, Insurance, Flex) with EV per type */}
+              {parlayAnalytics.availableTypes.length > 1 && (
+                <div className="mt-4 rounded-md border border-emerald-200 bg-white p-3 dark:border-emerald-800 dark:bg-zinc-950">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[11px] uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                      Entry type
+                    </div>
+                    {parlayAnalytics.bestType && (
+                      <div className="text-[10px] font-mono text-emerald-700 dark:text-emerald-300">
+                        Best:{" "}
+                        <span className="font-semibold uppercase">
+                          {parlayAnalytics.bestType.entryType}
+                        </span>{" "}
+                        ({(parlayAnalytics.bestType.evPerDollar * 100).toFixed(1)}% EV/$)
+                      </div>
+                    )}
+                  </div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {(["standard", "insurance", "flex"] as EntryType[]).map((et) => {
+                      const ev = parlayAnalytics.evByType.find((e) => e.entryType === et);
+                      const enabled = parlayAnalytics.availableTypes.includes(et);
+                      const isSelected = entryType === et;
+                      const isBest =
+                        parlayAnalytics.bestType?.entryType === et;
+                      return (
+                        <button
+                          key={et}
+                          disabled={!enabled}
+                          onClick={() => setEntryType(et)}
+                          className={[
+                            "flex flex-col items-start rounded-md border px-2 py-1.5 text-left text-xs transition-colors",
+                            !enabled
+                              ? "cursor-not-allowed border-zinc-200 bg-zinc-50 text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-600"
+                              : isSelected
+                              ? "border-emerald-500 bg-emerald-50 text-emerald-900 dark:border-emerald-400 dark:bg-emerald-950/40 dark:text-emerald-100"
+                              : "border-emerald-200 bg-white hover:bg-emerald-50 dark:border-emerald-800 dark:bg-zinc-950 dark:hover:bg-emerald-950/20",
+                          ].join(" ")}
+                          title={!enabled ? `${et} not offered for ${parlayAnalytics.n}-pick entries` : undefined}
+                        >
+                          <div className="flex w-full items-center justify-between">
+                            <span className="font-semibold uppercase">{et}</span>
+                            {isBest && enabled && (
+                              <span className="rounded-full bg-emerald-200 px-1 text-[9px] font-bold uppercase text-emerald-800 dark:bg-emerald-700 dark:text-emerald-100">
+                                top
+                              </span>
+                            )}
+                          </div>
+                          <span className="font-mono text-[10px] text-zinc-500">
+                            {enabled && ev
+                              ? `EV ${ev.evPerDollar >= 0 ? "+" : ""}${(ev.evPerDollar * 100).toFixed(1)}%`
+                              : "—"}
+                          </span>
+                          <span className="font-mono text-[10px] text-zinc-500">
+                            {enabled && ev ? `payout ${ev.expectedPayoutMultiplier.toFixed(2)}x` : ""}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {selectedEntryEv && (
+                    <div className="mt-2 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">
+                      <span className="font-semibold uppercase">{selectedEntryEv.entryType}</span>:{" "}
+                      EV/$ {selectedEntryEv.evPerDollar >= 0 ? "+" : ""}
+                      {selectedEntryEv.evPerDollar.toFixed(3)} · joint full-win prob{" "}
+                      {(selectedEntryEv.winProbabilityFull * 100).toFixed(2)}%
+                      {(entryType === "flex" || entryType === "insurance") && (
+                        <span> · payouts pay even on partial misses; see breakdown above.</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Underdog payout — table-default + manual override */}
               <div className="mt-4 grid grid-cols-1 gap-3 border-t border-emerald-200 pt-3 sm:grid-cols-2 dark:border-emerald-800">
@@ -1794,6 +1940,60 @@ export default function Home() {
                   </ul>
                 </div>
               )}
+
+              {/* Portfolio Kelly readout — shows what each leg's recommended
+                  single-bet stake would be at the current bankroll, plus the
+                  total stake if the user split it across straight bets.
+                  Useful comparison vs. parlaying. */}
+              {(() => {
+                const perLegKelly = parlayProps.map((p) => ({
+                  id: p.underdog_option_id,
+                  player: p.player_name,
+                  pick: `${p.side.toUpperCase()} ${p.line} ${p.display_stat ?? p.stat}`,
+                  kelly: kellyFullFraction(p.model_prob ?? 0.5, p.decimal_price ?? 1.81),
+                }));
+                const totalQuarterKelly = perLegKelly.reduce(
+                  (s, l) => s + Math.max(0, l.kelly / Math.max(1, kellyDivisor)),
+                  0,
+                );
+                const positiveLegs = perLegKelly.filter((l) => l.kelly > 0).length;
+                if (perLegKelly.length === 0) return null;
+                return (
+                  <details className="mt-3 rounded-md border border-emerald-100 bg-white p-3 dark:border-emerald-900/40 dark:bg-zinc-950">
+                    <summary className="cursor-pointer text-[11px] uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                      Portfolio Kelly view ({positiveLegs}/{perLegKelly.length} positive-edge legs)
+                    </summary>
+                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs dark:border-emerald-900/40 dark:bg-emerald-950/30">
+                        <div className="font-semibold">If played as straight bets (1/{kellyDivisor} Kelly each):</div>
+                        <div className="mt-1 font-mono">
+                          Total stake: {fmtMoney(bankroll * totalQuarterKelly)}{" "}
+                          ({(totalQuarterKelly * 100).toFixed(2)}% of bankroll)
+                        </div>
+                      </div>
+                      <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/40">
+                        <div className="font-semibold">Parlay stake (current slip):</div>
+                        <div className="mt-1 font-mono">
+                          {fmtMoney(parlayAnalytics.recommendedStake)}{" "}
+                          ({(parlayAnalytics.kellyUsed * 100).toFixed(2)}% of bankroll)
+                        </div>
+                      </div>
+                    </div>
+                    <ul className="mt-2 max-h-[160px] space-y-0.5 overflow-auto text-[11px] font-mono">
+                      {perLegKelly.map((l) => (
+                        <li key={l.id} className="flex items-center justify-between">
+                          <span className="text-zinc-600 dark:text-zinc-400 truncate">
+                            {l.player}: <span className="text-zinc-500">{l.pick}</span>
+                          </span>
+                          <span className={l.kelly > 0 ? "text-emerald-700 dark:text-emerald-300" : "text-rose-600 dark:text-rose-400"}>
+                            f* {(l.kelly * 100).toFixed(2)}%
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                );
+              })()}
             </div>
           )}
 
@@ -1921,6 +2121,54 @@ export default function Home() {
                               </div>
                             )}
 
+                            {/* Calibration + bankroll visualizations */}
+                            <div className="mt-5 grid gap-4 md:grid-cols-2">
+                              <div className="rounded-lg border border-zinc-100 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
+                                <ReliabilityDiagram entries={learningEntries} />
+                              </div>
+                              <div className="rounded-lg border border-zinc-100 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
+                                <BankrollGrowth entries={learningEntries} />
+                              </div>
+                            </div>
+
+                            {/* CLV summary — average closing-line value across resolved picks */}
+                            {(() => {
+                              const withClv = resolved.filter(
+                                (e) => typeof e.clv_cents === "number"
+                              );
+                              if (withClv.length === 0) return null;
+                              const avgClv =
+                                withClv.reduce((s, e) => s + (e.clv_cents || 0), 0) /
+                                withClv.length;
+                              const positiveClv = withClv.filter(
+                                (e) => (e.clv_cents || 0) > 0
+                              ).length;
+                              const beats = (positiveClv / withClv.length) * 100;
+                              return (
+                                <div className="mt-4 rounded-md border border-emerald-200 bg-emerald-50/40 p-3 dark:border-emerald-900/40 dark:bg-emerald-950/20">
+                                  <div className="text-xs font-semibold text-emerald-800 dark:text-emerald-200">
+                                    Closing-line value (CLV) — single best ROI proxy
+                                  </div>
+                                  <div className="mt-1 grid grid-cols-3 gap-3 text-xs font-mono">
+                                    <div>
+                                      <div className="text-zinc-500">Avg CLV</div>
+                                      <div className={`text-lg font-bold ${avgClv >= 0 ? "text-emerald-700 dark:text-emerald-300" : "text-rose-600"}`}>
+                                        {avgClv >= 0 ? "+" : ""}{avgClv.toFixed(2)}¢
+                                      </div>
+                                    </div>
+                                    <div>
+                                      <div className="text-zinc-500">% beat close</div>
+                                      <div className="text-lg font-bold">{beats.toFixed(0)}%</div>
+                                    </div>
+                                    <div>
+                                      <div className="text-zinc-500">CLV samples</div>
+                                      <div className="text-lg font-bold">{withClv.length}</div>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })()}
+
                             <div className="mt-4">
                               <div className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 mb-2">Recent Picks</div>
                               <div className="space-y-1 max-h-[300px] overflow-auto">
@@ -1946,6 +2194,18 @@ export default function Home() {
                                       <span className="font-mono text-zinc-600 dark:text-zinc-400">
                                         Actual: {e.actual_value !== null ? e.actual_value : "?"}
                                       </span>
+                                      {typeof e.clv_cents === "number" && (
+                                        <span
+                                          className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
+                                            (e.clv_cents || 0) >= 0
+                                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
+                                              : "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
+                                          }`}
+                                          title="Closing-line value (cents)"
+                                        >
+                                          CLV {(e.clv_cents >= 0 ? "+" : "") + e.clv_cents.toFixed(1)}¢
+                                        </span>
+                                      )}
                                       <span className="text-zinc-400">{e.sport}</span>
                                     </div>
                                   </div>

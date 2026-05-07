@@ -31,24 +31,11 @@ class OllamaClient:
         except Exception:
             return False
 
-    _DEFAULT_SYSTEM = (
-        "You are a sports prop analyst providing a SMALL CALIBRATED ADJUSTMENT to a "
-        "statistical model. Your job is to nudge the model probability up or down by a "
-        "small amount based on qualitative factors the math can't see.\n\n"
-        "Return ONLY valid JSON with keys: "
-        "summary (string), overall_bias (-1|0|1), confidence (float 0..1), "
-        "prob_adjustment (float between -0.05 and +0.05 — bounded; values outside this "
-        "range will be clamped). tailwinds (string[]), risk_factors (string[]).\n\n"
-        "CALIBRATION RULES:\n"
-        "- Aim for honest calibration: across 100 picks at confidence X, X% should hit. "
-        "Most picks SHOULD be near 0.5 — that is healthy.\n"
-        "- Reserve 0.80+ for unusual situations with multiple converging strong signals.\n"
-        "- prob_adjustment > +0.03 or < -0.03 should require a concrete cited factor.\n\n"
-        "The summary must be 2-4 sentences, referencing matchup context and "
-        "citing at least two numbers from the input (line, avg, hit rate, model_prob, edge). "
-        "If you mention injuries, ONLY reference names that appear in the provided data. "
-        "Do NOT invent injuries."
-    )
+    @property
+    def _DEFAULT_SYSTEM(self) -> str:
+        # Defer import to avoid hard dependency at module-load time.
+        from app.clients._prompts import PROP_SYSTEM_PROMPT
+        return PROP_SYSTEM_PROMPT
 
     async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0, system: str | None = None) -> dict[str, Any]:
         """

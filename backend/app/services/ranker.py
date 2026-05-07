@@ -20,6 +20,7 @@ from app.services.underdog_normalizer import (
 )
 from app.services.stat_model import (
     NormalParams,
+    apply_isotonic,
     bayesian_shrink,
     blowout_minutes_discount,
     compute_stat_profile,
@@ -72,6 +73,60 @@ HOME_ADVANTAGE: dict[str, float] = {
     "NBA": 0.02,
     "NFL": 0.02,
     "NHL": 0.015,
+}
+
+
+# League-average game totals (Vegas O/U). Used as the pace baseline to
+# scale scoring stats up/down for pace-adjusted matchups. Updated for
+# 2025-26 season averages; minor drift is fine because the scaler is
+# bounded.
+LEAGUE_AVG_TOTAL: dict[str, float] = {
+    "NBA": 224.0,
+    "NHL": 6.1,
+    "NFL": 44.5,
+}
+
+# Stat fields whose mean scales (~linearly) with pace / team total.
+PACE_LINKED_FIELDS: dict[str, set[str]] = {
+    "NBA": {"points", "totalRebounds", "assists", "threePointFieldGoalsMade", "steals", "turnovers"},
+    "NHL": {"goals", "assists", "points", "shots", "shotsTotal", "shotsOnGoal"},
+    "NFL": {"passingYards", "rushingYards", "receivingYards", "receptions", "passingTouchdowns"},
+}
+
+# Damping exponent — pace effects are real but smaller than total-deviation
+# would suggest because game scripts redistribute opportunities. ~0.4 is a
+# good empirical compromise (Cleaning the Glass / FantasyLabs research).
+PACE_DAMPING: dict[str, float] = {"NBA": 0.45, "NHL": 0.40, "NFL": 0.35}
+
+
+def pace_factor(sport: str, vegas_total: float | None) -> float:
+    """Multiplier on mu for pace-linked stats given Vegas total.
+    Returns 1.0 if no/invalid total or sport isn't pace-tracked."""
+    if vegas_total is None or sport not in LEAGUE_AVG_TOTAL:
+        return 1.0
+    league_avg = LEAGUE_AVG_TOTAL[sport]
+    if league_avg <= 0 or vegas_total <= 0:
+        return 1.0
+    ratio = vegas_total / league_avg
+    # Bound: cap at +/-25% scaling so a wild Vegas total can't over-correct.
+    ratio = max(0.75, min(1.25, ratio))
+    exp = PACE_DAMPING.get(sport, 0.4)
+    return ratio ** exp
+
+
+# Injury-status filter — Out / Doubtful zero out the model probability
+# (pick is unwinnable / will void). Questionable / Day-to-Day flag with a
+# slight haircut so the user sees the prop but knows it's risky.
+INJURY_STATUS_HAIRCUT: dict[str, float] = {
+    "OUT": 0.0,
+    "INJURED": 0.0,
+    "INACTIVE": 0.0,
+    "SUSPENDED": 0.0,
+    "DOUBTFUL": 0.0,
+    "PROBABLE": 1.0,
+    "QUESTIONABLE": 0.92,
+    "DAY-TO-DAY": 0.94,
+    "GAME-TIME DECISION": 0.90,
 }
 
 NFL_STAT_KEY_MAP: dict[str, str] = {
@@ -284,7 +339,7 @@ class Ranker:
         max_props: int = 120,
         ai_limit: int = 25,
         require_ai: bool = False,
-        require_ai_count: int = 10,
+        require_ai_count: int = 15,
         on_ai_progress: Any | None = None,
         on_model_done: Any | None = None,
     ) -> list[Prop]:
@@ -391,7 +446,7 @@ class Ranker:
         vol_vals: list[float] = []
         for p in props:
             raw_edge = (p.model_prob or 0.0) - (p.no_vig_prob or p.implied_prob or 0.0)
-            p.edge = edge_skepticism(raw_edge)
+            p.edge = edge_skepticism(raw_edge, stat_field=p.stat_field)
             p.ev = (p.model_prob or 0.0) * ((p.decimal_price or 1.0) - 1.0) - (1.0 - (p.model_prob or 0.0))
             edge_vals.append(p.edge or 0.0)
             ev_vals.append(p.ev or 0.0)
@@ -434,6 +489,22 @@ class Ranker:
             )
 
         await _emit_stage("rank", "Scoring and ranking props...")
+
+        # Drop props for players ruled OUT / DOUBTFUL / INACTIVE — these are
+        # un-winnable from a betting standpoint and would pollute downstream
+        # AI selection and parlay recommendations.
+        out_count = sum(
+            1 for p in props
+            if p.injury_haircut_applied is not None and p.injury_haircut_applied <= 0.0
+        )
+        if out_count:
+            props[:] = [
+                p for p in props
+                if not (p.injury_haircut_applied is not None and p.injury_haircut_applied <= 0.0)
+            ]
+            await _emit_stage(
+                "rank", f"Filtered {out_count} props for OUT/DOUBTFUL injuries"
+            )
 
         props.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
 
@@ -561,7 +632,7 @@ class Ranker:
                 # Re-derive edge / EV / Kelly with the post-nudge probability so
                 # the user-visible numbers stay coherent.
                 no_vig = p.no_vig_prob if p.no_vig_prob is not None else (p.implied_prob or 0.5)
-                p.edge = edge_skepticism(p.model_prob - no_vig)
+                p.edge = edge_skepticism(p.model_prob - no_vig, stat_field=p.stat_field)
                 p.ev = p.model_prob * ((p.decimal_price or 1.0) - 1.0) - (1.0 - p.model_prob)
                 p.kelly_fraction = compute_kelly(
                     p.model_prob, p.decimal_price or 1.0, fraction=0.25,
@@ -702,10 +773,22 @@ class Ranker:
         corr_factor, corr_notes = self._correlation_factor(selected_props)
         adjusted_prob = independence_prob * corr_factor
 
-        # Documented payout-implied odds per UD entry size (research-backed):
-        #   2-pick = +200 / 3x; 3-pick = +500 / 6x; 4-pick = +900 / 10x; 5-pick = +1900 / 20x
-        ENTRY_PAYOUT = {2: 3.0, 3: 6.0, 4: 10.0, 5: 20.0, 6: 35.0}
-        entry_payout = ENTRY_PAYOUT.get(int(legs))
+        # Documented Underdog Pick'em Standard / Power Play payouts (sourced from
+        # Underdog help docs + GamedayMath analysis). 6-pick = 37.5x (NOT 35x);
+        # 7-pick = 75x; 8-pick = 150x. Per-leg boost multipliers (Pick'em Specials,
+        # 2x boosts) compound on top — Underdog applies them to the entry payout.
+        from app.services.underdog_payouts import standard_payout, best_entry_type
+        base_entry_payout = standard_payout(int(legs))
+        boost_product = 1.0
+        for p in selected_props:
+            if p.payout_multiplier and p.payout_multiplier > 1.0:
+                # Boosts are reported as decimal-price-equivalents (e.g. 2.0 for a
+                # straight 2x boost). Strip out the implicit 1.81-ish base price.
+                # Use a conservative ratio versus the documented Pick'em base
+                # (1/0.5524) so non-boosted legs contribute neutrally.
+                boost_product *= max(1.0, float(p.payout_multiplier) / 1.81)
+        entry_payout = base_entry_payout * boost_product
+
         ev_independent = (
             (independence_prob * (entry_payout - 1)) - (1 - independence_prob)
             if entry_payout else None
@@ -714,6 +797,12 @@ class Ranker:
             (adjusted_prob * (entry_payout - 1)) - (1 - adjusted_prob)
             if entry_payout else None
         )
+
+        # Compare Standard vs Insurance vs Flex; recommend the entry type with
+        # the highest EV per dollar.
+        leg_probs = [float(p.model_prob or 0.5) * corr_factor ** (1.0 / max(1, len(selected_props))) for p in selected_props]
+        best_ev = best_entry_type(int(legs), leg_probs)
+        recommended_entry_type = best_ev.entry_type if best_ev else "standard"
 
         return {
             "legs": legs,
@@ -726,8 +815,18 @@ class Ranker:
             "correlation_factor": round(corr_factor, 4),
             "correlation_notes": corr_notes,
             "entry_payout_multiplier": entry_payout,
+            "boost_multiplier": round(boost_product, 4),
             "ev_independent": round(ev_independent, 4) if ev_independent is not None else None,
             "ev_corr_adjusted": round(ev_corrected, 4) if ev_corrected is not None else None,
+            "recommended_entry_type": recommended_entry_type,
+            "ev_by_entry_type": {
+                "standard": round(ev_corrected, 4) if ev_corrected is not None else None,
+                "best": {
+                    "type": recommended_entry_type,
+                    "ev_per_dollar": round(best_ev.expected_value_per_dollar, 4) if best_ev else None,
+                    "expected_payout": round(best_ev.expected_payout_multiplier, 4) if best_ev else None,
+                } if best_ev else None,
+            },
         }
 
     async def _ai_select_props(
@@ -739,9 +838,13 @@ class Ranker:
         """Ask AI to pick the best N props from a candidate list. Returns 0-indexed indices."""
         assert self._ollama is not None
 
-        # Shuffle presentation order to prevent positional bias (AI picking top-listed)
+        # Shuffle presentation order to prevent positional bias (AI picking top-listed).
+        # Use a non-deterministic seed: a fixed seed produced the same shuffle every
+        # call, which (a) defeated the cache invalidation when the candidate set
+        # changed slightly and (b) created a stable AI bias toward whichever real
+        # indices happened to land in the low display numbers.
         indices = list(range(len(candidates)))
-        rng = random.Random(42)
+        rng = random.Random()
         rng.shuffle(indices)
         idx_to_display: dict[int, int] = {}
         display_to_idx: dict[int, int] = {}
@@ -833,9 +936,14 @@ class Ranker:
             "Return ONLY valid JSON with keys: picks (array of integers), reasons (object), reasoning (string)."
         )
 
-        cache_key = f"ai_select:v2:{ask_count}:" + ":".join(
-            p.underdog_option_id for p in candidates[:10]
-        )
+        # Hash the FULL candidate list (not just the first 10) so the cache key
+        # changes whenever any candidate is added/removed/reordered. Use a stable
+        # sorted list of underdog_option_ids so order doesn't matter — all that
+        # matters for selection is the candidate set.
+        import hashlib
+        canon_ids = sorted(p.underdog_option_id for p in candidates if p.underdog_option_id)
+        cand_hash = hashlib.sha1(":".join(canon_ids).encode("utf-8")).hexdigest()[:16]
+        cache_key = f"ai_select:v3:{ask_count}:{cand_hash}"
         cached = self._cache.get_json(cache_key)
         if isinstance(cached, dict) and cached.get("picks"):
             raw = cached["picks"]
@@ -969,6 +1077,36 @@ class Ranker:
                 athlete_id_by_player[(sp, name)] = athlete_id
 
         await asyncio.gather(*(fetch_one(sp, name) for sp, name in unique_players))
+
+        # Fetch injury status for every player+team pair so we can apply the
+        # haircut / filter at probability time. ESPN's league-injuries
+        # endpoint is cached for 3 minutes inside the client, so this is
+        # essentially free after the first call per (sport, league).
+        injury_status_by_player: dict[tuple[SportId, str], str | None] = {}
+
+        async def fetch_injury(sp: SportId, name: str) -> None:
+            sl = self._espn.sport_league_for_scope(sp)
+            if sl is None:
+                injury_status_by_player[(sp, name)] = None
+                return
+            sport_slug, league_slug = sl
+            team_abbr = None
+            for p in props:
+                if p.sport == sp and p.player_name == name and p.team_abbr:
+                    team_abbr = p.team_abbr
+                    break
+            try:
+                status = await self._espn.get_player_injury_status(
+                    sport=sport_slug,
+                    league=league_slug,
+                    player_name=name,
+                    team_abbr=team_abbr,
+                )
+            except Exception:
+                status = None
+            injury_status_by_player[(sp, name)] = status
+
+        await asyncio.gather(*(fetch_injury(sp, name) for sp, name in unique_players))
 
         for p in props:
             p.player_position = position_by_player.get((p.sport, p.player_name))
@@ -1115,6 +1253,36 @@ class Ranker:
                         p.vegas_spread = float(spread_val)
                     if isinstance(total_val, (int, float)):
                         p.vegas_total = float(total_val)
+
+                    # Pace adjustment: if the Vegas total deviates from league
+                    # average, scale mu up/down for pace-linked stats. Bounded
+                    # by PACE_DAMPING + ratio cap inside pace_factor().
+                    if (
+                        isinstance(total_val, (int, float))
+                        and field_used in PACE_LINKED_FIELDS.get(p.sport, set())
+                    ):
+                        pf = pace_factor(p.sport, float(total_val))
+                        if abs(pf - 1.0) > 0.01:
+                            params = NormalParams(mu=params.mu * pf, sigma=params.sigma)
+
+                    # Implied team-scoring scaling for points/yards: combine
+                    # spread + total to get team-implied score and scale player
+                    # scoring stats accordingly. (-3, total 224 -> 113.5 implied;
+                    # league avg ~112 for NBA.)
+                    if (
+                        isinstance(spread_val, (int, float))
+                        and isinstance(total_val, (int, float))
+                        and total_val > 0
+                        and p.sport in ("NBA", "NHL")
+                        and field_used in {"points", "goals"}
+                    ):
+                        team_implied = (float(total_val) - float(spread_val)) / 2.0
+                        league_team_avg = LEAGUE_AVG_TOTAL[p.sport] / 2.0
+                        if league_team_avg > 0 and team_implied > 0:
+                            ratio = team_implied / league_team_avg
+                            ratio = max(0.75, min(1.25, ratio))
+                            implied_factor = ratio ** 0.5  # mild — already partly captured by pace
+                            params = NormalParams(mu=params.mu * implied_factor, sigma=params.sigma)
                     if (
                         p.sport == "NBA"
                         and p.avg_minutes is not None
@@ -1176,6 +1344,12 @@ class Ranker:
             shrunk_mu = continuous_shrinkage(params.mu, n, prior_mean)
             params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
 
+            # Injury status — capture before computing probability so we can
+            # zero out / haircut the model_prob coherently. Status comes from
+            # ESPN's league-injuries feed (cached).
+            status = injury_status_by_player.get((p.sport, p.player_name))
+            p.injury_status = status
+
             # Model probability — dispatch by distribution family per stat type.
             # NB > Poisson for over-dispersed counts (points, rebounds, assists);
             # Gamma for skewed continuous yards; Normal as fallback.
@@ -1184,6 +1358,36 @@ class Ranker:
                 field_name=field_used,
             )
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
+
+            # Apply injury haircut. OUT/DOUBTFUL kill the prop entirely so it
+            # gets filtered downstream; QUESTIONABLE / day-to-day get a small
+            # haircut that mostly affects high-confidence picks.
+            if status:
+                key = status.upper().strip()
+                # Normalise common alternates
+                key = (
+                    key.replace("DAY TO DAY", "DAY-TO-DAY")
+                    .replace("GAME-TIME-DECISION", "GAME-TIME DECISION")
+                    .replace("GAME TIME DECISION", "GAME-TIME DECISION")
+                )
+                haircut = INJURY_STATUS_HAIRCUT.get(key)
+                if haircut is not None:
+                    p.injury_haircut_applied = haircut
+                    if haircut <= 0.0:
+                        p.notes.append(f"INJURY {status} — pick auto-filtered.")
+                        p.model_prob = 0.0
+                    else:
+                        # Pull the model prob toward 0.5 (uncertainty) by the
+                        # complement of the haircut; preserves direction but
+                        # drops confidence for questionable players.
+                        p.notes.append(f"INJURY {status} — confidence haircut x{haircut:.2f}.")
+                        p.model_prob = 0.5 + (p.model_prob - 0.5) * haircut
+
+            # Post-hoc isotonic calibration — applied AFTER the analytical
+            # probability is computed but BEFORE capping. If no calibrator is
+            # loaded this is a no-op.
+            if p.model_prob is not None:
+                p.model_prob = apply_isotonic(p.model_prob)
 
             # Cap model probability — no stat type deserves 85%+ confidence
             cap = model_prob_cap(field_used)
@@ -1541,14 +1745,40 @@ class Ranker:
                     else:
                         out.append(f"Opponent {p.opponent_abbr.upper()} allows ~{opp_allowed:.2f} {stat_key}/game (last5).")
 
-            # Position-split for NBA
-            if p.sport == "NBA" and p.player_position and p.player_position.strip():
+            # Position-split for NBA / NFL / NHL — each sport maps Underdog stat
+            # names to the boxscore field used by the position-allowed query.
+            position_splits = {
+                "NBA": {
+                    "totalRebounds": "rebounds",
+                    "assists": "assists",
+                    "blocks": "blocks",
+                    "steals": "steals",
+                    "turnovers": "turnovers",
+                    "points": "points",
+                    "threePointFieldGoalsMade": "threePointFieldGoalsMade",
+                },
+                "NFL": {
+                    "passingYards": "passingYards",
+                    "rushingYards": "rushingYards",
+                    "receivingYards": "receivingYards",
+                    "receptions": "receptions",
+                    "passingTouchdowns": "passingTouchdowns",
+                },
+                "NHL": {
+                    "goals": "goals",
+                    "assists": "assists",
+                    "points": "points",
+                    "shots": "shots",
+                    "shotsTotal": "shots",
+                },
+            }
+            if (
+                p.sport in position_splits
+                and p.player_position
+                and p.player_position.strip()
+            ):
                 pos = p.player_position.strip().upper()
-                player_stat_key = None
-                if stat_key == "totalRebounds":
-                    player_stat_key = "rebounds"
-                elif stat_key in ("assists", "blocks", "steals", "turnovers", "points"):
-                    player_stat_key = stat_key
+                player_stat_key = position_splits[p.sport].get(stat_key)
                 if player_stat_key:
                     try:
                         pos_allowed = await self._espn.compute_team_allowed_by_position_average(
@@ -1836,3 +2066,26 @@ class Ranker:
         if isinstance(prob_adj, (int, float)):
             # Hard cap at ±0.05 to align with the calibrated nudge contract.
             p.ai_prob_adjustment = max(-0.05, min(0.05, float(prob_adj)))
+
+        # Stamp provenance so future learning-log rows can attribute the pick
+        # to a specific prompt revision and calibration snapshot. Defer the
+        # imports so this stays a leaf module-wise.
+        try:
+            from app.clients._prompts import PROMPT_VERSION
+            p.prompt_version = PROMPT_VERSION
+        except Exception:
+            pass
+        try:
+            latest = (Ranker._latest_calibration_id_cache or "default")
+            p.model_params_id = latest
+        except Exception:
+            pass
+
+    # Class-level cache of the latest calibration ID (set on calibration apply
+    # via Ranker.set_active_calibration_id). Defaults to "default" when no
+    # custom params are loaded.
+    _latest_calibration_id_cache: str | None = "default"
+
+    @classmethod
+    def set_active_calibration_id(cls, calib_id: str | None) -> None:
+        cls._latest_calibration_id_cache = calib_id or "default"

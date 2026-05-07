@@ -69,6 +69,8 @@ class Prop(BaseModel):
     vegas_total: float | None = None  # game over/under total when known
     vegas_spread: float | None = None  # team-perspective point spread (negative = favorite)
     blowout_risk: bool | None = None
+    injury_status: str | None = None  # ESPN canonical: OUT, DOUBTFUL, QUESTIONABLE, PROBABLE, DAY-TO-DAY, etc.
+    injury_haircut_applied: float | None = None  # multiplier applied to model_prob (0.0 = picked filtered out)
 
     # trend / profile
     trend_short_avg: float | None = None  # last 3 game average
@@ -108,6 +110,12 @@ class Prop(BaseModel):
     ai_tailwinds: list[str] = Field(default_factory=list)
     ai_risk_factors: list[str] = Field(default_factory=list)
     ai_prob_adjustment: float | None = None  # e.g. +0.05 or -0.03
+
+    # provenance — which prompt revision and calibration snapshot was used.
+    # Persisted to learning_log so we can attribute pick performance to
+    # specific prompt / model revisions.
+    prompt_version: str | None = None
+    model_params_id: str | None = None
 
     # derived
     confidence_tier: str | None = None  # "high" | "medium" | "low"

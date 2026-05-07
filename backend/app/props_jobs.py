@@ -68,5 +68,5 @@ class PropsJobRequest:
     refresh: bool = False
     max_props: int = 10
     ai_limit: int = 10
-    require_ai_count: int = 10
+    require_ai_count: int = 15
 

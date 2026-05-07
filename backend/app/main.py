@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -24,6 +25,12 @@ from app.services.ranker import Ranker, RankerConfig
 
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("app")
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -139,7 +146,6 @@ _CALIBRATION_INTERVAL_HOURS = _env_int("CALIBRATION_INTERVAL_HOURS", 48)
 
 async def _calibration_loop() -> None:
     """Background loop that runs model calibration on a schedule."""
-    import logging
     _log = logging.getLogger("calibration.scheduler")
     while True:
         await asyncio.sleep(_CALIBRATION_INTERVAL_HOURS * 3600)
@@ -158,31 +164,99 @@ async def _calibration_loop() -> None:
             _log.exception("Scheduled calibration failed")
 
 
+_CLV_CAPTURE_INTERVAL_MIN = _env_int("CLV_CAPTURE_INTERVAL_MIN", 30)
+
+
+async def _clv_capture_loop() -> None:
+    """Periodically capture closing-line value for picks made earlier today.
+
+    Strategy: every CLV_CAPTURE_INTERVAL_MIN minutes, scan learning_log for
+    entries with no close_line yet and a scheduled_at in the past 6h. Pull
+    the *current* Underdog over/under for that player+stat and treat it as
+    the "near-close" line. CLV cents = 100 * (line_at_pick - close_line) /
+    line_at_pick (positive = beat the close).
+    """
+    _log = logging.getLogger("clv.capture")
+    await asyncio.sleep(60)  # delay first run so server is fully up
+    while True:
+        try:
+            entries = cache.get_learning_entries_missing_clv(limit=200)
+            if entries:
+                _log.info("CLV capture: %d entries pending", len(entries))
+                # Snapshot current Underdog lines once per cycle.
+                try:
+                    payload = await ud_client.fetch_all_over_under_lines()
+                except Exception:
+                    payload = None
+                if payload:
+                    from app.services.underdog_normalizer import normalize_underdog_over_under_lines
+                    current_props = normalize_underdog_over_under_lines(payload)
+                    by_key: dict[tuple[str, str, str], float] = {}
+                    for cp in current_props:
+                        key = (
+                            cp.player_name.lower().strip(),
+                            (cp.stat or "").lower().strip(),
+                            cp.side,
+                        )
+                        by_key[key] = float(cp.line)
+                    updated = 0
+                    for e in entries:
+                        line_at_pick = e.get("line_at_pick") or e.get("line")
+                        key = (
+                            (e.get("player_name") or "").lower().strip(),
+                            (e.get("stat") or "").lower().strip(),
+                            (e.get("side") or "").lower().strip(),
+                        )
+                        close_line = by_key.get(key)
+                        if close_line is None or not isinstance(line_at_pick, (int, float)):
+                            continue
+                        clv_cents = 0.0
+                        try:
+                            denom = float(line_at_pick) or 1.0
+                            clv_cents = 100.0 * (float(line_at_pick) - float(close_line)) / denom
+                            if e.get("side") == "under":
+                                clv_cents = -clv_cents
+                        except Exception:
+                            clv_cents = 0.0
+                        cache.update_learning_clv(
+                            e["id"],
+                            close_line=float(close_line),
+                            close_implied_prob=None,
+                            clv_cents=round(clv_cents, 3),
+                        )
+                        updated += 1
+                    if updated:
+                        _log.info("CLV capture: updated %d entries", updated)
+        except Exception:
+            _log.exception("CLV capture loop failed")
+        await asyncio.sleep(_CLV_CAPTURE_INTERVAL_MIN * 60)
+
+
 async def _warm_league_matchup_caches() -> None:
-    nba_keys = ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]
-    for k in nba_keys:
-        try:
-            await espn_client.compute_league_allowed_rank_snapshot(
-                sport="basketball", league="nba", stat_key=k, last_n_games=3
-            )
-        except Exception:
-            continue
-    nfl_keys = ["passingYards", "rushingYards", "receivingYards", "receptions", "passingTouchdowns"]
-    for k in nfl_keys:
-        try:
-            await espn_client.compute_league_allowed_rank_snapshot(
-                sport="football", league="nfl", stat_key=k, last_n_games=3
-            )
-        except Exception:
-            continue
-    nhl_keys = ["goals", "assists", "points", "shots"]
-    for k in nhl_keys:
-        try:
-            await espn_client.compute_league_allowed_rank_snapshot(
-                sport="hockey", league="nhl", stat_key=k, last_n_games=3
-            )
-        except Exception:
-            continue
+    """Compute league-allowed snapshots for upcoming sports.
+
+    The underlying compute function is already cache-aware; this loop just
+    asks for each (sport, stat) so the cache stays warm. We additionally
+    skip the call entirely when a snapshot is already in cache and recent
+    (< 6h old by TTL), avoiding redundant work on every API restart.
+    """
+    pairs: list[tuple[str, str, list[str]]] = [
+        ("basketball", "nba", ["points", "assists", "totalRebounds", "blocks", "steals", "turnovers"]),
+        ("football", "nfl", ["passingYards", "rushingYards", "receivingYards", "receptions", "passingTouchdowns"]),
+        ("hockey", "nhl", ["goals", "assists", "points", "shots"]),
+    ]
+    for sport, league, keys in pairs:
+        for k in keys:
+            cache_key = f"espn:league_allowed_snapshot:{sport}:{league}:{k}:last3"
+            cached = cache.get_json(cache_key)
+            if isinstance(cached, dict) and isinstance(cached.get("teams"), dict) and cached["teams"]:
+                continue  # fresh, skip the network round trip
+            try:
+                await espn_client.compute_league_allowed_rank_snapshot(
+                    sport=sport, league=league, stat_key=k, last_n_games=3
+                )
+            except Exception:
+                continue
 
 
 @app.on_event("startup")
@@ -209,6 +283,19 @@ async def _startup() -> None:
         log.warning("Failed to restore tier model: %s", exc)
 
     asyncio.create_task(_calibration_loop())
+    asyncio.create_task(_clv_capture_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    try:
+        await ud_client.aclose()
+    except Exception:
+        pass
+    try:
+        await espn_client.aclose()
+    except Exception:
+        pass
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -224,7 +311,7 @@ async def get_ranked_props(
     max_props: int = Query(10, ge=1, le=500),
     ai_limit: int = Query(10, ge=0, le=200),
     require_ai: bool = Query(False),
-    require_ai_count: int = Query(10, ge=1, le=50),
+    require_ai_count: int = Query(15, ge=1, le=50),
 ) -> RankedPropsResponse:
     props = await ranker.rank_props(
         scope=scope,
@@ -257,6 +344,38 @@ async def clear_gamelogs() -> dict[str, int | str]:
     return {"status": "ok", "deleted": d1 + d2 + d3 + d4}
 
 
+_CACHE_CLEAR_KINDS: dict[str, list[str]] = {
+    "gamelogs": ["espn:gamelog:"],
+    "injuries": ["espn:injuries:"],
+    "ai-summaries": ["ollama:prop:", "ai_select:"],
+    "underdog": ["underdog:"],
+    "league-snapshots": ["espn:league_allowed_snapshot:"],
+    "team-allowed": ["espn:team_allowed:"],
+    "matchup-stats": ["espn:event_odds:", "espn:upcoming_event:"],
+}
+
+
+@app.post("/cache/clear/{kind}")
+async def clear_cache_kind(kind: str) -> dict[str, int | str]:
+    """Granular cache eviction. `kind` is one of the entries in
+    _CACHE_CLEAR_KINDS — gamelogs, injuries, ai-summaries, underdog,
+    league-snapshots, team-allowed, matchup-stats.
+
+    Useful for surgical invalidation: e.g. after a player-injury wire flip,
+    you only want `injuries`; after a fresh box score, you want `gamelogs`.
+    """
+    prefixes = _CACHE_CLEAR_KINDS.get(kind)
+    if not prefixes:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": f"unknown kind '{kind}'", "valid": list(_CACHE_CLEAR_KINDS.keys())},
+        )
+    deleted = 0
+    for pfx in prefixes:
+        deleted += cache.clear_prefix(pfx)
+    return {"status": "ok", "kind": kind, "deleted": deleted}
+
+
 @app.post("/props/job")
 async def start_props_job(req: dict) -> dict[str, str]:
     """
@@ -269,7 +388,7 @@ async def start_props_job(req: dict) -> dict[str, str]:
         refresh=bool(req.get("refresh") or False),
         max_props=int(req.get("max_props") or 10),
         ai_limit=int(req.get("ai_limit") or 10),
-        require_ai_count=int(req.get("require_ai_count") or 10),
+        require_ai_count=int(req.get("require_ai_count") or 15),
     )
     job = await jobs.create()
 
@@ -713,11 +832,31 @@ async def debug_mma(fighter_name: str):
 
 # ── Calibration endpoints ─────────────────────────────────────────────
 
+_CRON_TOKEN_ENV = os.getenv("CRON_TOKEN", "").strip()
+
+
 @app.post("/calibration/run")
-async def calibration_run():
-    """Manually trigger a model calibration run."""
+async def calibration_run(
+    req: dict | None = None,
+    x_cron_token: str | None = Header(default=None, alias="X-Cron-Token"),
+):
+    """Manually trigger a model calibration run.
+
+    When CRON_TOKEN is configured, the X-Cron-Token header must match — used
+    by the Render Cron Job to authenticate without exposing the endpoint
+    publicly. Manual invocations from the FastAPI docs / curl do not require
+    a token if CRON_TOKEN is unset.
+    """
+    if _CRON_TOKEN_ENV and (x_cron_token or "").strip() != _CRON_TOKEN_ENV:
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "message": "invalid X-Cron-Token"},
+        )
+    source = "manual"
+    if isinstance(req, dict) and isinstance(req.get("source"), str):
+        source = req["source"]
     result = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: calibration_svc.run_calibration(source="manual")
+        None, lambda: calibration_svc.run_calibration(source=source)
     )
     return result
 

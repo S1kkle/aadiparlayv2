@@ -55,6 +55,13 @@ class EspnClient:
                     )
         return self._http
 
+    async def aclose(self) -> None:
+        """Close the shared connection pool. Called on app shutdown."""
+        async with self._http_lock:
+            if self._http is not None and not self._http.is_closed:
+                await self._http.aclose()
+            self._http = None
+
     async def _get_json(self, url: str) -> dict[str, Any]:
         """GET JSON with bounded retry on 429/5xx + transient network errors.
 
@@ -1125,6 +1132,60 @@ class EspnClient:
         self._cache.set_json(cache_key, data, ttl_seconds=3 * 60)
         return data
 
+    async def get_player_injury_status(
+        self,
+        *,
+        sport: EspnSport,
+        league: EspnLeague,
+        player_name: str,
+        team_abbr: str | None = None,
+    ) -> str | None:
+        """Returns the canonical injury STATUS for a player (e.g. "OUT",
+        "QUESTIONABLE", "DOUBTFUL", "PROBABLE", "DAY-TO-DAY"), upper-cased
+        and trimmed. Returns None if the player isn't on any injury list.
+
+        Used by the ranker to auto-haircut model probability for risky
+        players and zero-out unwinnable picks (Out / Doubtful).
+        """
+        target_canon = _canon_name(player_name)
+        team_filter = (team_abbr or "").strip().upper() or None
+
+        try:
+            data = await self.fetch_league_injuries(sport=sport, league=league)
+        except Exception:
+            return None
+
+        team_entries = data.get("injuries") or []
+        if not isinstance(team_entries, list):
+            return None
+
+        for t in team_entries:
+            if not isinstance(t, dict):
+                continue
+            injuries = t.get("injuries") or []
+            if not isinstance(injuries, list):
+                continue
+            for inj in injuries:
+                if not isinstance(inj, dict):
+                    continue
+                athlete = inj.get("athlete") or {}
+                if not isinstance(athlete, dict):
+                    continue
+                name = athlete.get("displayName")
+                if not isinstance(name, str):
+                    continue
+                if _canon_name(name) != target_canon:
+                    continue
+                if team_filter:
+                    team = athlete.get("team") or {}
+                    abbr = team.get("abbreviation") if isinstance(team, dict) else None
+                    if isinstance(abbr, str) and abbr.strip().upper() != team_filter:
+                        continue
+                status = inj.get("status")
+                if isinstance(status, str) and status.strip():
+                    return status.strip().upper()
+        return None
+
     async def get_team_injuries_summary(
         self,
         *,
@@ -1267,7 +1328,12 @@ class EspnClient:
             return []
 
         # Gather events in the order provided (typically most recent first).
+        # ESPN sometimes lists the same event in multiple categories (e.g. a
+        # postseason game also showing up under regular-season categories on
+        # transitional dates) — dedupe by eventId so a single game can't
+        # double-count in the recent stat series.
         values: list[float] = []
+        seen_event_ids: set[str] = set()
         for categories in category_lists:
             for cat in categories:
                 if not isinstance(cat, dict):
@@ -1278,6 +1344,11 @@ class EspnClient:
                 for ev in events:
                     if not isinstance(ev, dict):
                         continue
+                    event_id = ev.get("eventId")
+                    if isinstance(event_id, str):
+                        if event_id in seen_event_ids:
+                            continue
+                        seen_event_ids.add(event_id)
                     stats = ev.get("stats")
                     if not isinstance(stats, list) or idx >= len(stats):
                         continue
@@ -1316,6 +1387,7 @@ class EspnClient:
             events_meta = {}
 
         out: list[dict[str, Any]] = []
+        seen_event_ids: set[str] = set()
         for categories in category_lists:
             for cat in categories:
                 if not isinstance(cat, dict):
@@ -1330,6 +1402,9 @@ class EspnClient:
                     stats = ev.get("stats")
                     if not isinstance(event_id, str) or not isinstance(stats, list) or idx >= len(stats):
                         continue
+                    if event_id in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event_id)
                     raw = stats[idx]
                     try:
                         value = float(raw)

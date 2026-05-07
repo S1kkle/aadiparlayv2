@@ -11,32 +11,15 @@ from typing import Any
 
 import httpx
 
+from app.clients._prompts import (
+    ANTHROPIC_PROP_TOOL,
+    PROP_SYSTEM_PROMPT,
+)
+
 ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 
-SYSTEM_PROMPT = (
-    "You are a sports prop analyst providing a SMALL CALIBRATED ADJUSTMENT to a "
-    "statistical model that already prices the pick. Your job is NOT to reprice the "
-    "pick from scratch — it is to nudge the existing probability up or down by a "
-    "small amount based on qualitative factors the math model can't see (injuries, "
-    "matchup detail, recent context).\n\n"
-    "Return ONLY valid JSON with keys: "
-    "summary (string), overall_bias (-1|0|1 where 1 = FAVORS pick direction, "
-    "-1 = AGAINST, 0 = neutral), confidence (float 0..1), "
-    "prob_adjustment (float between -0.05 and +0.05 — bounded; values outside this "
-    "range will be clamped). tailwinds (string[]), risk_factors (string[]).\n\n"
-    "CALIBRATION RULES (critical — published research shows frontier LLMs are "
-    "systematically overconfident on prediction tasks):\n"
-    "- Aim for honest calibration: across 100 picks at confidence X, X% should hit. "
-    "Most picks SHOULD be near 0.5 — that is healthy.\n"
-    "- Reserve 0.80+ for unusual situations with multiple converging strong signals.\n"
-    "- prob_adjustment > +0.03 or < -0.03 should require a concrete cited factor "
-    "(injury, large rest gap, named matchup edge).\n\n"
-    "The summary must be 2-4 sentences, referencing matchup context and "
-    "citing at least two numbers from the input (line, avg, hit rate, model_prob, edge). "
-    "If you mention injuries, ONLY reference names that appear in the provided data. "
-    "Do NOT invent injuries."
-)
+SYSTEM_PROMPT = PROP_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -86,15 +69,28 @@ class ClaudeClient:
         }
 
     async def analyze_prop(
-        self, *, prompt: str, timeout_s: float = 45.0, system: str | None = None
+        self,
+        *,
+        prompt: str,
+        timeout_s: float = 45.0,
+        system: str | None = None,
+        use_tool: bool = True,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._cfg.model,
             "max_tokens": 1024,
             "temperature": 0.2,
             "system": system or SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         }
+
+        # Anthropic Tool Use — forces structured output that matches the
+        # prop_analysis schema, eliminating "did not return valid JSON" errors
+        # that plague free-form prompts. Disable when the caller's prompt
+        # uses a different schema (parlay summary, AI selection, etc.).
+        if use_tool:
+            payload["tools"] = [ANTHROPIC_PROP_TOOL]
+            payload["tool_choice"] = {"type": "tool", "name": ANTHROPIC_PROP_TOOL["name"]}
 
         client = await self._get_client()
         max_retries = 3
@@ -123,6 +119,13 @@ class ClaudeClient:
         content_blocks = data.get("content") or []
         if not content_blocks:
             raise ValueError("Claude response had no content blocks")
+
+        # Prefer tool_use block (structured) over text block.
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                inp = block.get("input")
+                if isinstance(inp, dict):
+                    return inp
 
         raw_text = ""
         for block in content_blocks:

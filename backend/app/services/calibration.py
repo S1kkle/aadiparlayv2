@@ -18,9 +18,11 @@ from typing import Any
 
 from app.db import SqliteTTLCache
 from app.services.stat_model import (
+    fit_isotonic,
     get_calibrated_params,
     get_default_params,
     load_calibrated_params,
+    load_isotonic_calibrator,
     prob_over_for_field,
 )
 
@@ -513,112 +515,133 @@ def _score_metric(m: dict, *, min_total: int = 30) -> float:
     return brier - accuracy_bonus
 
 
+_PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+    "decay": (0.70, 0.97),
+    "shrinkage_k": (0.5, 14.0),
+    "vol_assists": (0.7, 1.6),
+    "vol_steals": (0.7, 1.6),
+    "vol_blocks": (0.7, 1.6),
+    "vol_3pm": (0.7, 1.6),
+    "prob_cap": (0.60, 0.92),
+    "prox_penalty_min": (0.30, 1.0),
+    "pick_threshold": (0.50, 0.70),
+}
+
+
+def _sample_random_cfg(rng: random.Random) -> ModelConfig:
+    return ModelConfig(
+        decay=rng.uniform(*_PARAM_BOUNDS["decay"]),
+        shrinkage_k=rng.uniform(*_PARAM_BOUNDS["shrinkage_k"]),
+        vol_assists=rng.uniform(*_PARAM_BOUNDS["vol_assists"]),
+        vol_steals=rng.uniform(*_PARAM_BOUNDS["vol_steals"]),
+        vol_blocks=rng.uniform(*_PARAM_BOUNDS["vol_blocks"]),
+        vol_3pm=rng.uniform(*_PARAM_BOUNDS["vol_3pm"]),
+        prob_cap=rng.uniform(*_PARAM_BOUNDS["prob_cap"]),
+        prox_penalty_min=rng.uniform(*_PARAM_BOUNDS["prox_penalty_min"]),
+        pick_threshold=rng.uniform(*_PARAM_BOUNDS["pick_threshold"]),
+    )
+
+
+def _perturb_cfg(cfg: ModelConfig, scale: float, rng: random.Random) -> ModelConfig:
+    """Sample neighbour with `scale` (e.g. 0.10) of each bound's range."""
+    def jitter(val: float, key: str) -> float:
+        lo, hi = _PARAM_BOUNDS[key]
+        span = hi - lo
+        return max(lo, min(hi, val + rng.uniform(-scale * span, scale * span)))
+
+    return ModelConfig(
+        decay=jitter(cfg.decay, "decay"),
+        shrinkage_k=jitter(cfg.shrinkage_k, "shrinkage_k"),
+        vol_assists=jitter(cfg.vol_assists, "vol_assists"),
+        vol_steals=jitter(cfg.vol_steals, "vol_steals"),
+        vol_blocks=jitter(cfg.vol_blocks, "vol_blocks"),
+        vol_3pm=jitter(cfg.vol_3pm, "vol_3pm"),
+        prob_cap=jitter(cfg.prob_cap, "prob_cap"),
+        prox_penalty_min=jitter(cfg.prox_penalty_min, "prox_penalty_min"),
+        pick_threshold=jitter(cfg.pick_threshold, "pick_threshold"),
+    )
+
+
 def grid_search(
     player_data: list[dict],
     n_test: int = 8,
     real_entries: list[dict] | None = None,
+    *,
+    n_random: int = 200,
+    n_refine: int = 80,
+    seed: int | None = None,
 ) -> tuple[ModelConfig, dict, dict | None]:
-    """Three-phase grid search. Returns (best_cfg, synthetic_metrics, real_metrics).
+    """Random search + local refinement. Returns (best_cfg, primary_metrics,
+    real_metrics).
 
-    DRIVEN ON BRIER SCORE, not accuracy — calibration > accuracy for betting:
-    a 60%-confidence pick that hits 60% of the time is +EV; a 90%-confidence pick
-    that hits 60% of the time is -EV.
+    OBJECTIVE PRIORITY:
+    - When n_real >= MIN_REAL_ENTRIES we score on real-data Brier (the only
+      thing that ultimately matters for ROI). Synthetic data is used only as
+      a sanity-check.
+    - Otherwise we score on synthetic Brier (legacy behaviour) so the model
+      is still calibrated even with sparse real data.
+
+    The random+refine loop evaluates ~280 configs total (vs 6,000+ for the
+    old grid search) and finds equally-good optima per Bergstra & Bengio
+    "Random Search for Hyper-Parameter Optimization" (JMLR 2012).
     """
+    rng = random.Random(seed)
+
+    # Phase 1: Latin-hypercube-ish random search across full bounded space.
     best_score = 1e9
     best_cfg = ModelConfig()
     best_m: dict = {}
 
-    log.info("Phase 1: Coarse grid search (Brier-driven)")
+    use_real_objective = bool(real_entries) and len(real_entries) >= MIN_REAL_ENTRIES
+
+    def evaluate(cfg: ModelConfig) -> tuple[dict, float]:
+        synth_m = run_backtest(player_data, cfg, n_test)
+        if use_real_objective:
+            real_m = run_backtest_real(real_entries or [], cfg)
+            score = _score_metric(real_m, min_total=50)
+            return real_m, score
+        return synth_m, _score_metric(synth_m)
+
+    log.info(
+        "Calibration: phase 1 random search (%d configs, objective=%s)",
+        n_random, "real" if use_real_objective else "synthetic",
+    )
     t0 = time.time()
-    n = 0
-
-    for decay in [0.78, 0.85, 0.92]:
-        for sk in [2.0, 5.0, 8.0, 12.0]:
-            for va in [0.9, 1.1, 1.30]:
-                for vs in [0.9, 1.15, 1.40]:
-                    for cap in [0.75, 0.82, 0.88]:
-                        for pm in [0.55, 0.75, 1.0]:
-                            for pt in [0.52, 0.56, 0.60]:
-                                cfg = ModelConfig(
-                                    decay=decay, shrinkage_k=sk,
-                                    vol_assists=va, vol_steals=vs,
-                                    vol_blocks=vs, vol_3pm=va,
-                                    prob_cap=cap, prox_penalty_min=pm,
-                                    pick_threshold=pt,
-                                )
-                                m = run_backtest(player_data, cfg, n_test)
-                                n += 1
-                                score = _score_metric(m)
-                                if score < best_score:
-                                    best_score = score
-                                    best_cfg = cfg
-                                    best_m = m
+    for _ in range(n_random):
+        cfg = _sample_random_cfg(rng)
+        m, score = evaluate(cfg)
+        if score < best_score:
+            best_score = score
+            best_cfg = cfg
+            best_m = m
 
     log.info(
-        "  Phase 1: %d configs in %.0fs -> brier=%.4f acc=%.2f%%",
-        n, time.time() - t0, best_m.get("brier", 1.0), best_m.get("accuracy", 0.0) * 100,
+        "  Phase 1 done in %.0fs -> brier=%.4f acc=%.2f%%",
+        time.time() - t0, best_m.get("brier", 1.0), best_m.get("accuracy", 0.0) * 100,
     )
 
-    log.info("Phase 2: Fine-tune")
+    # Phase 2: local refinement around the best (simulated-annealing-style).
     t1 = time.time()
-    n2 = 0
-    for decay in _near(best_cfg.decay, 0.03, 0.6, 0.99):
-        for sk in _near(best_cfg.shrinkage_k, 1.5, 0.5, 15):
-            for va in _near(best_cfg.vol_assists, 0.08, 0.7, 1.6):
-                for vs in _near(best_cfg.vol_steals, 0.08, 0.7, 1.6):
-                    for cap in _near(best_cfg.prob_cap, 0.03, 0.6, 0.95):
-                        for pm in _near(best_cfg.prox_penalty_min, 0.08, 0.3, 1.0):
-                            for pt in _near(best_cfg.pick_threshold, 0.02, 0.5, 0.7):
-                                cfg = ModelConfig(
-                                    decay=decay, shrinkage_k=sk,
-                                    vol_assists=va, vol_steals=vs,
-                                    vol_blocks=vs, vol_3pm=va,
-                                    prob_cap=cap, prox_penalty_min=pm,
-                                    pick_threshold=pt,
-                                )
-                                m = run_backtest(player_data, cfg, n_test)
-                                n2 += 1
-                                score = _score_metric(m)
-                                if score < best_score:
-                                    best_score = score
-                                    best_cfg = cfg
-                                    best_m = m
+    scales = [0.10, 0.05, 0.02]
+    refines_per_scale = max(1, n_refine // len(scales))
+    for scale in scales:
+        for _ in range(refines_per_scale):
+            cfg = _perturb_cfg(best_cfg, scale, rng)
+            m, score = evaluate(cfg)
+            if score < best_score:
+                best_score = score
+                best_cfg = cfg
+                best_m = m
 
     log.info(
-        "  Phase 2: %d configs in %.0fs -> brier=%.4f acc=%.2f%%",
-        n2, time.time() - t1, best_m.get("brier", 1.0), best_m.get("accuracy", 0.0) * 100,
+        "  Phase 2 refine done in %.0fs -> brier=%.4f acc=%.2f%%",
+        time.time() - t1, best_m.get("brier", 1.0), best_m.get("accuracy", 0.0) * 100,
     )
 
-    log.info("Phase 3: Ultra-fine")
-    t2 = time.time()
-    n3 = 0
-    for decay in _near(best_cfg.decay, 0.01, 0.6, 0.99):
-        for sk in _near(best_cfg.shrinkage_k, 0.5, 0.5, 15):
-            for va in _near(best_cfg.vol_assists, 0.03, 0.7, 1.6):
-                for vs in _near(best_cfg.vol_steals, 0.03, 0.7, 1.6):
-                    for cap in _near(best_cfg.prob_cap, 0.01, 0.6, 0.95):
-                        for pm in _near(best_cfg.prox_penalty_min, 0.03, 0.3, 1.0):
-                            for pt in _near(best_cfg.pick_threshold, 0.01, 0.5, 0.7):
-                                cfg = ModelConfig(
-                                    decay=decay, shrinkage_k=sk,
-                                    vol_assists=va, vol_steals=vs,
-                                    vol_blocks=vs, vol_3pm=va,
-                                    prob_cap=cap, prox_penalty_min=pm,
-                                    pick_threshold=pt,
-                                )
-                                m = run_backtest(player_data, cfg, n_test)
-                                n3 += 1
-                                score = _score_metric(m)
-                                if score < best_score:
-                                    best_score = score
-                                    best_cfg = cfg
-                                    best_m = m
-
-    log.info(
-        "  Phase 3: %d configs in %.0fs -> brier=%.4f acc=%.2f%%",
-        n3, time.time() - t2, best_m.get("brier", 1.0), best_m.get("accuracy", 0.0) * 100,
-    )
-
+    # Always produce both real and synthetic metrics for the chosen config so
+    # the caller has clean side-by-side reporting regardless of which signal
+    # drove the search.
+    synthetic_m = run_backtest(player_data, best_cfg, n_test)
     real_m = None
     if real_entries:
         real_m = run_backtest_real(real_entries, best_cfg)
@@ -627,7 +650,7 @@ def grid_search(
             real_m.get("brier", 1.0), real_m.get("accuracy", 0.0) * 100, real_m.get("total", 0),
         )
 
-    return best_cfg, best_m, real_m
+    return best_cfg, synthetic_m, real_m
 
 
 # ── Main calibration service ─────────────────────────────────────────
@@ -643,10 +666,27 @@ class CalibrationService:
             return None
         params = latest["params"]
         load_calibrated_params(params)
-        log.info("Loaded calibrated params from DB run %s (accuracy: real=%.2f%%, synth=%.2f%%)",
+        # Stamp the active calibration ID so newly-saved learning entries
+        # carry it as model_params_id (provenance).
+        try:
+            from app.services.ranker import Ranker as _Ranker
+            _Ranker.set_active_calibration_id(latest.get("id"))
+        except Exception:
+            pass
+        # Reload isotonic calibrator if one was saved with this run.
+        iso = latest.get("isotonic")
+        if iso:
+            try:
+                load_isotonic_calibrator([(float(x), float(y)) for x, y in iso])
+            except (TypeError, ValueError):
+                load_isotonic_calibrator(None)
+        else:
+            load_isotonic_calibrator(None)
+        log.info("Loaded calibrated params from DB run %s (accuracy: real=%.2f%%, synth=%.2f%%, isotonic=%s)",
                  latest["id"],
                  (latest.get("accuracy_real") or 0) * 100,
-                 (latest.get("accuracy_synthetic") or 0) * 100)
+                 (latest.get("accuracy_synthetic") or 0) * 100,
+                 "yes" if iso else "no")
         return params
 
     def run_calibration(self, *, source: str = "scheduled") -> dict[str, Any]:
@@ -688,6 +728,30 @@ class CalibrationService:
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
+        # Fit a post-hoc isotonic calibrator from resolved real entries (when
+        # we have enough). The mapping from raw model_prob -> calibrated prob
+        # is applied at request time inside the ranker.
+        isotonic_breakpoints = None
+        if has_real:
+            probs: list[float] = []
+            outcomes: list[int] = []
+            for e in real_entries_flat:
+                mp = e.get("model_prob")
+                hit = e.get("hit")
+                if mp is None or hit is None:
+                    continue
+                # Direction-correct the prob: store P(side wins).
+                # Existing model_prob is already side-normalised at write time.
+                try:
+                    probs.append(float(mp))
+                    outcomes.append(1 if int(hit) == 1 else 0)
+                except (TypeError, ValueError):
+                    continue
+            isotonic_breakpoints = fit_isotonic(probs, outcomes)
+            if isotonic_breakpoints:
+                log.info("Isotonic calibrator fit on %d real entries (%d breakpoints)",
+                         len(probs), len(isotonic_breakpoints))
+
         run_record = {
             "id": run_id,
             "created_at": now,
@@ -698,14 +762,25 @@ class CalibrationService:
             "params_json": json.dumps(params_dict),
             "applied": 1 if should_apply else 0,
             "source": source,
+            "brier": real_metrics.get("brier") if real_metrics else synth_metrics.get("brier"),
+            "log_loss": real_metrics.get("log_loss") if real_metrics else synth_metrics.get("log_loss"),
+            "ece": real_metrics.get("ece") if real_metrics else synth_metrics.get("ece"),
+            "isotonic_json": json.dumps(isotonic_breakpoints) if isotonic_breakpoints else None,
         }
         self._cache.save_calibration_run(run_record)
 
         if should_apply:
             load_calibrated_params(params_dict)
-            log.info("Calibration applied: synth=%.2f%%, real=%s, params=%s",
+            load_isotonic_calibrator(isotonic_breakpoints)
+            try:
+                from app.services.ranker import Ranker as _Ranker
+                _Ranker.set_active_calibration_id(run_id)
+            except Exception:
+                pass
+            log.info("Calibration applied: synth=%.2f%%, real=%s, isotonic=%s, params=%s",
                      synth_acc * 100,
                      f"{real_acc * 100:.2f}%" if real_acc is not None else "N/A",
+                     "yes" if isotonic_breakpoints else "no",
                      params_dict)
         else:
             log.info("Calibration NOT applied (thresholds not met): synth=%.2f%%, real=%s",

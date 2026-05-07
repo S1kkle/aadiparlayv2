@@ -1,4 +1,4 @@
-# Render Blueprint: backend only (frontend stays on Vercel).
+# Render Blueprint: backend + scheduled calibration cron.
 # Deploy from repo root; set GROQ_API_KEY and Underdog env vars in Render dashboard.
 services:
   - type: web
@@ -26,3 +26,27 @@ services:
         sync: false
       - key: CORS_ALLOW_ORIGINS
         sync: false
+      # Tuning for the in-process calibration loop. The Cron Job below is
+      # the preferred way to run calibration on Render, but the in-process
+      # loop is kept as a fallback for non-Render environments.
+      - key: CALIBRATION_INTERVAL_HOURS
+        value: "48"
+      - key: CLV_CAPTURE_INTERVAL_MIN
+        value: "30"
+
+  # Scheduled calibration runner — fires the /calibration/run endpoint on
+  # a fixed schedule. Saves CPU on the long-lived web service and gives
+  # the calibration its own log stream + retry semantics. Adjust the
+  # schedule + URL via the Render dashboard once the web service URL is
+  # known. (curl bins are pre-installed on Render's container images.)
+  - type: cron
+    name: aadiparlay-calibration
+    runtime: docker
+    rootDir: backend
+    schedule: "0 8 * * *"  # daily at 08:00 UTC
+    dockerfilePath: ../scripts/cron-calibrate.Dockerfile
+    envVars:
+      - key: BACKEND_URL
+        sync: false  # set to https://<your-aadiparlay-backend>.onrender.com
+      - key: CRON_TOKEN
+        sync: false  # optional shared secret for /calibration/run auth

@@ -63,10 +63,16 @@ def main() -> None:
     log(f"CALIBRATION COMPLETE in {elapsed:.0f}s ({elapsed / 60:.1f} min)")
     log("=" * 60)
     log(f"\nDefault accuracy:   {dm['accuracy']:.2%}")
+    log(f"Default Brier:      {dm.get('brier', 0):.4f}")
+    log(f"Default LogLoss:    {dm.get('log_loss', 0):.4f}")
+    log(f"Default ECE:        {dm.get('ece', 0):.4f}")
+    log("")
     log(f"Optimized accuracy: {best_m['accuracy']:.2%} ({best_m['total']} predictions)")
-    if best_m.get("high_conf_total", 0) > 0:
-        log(f"High-confidence:    {best_m['high_conf_accuracy']:.2%} ({best_m['high_conf_total']})")
-    log(f"\nOptimal parameters:")
+    log(f"Optimized Brier:    {best_m.get('brier', 0):.4f}")
+    log(f"Optimized LogLoss:  {best_m.get('log_loss', 0):.4f}")
+    log(f"Optimized ECE:      {best_m.get('ece', 0):.4f}")
+    log("")
+    log("Optimal parameters:")
     params = best_cfg.to_params_dict()
     for k, v in params.items():
         log(f"  {k:20s} = {v}")
@@ -77,6 +83,10 @@ def main() -> None:
     results = {
         "accuracy": best_m["accuracy"],
         "default_accuracy": dm["accuracy"],
+        "brier": best_m.get("brier"),
+        "log_loss": best_m.get("log_loss"),
+        "ece": best_m.get("ece"),
+        "reliability": best_m.get("reliability", []),
         "total_predictions": best_m["total"],
         "params": params,
     }

@@ -11,25 +11,10 @@ from typing import Any
 
 import httpx
 
+from app.clients._prompts import PROP_SYSTEM_PROMPT
+
 GROQ_BASE = "https://api.groq.com/openai/v1"
-SYSTEM_JSON = (
-    "You are a sports prop analyst providing a SMALL CALIBRATED ADJUSTMENT to a "
-    "statistical model. Your job is to nudge the model probability up or down by a "
-    "small amount based on qualitative factors the math can't see.\n\n"
-    "Return ONLY valid JSON with keys: "
-    "summary (string), overall_bias (-1|0|1), confidence (float 0..1), "
-    "prob_adjustment (float between -0.05 and +0.05 — bounded; values outside this "
-    "range will be clamped). tailwinds (string[]), risk_factors (string[]).\n\n"
-    "CALIBRATION RULES:\n"
-    "- Aim for honest calibration: across 100 picks at confidence X, X% should hit. "
-    "Most picks SHOULD be near 0.5 — that is healthy.\n"
-    "- Reserve 0.80+ for unusual situations with multiple converging strong signals.\n"
-    "- prob_adjustment > +0.03 or < -0.03 should require a concrete cited factor.\n\n"
-    "The summary must be 2-4 sentences, referencing matchup context and "
-    "citing at least two numbers from the input (line, avg, hit rate, model_prob, edge). "
-    "If you mention injuries, ONLY reference names that appear in the provided data. "
-    "Do NOT invent injuries."
-)
+SYSTEM_JSON = PROP_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -65,9 +50,16 @@ class GroqClient:
         except Exception:
             return False
 
-    async def analyze_prop(self, *, prompt: str, timeout_s: float = 30.0, system: str | None = None) -> dict[str, Any]:
+    async def analyze_prop(
+        self,
+        *,
+        prompt: str,
+        timeout_s: float = 30.0,
+        system: str | None = None,
+        json_mode: bool = True,
+    ) -> dict[str, Any]:
         url = f"{GROQ_BASE}/chat/completions"
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": [
                 {"role": "system", "content": system or SYSTEM_JSON},
@@ -76,6 +68,11 @@ class GroqClient:
             "temperature": 0.2,
             "max_tokens": 1024,
         }
+        # Groq supports OpenAI-compatible response_format. Forcing json_object
+        # eliminates the "did not return valid JSON" failure mode in
+        # production. Disable when the caller's prompt expects free-form text.
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         headers = {
             "Authorization": f"Bearer {self._cfg.api_key.strip()}",
             "Content-Type": "application/json",
