@@ -42,6 +42,28 @@ function lsSaveHistoryEntry(entry: HistoryEntry) {
   } catch {}
 }
 
+// ── Underdog Standard Pick'em payout table ────────────────────────────
+// Underdog Pick'em does NOT multiply per-leg decimal odds. It pays from a
+// fixed payout schedule keyed on entry size. These are the published
+// multipliers for "Standard / Power Play (all-or-nothing)". Insurance,
+// boosts, and demons modify this; let the user override when needed.
+const UD_STANDARD_PAYOUTS: Record<number, number> = {
+  2: 3,
+  3: 6,
+  4: 10,
+  5: 20,
+  6: 37.5,
+  7: 75,
+  8: 150,
+};
+
+function underdogStandardPayout(n: number): number {
+  if (n <= 1) return 0;
+  if (n in UD_STANDARD_PAYOUTS) return UD_STANDARD_PAYOUTS[n];
+  // Rough extrapolation for very large slips (rare).
+  return Math.pow(2, n - 1) * 1.5;
+}
+
 // ── Kelly Criterion (Kelly 1956, Bell System Technical Journal) ───────
 // f* = (b·p − q) / b   maximises log-growth of wealth.
 // Full Kelly is mathematically optimal but produces ~60% drawdowns; the
@@ -251,6 +273,11 @@ export default function Home() {
   const [bankroll, setBankroll] = useState<number>(1000);
   const [bankrollInput, setBankrollInput] = useState<string>("1000");
   const [kellyDivisor, setKellyDivisor] = useState<number>(4);
+
+  // User-supplied parlay payout override (e.g. "13" when Underdog's slip
+  // shows 13x). Defaults to null → use the Underdog standard payout table.
+  const [parlayPayoutOverride, setParlayPayoutOverride] = useState<number | null>(null);
+  const [parlayPayoutInput, setParlayPayoutInput] = useState<string>("");
 
   // Model-only props (shown before AI finishes)
   const [modelProps, setModelProps] = useState<Prop[]>([]);
@@ -537,6 +564,13 @@ export default function Home() {
     }
   }
 
+  // Reset the manual payout override whenever the leg count changes — a
+  // different parlay means a different actual Underdog multiplier.
+  useEffect(() => {
+    setParlayPayoutOverride(null);
+    setParlayPayoutInput("");
+  }, [parlayIds.size]);
+
   const allProps = data?.props ?? [];
   const displayProps = allProps.length ? allProps : modelProps;
   const aiFinished = !!data;
@@ -599,6 +633,13 @@ export default function Home() {
 
   // Comprehensive parlay analytics — joint probability, no-vig estimate,
   // edge, EV, full / fractional Kelly stake, expected profit.
+  //
+  // Underdog payout source-of-truth hierarchy:
+  //   1. User override (parlayPayoutOverride) — what their actual slip shows
+  //   2. Underdog standard payout table by leg count (2=3x, 3=6x, 4=10x,
+  //      5=20x, 6=37.5x, 7=75x, 8=150x)
+  // The legacy "product of per-leg decimal_price" is kept only as a
+  // diagnostic for users who want to compare.
   const parlayAnalytics = useMemo(() => {
     const n = parlayProps.length;
     if (!n) {
@@ -606,6 +647,9 @@ export default function Home() {
         n: 0,
         decimalOdds: 0,
         americanOdds: "—",
+        legProductOdds: 0,
+        standardPayout: 0,
+        usingOverride: false,
         jointModelProb: 0,
         jointNoVigProb: 0,
         impliedFromOdds: 0,
@@ -620,7 +664,11 @@ export default function Home() {
         hasNegativeEdge: false,
       };
     }
-    const decimalOdds = parlayProps.reduce((acc, p) => acc * (p.decimal_price ?? 1), 1);
+    const legProductOdds = parlayProps.reduce((acc, p) => acc * (p.decimal_price ?? 1), 1);
+    const standardPayout = underdogStandardPayout(n);
+    const usingOverride = parlayPayoutOverride !== null && parlayPayoutOverride > 1;
+    const decimalOdds = usingOverride ? (parlayPayoutOverride as number) : standardPayout;
+
     const jointModelProb = parlayProps.reduce((acc, p) => acc * (p.model_prob ?? 0.5), 1);
     const jointNoVigProb = parlayProps.reduce(
       (acc, p) => acc * (p.no_vig_prob ?? p.implied_prob ?? 1 / Math.max(1.01, p.decimal_price ?? 2)),
@@ -640,6 +688,9 @@ export default function Home() {
       n,
       decimalOdds,
       americanOdds: fmtAmericanFromDecimal(decimalOdds),
+      legProductOdds,
+      standardPayout,
+      usingOverride,
       jointModelProb,
       jointNoVigProb,
       impliedFromOdds,
@@ -653,7 +704,7 @@ export default function Home() {
       expectedProfit,
       hasNegativeEdge: kellyFull <= 0,
     };
-  }, [parlayProps, bankroll, kellyDivisor]);
+  }, [parlayProps, bankroll, kellyDivisor, parlayPayoutOverride]);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -1588,19 +1639,72 @@ export default function Home() {
                 ))}
               </div>
 
-              {/* Top-line metrics */}
-              <div className="mt-4 grid grid-cols-2 gap-3 border-t border-emerald-200 pt-3 text-xs dark:border-emerald-800 sm:grid-cols-4">
-                <div>
-                  <div className="text-emerald-700 dark:text-emerald-300" title="Product of each leg's decimal odds">
-                    Combined odds
+              {/* Underdog payout — table-default + manual override */}
+              <div className="mt-4 grid grid-cols-1 gap-3 border-t border-emerald-200 pt-3 sm:grid-cols-2 dark:border-emerald-800">
+                <div className="rounded-md border border-emerald-200 bg-white p-3 dark:border-emerald-800 dark:bg-zinc-950">
+                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                    <span>Underdog payout</span>
+                    <span className="rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[9px] font-mono normal-case dark:border-emerald-800 dark:bg-emerald-950/40">
+                      {parlayAnalytics.usingOverride ? "your slip" : "standard table"}
+                    </span>
                   </div>
-                  <div className="font-mono font-semibold">
-                    {parlayAnalytics.decimalOdds.toFixed(2)}x
+                  <div className="mt-1 flex items-baseline gap-2">
+                    <div className="font-mono text-2xl font-semibold">
+                      {parlayAnalytics.decimalOdds.toFixed(2)}x
+                    </div>
+                    <div className="text-[10px] font-mono text-zinc-500">
+                      {parlayAnalytics.americanOdds}
+                    </div>
                   </div>
-                  <div className="text-[10px] text-zinc-500 font-mono">
-                    {parlayAnalytics.americanOdds}
+                  <div className="mt-1 text-[10px] text-zinc-500">
+                    Standard {parlayAnalytics.n}-pick: {parlayAnalytics.standardPayout.toFixed(2)}x
+                    {" · "}
+                    Per-leg product: {parlayAnalytics.legProductOdds.toFixed(2)}x
                   </div>
                 </div>
+
+                <div className="rounded-md border border-emerald-200 bg-white p-3 dark:border-emerald-800 dark:bg-zinc-950">
+                  <label className="block text-[11px] uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                    Override with your Underdog slip multiplier
+                  </label>
+                  <div className="mt-1 flex items-center gap-2">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder={`e.g. ${parlayAnalytics.standardPayout}`}
+                      className="h-9 w-28 rounded-md border border-emerald-200 bg-white px-2 font-mono text-sm shadow-sm outline-none focus:ring-2 focus:ring-emerald-300 dark:border-emerald-800 dark:bg-zinc-950 dark:focus:ring-emerald-700"
+                      value={parlayPayoutInput}
+                      onChange={(e) => setParlayPayoutInput(e.target.value)}
+                      onBlur={(e) => {
+                        const v = Number(e.target.value.replace(/[^0-9.]/g, ""));
+                        if (isFinite(v) && v > 1) {
+                          setParlayPayoutOverride(v);
+                          setParlayPayoutInput(String(v));
+                        } else {
+                          setParlayPayoutOverride(null);
+                          setParlayPayoutInput("");
+                        }
+                      }}
+                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                    />
+                    <span className="text-xs text-zinc-500">x</span>
+                    {parlayAnalytics.usingOverride && (
+                      <button
+                        className="text-[10px] text-rose-500 hover:underline"
+                        onClick={() => { setParlayPayoutOverride(null); setParlayPayoutInput(""); }}
+                      >
+                        clear
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-1 text-[10px] leading-4 text-zinc-500">
+                    Underdog uses different schedules for Standard, Insured, Power, and Champions entries. If your actual slip shows a different number, type it here and Kelly sizing will use it.
+                  </div>
+                </div>
+              </div>
+
+              {/* Top-line metrics */}
+              <div className="mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-3">
                 <div>
                   <div className="text-emerald-700 dark:text-emerald-300" title="Joint model probability assuming independence">
                     Model prob
@@ -1678,6 +1782,7 @@ export default function Home() {
                   Sizing follows Kelly (1956) <span className="font-mono">f* = (b·p − q)/b</span>, scaled by 1/{kellyDivisor}.
                   Quarter-Kelly captures ~44% of optimal log-growth at ~6% of full-Kelly variance — the standard for risk-aware bettors.
                   Joint probability assumes independence; correlation warnings below should reduce your stake further.
+                  Payout uses {parlayAnalytics.usingOverride ? <>your <span className="font-semibold">slip override ({parlayAnalytics.decimalOdds.toFixed(2)}x)</span></> : <>Underdog&apos;s <span className="font-semibold">standard {parlayAnalytics.n}-pick payout ({parlayAnalytics.standardPayout.toFixed(2)}x)</span></>} — override above if your slip differs.
                 </div>
               </div>
 
