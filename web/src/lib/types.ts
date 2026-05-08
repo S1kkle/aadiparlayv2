@@ -2,6 +2,9 @@ export type SportId = "UNKNOWN" | "NBA" | "NFL" | "NHL" | "SOCCER" | "MMA";
 
 export type PropSide = "over" | "under";
 
+export type MarketType = "player_prop" | "team_total" | "game_total" | "spread" | "moneyline";
+export type SubjectKind = "player" | "team" | "game";
+
 export type Prop = {
   sport: SportId;
   league?: string | null;
@@ -14,6 +17,10 @@ export type Prop = {
   scheduled_at?: string | null;
   team_abbr?: string | null;
   opponent_abbr?: string | null;
+
+  market_type?: MarketType;
+  subject_kind?: SubjectKind;
+  subject_name?: string | null;
 
   stat: string;
   display_stat?: string | null;

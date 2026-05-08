@@ -247,6 +247,10 @@ export default function Home() {
   // Stat filter
   const [statFilter, setStatFilter] = useState<string>("all");
 
+  // Market filter — separates player props from game-level lines (game/team
+  // total, spread, moneyline). All / props / game-lines.
+  const [marketFilter, setMarketFilter] = useState<"all" | "player_prop" | "game_line">("all");
+
   // Parlay builder
   const [parlayIds, setParlayIds] = useState<Set<string>>(new Set());
 
@@ -596,8 +600,16 @@ export default function Home() {
 
   const hasAi = (p: Prop) => typeof p.ai_summary === "string" && p.ai_summary.trim().length > 0;
 
+  // Helper: detect game-line props. The backend marks them with
+  // market_type != "player_prop"; we tolerate older props missing the
+  // field by assuming they're player_props.
+  const isGameLine = (p: Prop) =>
+    p.market_type !== undefined && p.market_type !== null && p.market_type !== "player_prop";
+
   const topProps = useMemo(() => {
     let list = displayProps;
+    if (marketFilter === "player_prop") list = list.filter((p) => !isGameLine(p));
+    else if (marketFilter === "game_line") list = list.filter((p) => isGameLine(p));
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
     const withAiAgree = sortProps(
       list.filter((p) => hasAi(p) && p.model_ai_agree === true),
@@ -613,14 +625,16 @@ export default function Home() {
       if (deduped.length >= 10) break;
     }
     return deduped;
-  }, [displayProps, statFilter, sortKey, sortAsc]);
+  }, [displayProps, statFilter, marketFilter, sortKey, sortAsc]);
 
   const remainingProps = useMemo(() => {
     let list = displayProps;
+    if (marketFilter === "player_prop") list = list.filter((p) => !isGameLine(p));
+    else if (marketFilter === "game_line") list = list.filter((p) => isGameLine(p));
     if (statFilter !== "all") list = list.filter((p) => p.stat === statFilter);
     const topIds = new Set(topProps.map((p) => p.underdog_option_id));
     return sortProps(list.filter((p) => !topIds.has(p.underdog_option_id)), sortKey, sortAsc);
-  }, [displayProps, statFilter, sortKey, sortAsc, topProps]);
+  }, [displayProps, statFilter, marketFilter, sortKey, sortAsc, topProps]);
 
   const filteredProps = topProps;
 
@@ -698,8 +712,17 @@ export default function Home() {
     }, 1);
 
     const usingOverride = parlayPayoutOverride !== null && parlayPayoutOverride > 1;
+    // Smart payout detection: if any leg is a non-Pick'em market priced at
+    // true sportsbook decimal odds (clearly above the ~1.81 Pick'em base),
+    // we can no longer use Underdog's flat payout tables — the whole
+    // parlay must be priced as the product of per-leg decimals.
+    const hasSportsbookPricing = parlayProps.some(
+      (p) => isGameLine(p) && (p.decimal_price ?? 0) > 1.95,
+    );
     const decimalOdds = usingOverride
       ? (parlayPayoutOverride as number)
+      : hasSportsbookPricing
+      ? legProductOdds
       : standardPayout * boostMultiplier;
 
     const legProbs = parlayProps.map((p) => p.model_prob ?? 0.5);
@@ -748,6 +771,7 @@ export default function Home() {
       evByType,
       bestType,
       boostMultiplier,
+      hasSportsbookPricing,
     };
   }, [parlayProps, bankroll, kellyDivisor, parlayPayoutOverride]);
 
@@ -821,6 +845,35 @@ export default function Home() {
                     </select>
                   </label>
                 )}
+
+                <div className="inline-flex rounded-md border border-zinc-200 dark:border-zinc-800" role="tablist" aria-label="Market filter">
+                  {([
+                    { id: "all", label: "All" },
+                    { id: "player_prop", label: "Player Props" },
+                    { id: "game_line", label: "Game Lines" },
+                  ] as const).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setMarketFilter(opt.id)}
+                      className={
+                        "h-9 px-3 text-xs font-medium first:rounded-l-md last:rounded-r-md " +
+                        (marketFilter === opt.id
+                          ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                          : "bg-white text-zinc-600 hover:bg-zinc-100 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-900")
+                      }
+                      title={
+                        opt.id === "game_line"
+                          ? "Show only game-level markets (game total, team total, spread, moneyline)"
+                          : opt.id === "player_prop"
+                          ? "Show only individual player O/U props"
+                          : "Show all markets"
+                      }
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="flex flex-col gap-2 w-full sm:w-auto">
@@ -1099,6 +1152,20 @@ export default function Home() {
                                   {p.model_ai_agree && (
                                     <span className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[9px] font-semibold text-blue-700 dark:bg-blue-900/40 dark:text-blue-300" title="Model & AI agree">
                                       AGREE
+                                    </span>
+                                  )}
+                                  {isGameLine(p) && (
+                                    <span
+                                      className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-violet-700 dark:bg-violet-900/40 dark:text-violet-300"
+                                      title={`Game-level market (${p.market_type})`}
+                                    >
+                                      {p.market_type === "game_total"
+                                        ? "GAME TOTAL"
+                                        : p.market_type === "team_total"
+                                        ? "TEAM TOTAL"
+                                        : p.market_type === "spread"
+                                        ? "SPREAD"
+                                        : "MONEYLINE"}
                                     </span>
                                   )}
                                 </div>
@@ -1426,6 +1493,20 @@ export default function Home() {
                         {p.player_name}
                         {trendArrow(p.trend_direction)}
                         {tierBadge(p.confidence_tier)}
+                        {isGameLine(p) && (
+                          <span
+                            className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-violet-700 dark:bg-violet-900/40 dark:text-violet-300"
+                            title={`Game-level market (${p.market_type})`}
+                          >
+                            {p.market_type === "game_total"
+                              ? "GAME"
+                              : p.market_type === "team_total"
+                              ? "TEAM"
+                              : p.market_type === "spread"
+                              ? "SPREAD"
+                              : "ML"}
+                          </span>
+                        )}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-2 text-xs text-zinc-500">
                         <span className="font-mono">{p.sport}</span>
@@ -1729,10 +1810,17 @@ export default function Home() {
                       </div>
                     )}
                   </div>
+                  {parlayAnalytics.hasSportsbookPricing && (
+                    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[10px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+                      Slip contains a non-Pick&apos;em market — Underdog Flex/Insurance entry types don&apos;t apply. Using true decimal-odds payout.
+                    </div>
+                  )}
                   <div className="mt-2 grid grid-cols-3 gap-2">
                     {(["standard", "insurance", "flex"] as EntryType[]).map((et) => {
                       const ev = parlayAnalytics.evByType.find((e) => e.entryType === et);
-                      const enabled = parlayAnalytics.availableTypes.includes(et);
+                      const enabled =
+                        parlayAnalytics.availableTypes.includes(et) &&
+                        !(parlayAnalytics.hasSportsbookPricing && et !== "standard");
                       const isSelected = entryType === et;
                       const isBest =
                         parlayAnalytics.bestType?.entryType === et;
@@ -1928,7 +2016,13 @@ export default function Home() {
                   Sizing follows Kelly (1956) <span className="font-mono">f* = (b·p − q)/b</span>, scaled by 1/{kellyDivisor}.
                   Quarter-Kelly captures ~44% of optimal log-growth at ~6% of full-Kelly variance — the standard for risk-aware bettors.
                   Joint probability assumes independence; correlation warnings below should reduce your stake further.
-                  Payout uses {parlayAnalytics.usingOverride ? <>your <span className="font-semibold">slip override ({parlayAnalytics.decimalOdds.toFixed(2)}x)</span></> : <>Underdog&apos;s <span className="font-semibold">standard {parlayAnalytics.n}-pick payout ({parlayAnalytics.standardPayout.toFixed(2)}x)</span></>} — override above if your slip differs.
+                  Payout uses {parlayAnalytics.usingOverride ? (
+                    <>your <span className="font-semibold">slip override ({parlayAnalytics.decimalOdds.toFixed(2)}x)</span></>
+                  ) : parlayAnalytics.hasSportsbookPricing ? (
+                    <>true <span className="font-semibold">decimal-odds product ({parlayAnalytics.decimalOdds.toFixed(2)}x)</span> — slip contains a non-Pick&apos;em market so flat payout tables don&apos;t apply</>
+                  ) : (
+                    <>Underdog&apos;s <span className="font-semibold">standard {parlayAnalytics.n}-pick payout ({parlayAnalytics.standardPayout.toFixed(2)}x)</span></>
+                  )} — override above if your slip differs.
                 </div>
               </div>
 

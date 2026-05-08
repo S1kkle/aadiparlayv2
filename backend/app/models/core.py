@@ -8,6 +8,12 @@ from pydantic import BaseModel, Field
 
 SportId = Literal["NBA", "NFL", "NHL", "SOCCER", "MMA", "UNKNOWN"]
 Side = Literal["over", "under"]
+# Market type — what the leg is actually betting on. The vast majority of
+# Underdog Pick'em legs are player_prop. Game-level markets (game total,
+# team total, spread, moneyline) flow through the same over_under_lines
+# endpoint when offered by the operator.
+MarketType = Literal["player_prop", "team_total", "game_total", "spread", "moneyline"]
+SubjectKind = Literal["player", "team", "game"]
 
 
 class GameStat(BaseModel):
@@ -41,7 +47,7 @@ class Prop(BaseModel):
     # identity
     sport: SportId
     league: str | None = None  # ESPN league slug: nba/nfl/nhl/...
-    player_name: str
+    player_name: str  # for non-player markets we put the team or game title here so the UI has something to show
     player_position: str | None = None  # ESPN position abbreviation when available (e.g., G/F/C, QB, RW)
     espn_athlete_id: int | None = None
     underdog_player_id: str | None = None
@@ -50,6 +56,12 @@ class Prop(BaseModel):
     scheduled_at: datetime | None = None
     team_abbr: str | None = None
     opponent_abbr: str | None = None
+
+    # market classification — defaults preserve the existing behaviour where
+    # every prop is treated as a per-player over/under.
+    market_type: MarketType = "player_prop"
+    subject_kind: SubjectKind = "player"
+    subject_name: str | None = None  # team or game when market_type != player_prop
 
     # market
     stat: str

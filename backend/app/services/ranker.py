@@ -977,11 +977,22 @@ class Ranker:
     async def _apply_espn_model(self, props: list[Prop]) -> None:
         assert self._espn is not None
 
-        team_sport_props = [p for p in props if p.sport in ("NBA", "NFL", "NHL")]
+        # Game/team-level markets (game total, team total, spread, moneyline)
+        # don't have a player gamelog — they're modelled directly off Vegas
+        # data. Route them to a dedicated handler so the per-player ESPN
+        # flow doesn't waste lookups on a non-existent athlete.
+        team_sport_player_props = [
+            p for p in props if p.sport in ("NBA", "NFL", "NHL") and p.market_type == "player_prop"
+        ]
+        game_line_props = [
+            p for p in props if p.sport in ("NBA", "NFL", "NHL") and p.market_type != "player_prop"
+        ]
         mma_props = [p for p in props if p.sport == "MMA"]
 
-        if team_sport_props:
-            await self._apply_espn_model_team_sports(team_sport_props)
+        if team_sport_player_props:
+            await self._apply_espn_model_team_sports(team_sport_player_props)
+        if game_line_props:
+            await self._apply_game_line_model(game_line_props)
         if mma_props:
             await self._apply_espn_model_mma(mma_props)
 
@@ -1404,6 +1415,129 @@ class Ranker:
                 if prox_penalty < 1.0:
                     excess = (p.model_prob or 0.5) - 0.5
                     p.model_prob = round(0.5 + excess * prox_penalty, 4)
+
+    async def _apply_game_line_model(self, props: list[Prop]) -> None:
+        """Probability model for game-level markets (game total, team total,
+        spread, moneyline). These don't have a per-player gamelog so we
+        derive the model directly from Vegas total + spread.
+
+        Underdog Pick'em prices these legs the same way it prices player
+        props (~55% break-even), so any sustained mispricing vs. the Vegas
+        consensus translates into edge — exactly the same EV / Kelly
+        machinery applies downstream.
+        """
+        assert self._espn is not None
+        from math import erf, sqrt
+        # Sport-calibrated standard deviations for the relevant outcome
+        # distributions. These come from public sportsbook research and
+        # historical box-score variance — close enough for sizing edge,
+        # not pretending to be exact.
+        SIGMA_TOTAL = {"NBA": 10.5, "NFL": 10.0, "NHL": 1.5}  # game total
+        SIGMA_TEAM = {"NBA": 8.0, "NFL": 7.5, "NHL": 1.0}  # one team's score
+        SIGMA_MARGIN = {"NBA": 12.0, "NFL": 13.0, "NHL": 2.0}  # final margin
+
+        def normal_cdf(x: float, mu: float, sigma: float) -> float:
+            if sigma <= 0:
+                return 0.5
+            return 0.5 * (1.0 + erf((x - mu) / (sigma * sqrt(2.0))))
+
+        # Fetch Vegas odds for every team that appears on a game-line prop.
+        # Re-uses the same per-team helper as the player-prop flow.
+        unique_teams: set[tuple[SportId, str]] = set()
+        for p in props:
+            if p.team_abbr and p.sport in ("NBA", "NFL", "NHL"):
+                unique_teams.add((p.sport, p.team_abbr.strip().upper()))
+
+        odds_by_team: dict[tuple[SportId, str], dict[str, float | None]] = {}
+
+        async def fetch_team_odds(sp: SportId, abbr: str) -> None:
+            try:
+                sl = self._espn.sport_league_for_scope(sp)
+                if sl is None:
+                    return
+                sport_slug, league_slug = sl
+                tid = await self._espn._team_id_by_abbr(
+                    sport=sport_slug, league=league_slug, abbr=abbr
+                )
+                if tid is None:
+                    return
+                eid = await self._espn.fetch_upcoming_event_id(
+                    sport=sport_slug, league=league_slug, team_id=tid
+                )
+                if eid is None:
+                    return
+                odds = await self._espn.fetch_event_odds(
+                    sport=sport_slug, league=league_slug, event_id=eid, team_id=tid,
+                )
+                odds_by_team[(sp, abbr)] = odds
+            except Exception:
+                return
+
+        if unique_teams:
+            await asyncio.gather(*(fetch_team_odds(sp, ab) for sp, ab in unique_teams))
+
+        for p in props:
+            sport = p.sport
+            if sport not in ("NBA", "NFL", "NHL"):
+                continue
+
+            odds: dict[str, float | None] | None = None
+            if p.team_abbr:
+                odds = odds_by_team.get((sport, p.team_abbr.strip().upper()))
+
+            v_total = odds.get("total") if odds else None
+            v_spread = odds.get("spread") if odds else None
+            if isinstance(v_total, (int, float)):
+                p.vegas_total = float(v_total)
+            if isinstance(v_spread, (int, float)):
+                p.vegas_spread = float(v_spread)
+
+            mu: float | None = None
+            sigma: float | None = None
+            x_target: float | None = None
+
+            if p.market_type == "game_total" and isinstance(v_total, (int, float)):
+                mu = float(v_total)
+                sigma = SIGMA_TOTAL[sport]
+                x_target = float(p.line)
+            elif (
+                p.market_type == "team_total"
+                and isinstance(v_total, (int, float))
+                and isinstance(v_spread, (int, float))
+            ):
+                # team-implied score: total / 2 minus spread / 2 (negative spread = favorite)
+                mu = (float(v_total) - float(v_spread)) / 2.0
+                sigma = SIGMA_TEAM[sport]
+                x_target = float(p.line)
+            elif p.market_type == "spread" and isinstance(v_spread, (int, float)):
+                # convention: line is the offered spread number from team's
+                # perspective; we model the team's expected margin and ask
+                # P(margin > line). vegas_spread is from team perspective
+                # too (negative = favorite), so expected_margin = -vegas_spread.
+                mu = -float(v_spread)
+                sigma = SIGMA_MARGIN[sport]
+                x_target = float(p.line)
+            elif p.market_type == "moneyline" and isinstance(v_spread, (int, float)):
+                # win probability = P(margin > 0) = 1 - Φ(0; mu, sigma)
+                mu = -float(v_spread)
+                sigma = SIGMA_MARGIN[sport]
+                x_target = 0.0
+
+            if mu is not None and sigma is not None and x_target is not None:
+                p_over = 1.0 - normal_cdf(x_target, mu, sigma)
+                if p.market_type == "moneyline":
+                    # for moneyline the "over" side encodes the win pick
+                    p.model_prob = round(p_over if p.side == "over" else (1.0 - p_over), 4)
+                else:
+                    p.model_prob = round(p_over if p.side == "over" else (1.0 - p_over), 4)
+                # Volatility for sortability — flatter for game lines because
+                # the outcome variance is much wider than typical player props.
+                p.volatility = round(float(sigma) / max(abs(float(p.line) or 1.0), 1.0), 3)
+                p.notes.append(f"Game-line model: vegas total={p.vegas_total}, spread={p.vegas_spread}")
+            else:
+                p.notes.append(
+                    f"Game line: missing Vegas {p.market_type} data — falling back to implied probability."
+                )
 
     async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
         """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog."""

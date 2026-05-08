@@ -1,9 +1,56 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
-from app.models.core import Prop, SportId
+from app.models.core import MarketType, Prop, SportId, SubjectKind
+
+
+# Regex heuristics for detecting non-player markets purely from the stat
+# label. Underdog uses human-readable strings here ("Total Points",
+# "Lakers Total Points", "Run Line", etc.) so a small set of patterns
+# covers virtually all flavours.
+_GAME_TOTAL_RE = re.compile(
+    r"^\s*(game\s+)?(total|points?\s+total|combined|over\/under|o\/u)\s+(points?|runs?|goals?)?\s*$",
+    re.IGNORECASE,
+)
+_TEAM_TOTAL_RE = re.compile(
+    r"\bteam\s+(total|points?|runs?|goals?)\b",
+    re.IGNORECASE,
+)
+_SPREAD_RE = re.compile(
+    r"\b(spread|run\s+line|puck\s+line|handicap|line)\b",
+    re.IGNORECASE,
+)
+_MONEYLINE_RE = re.compile(
+    r"\bmoneyline\b|\bwin(ner)?\b|\bto\s+win\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_market(stat: str, has_player: bool) -> MarketType:
+    """Heuristic classifier — falls back to player_prop when nothing matches.
+
+    `has_player` is the strongest signal: if the appearance dereferences to
+    a real player record, this is virtually always a player prop, even if
+    the stat string contains words like "total".
+    """
+    s = (stat or "").strip()
+    if has_player:
+        return "player_prop"
+    if _MONEYLINE_RE.search(s):
+        return "moneyline"
+    if _SPREAD_RE.search(s):
+        return "spread"
+    if _TEAM_TOTAL_RE.search(s):
+        return "team_total"
+    if _GAME_TOTAL_RE.search(s):
+        return "game_total"
+    if "total" in s.lower():
+        # Generic "Total <stat>" without team / game qualifier defaults to game total.
+        return "game_total"
+    return "player_prop"
 
 
 def _parse_float(x: Any) -> float | None:
@@ -83,6 +130,18 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
     players = {p.get("id"): p for p in (payload.get("players") or []) if isinstance(p, dict)}
     appearances = {a.get("id"): a for a in (payload.get("appearances") or []) if isinstance(a, dict)}
     games = {g.get("id"): g for g in (payload.get("games") or []) if isinstance(g, dict)}
+    # Some payload shapes also include a flat `teams` collection and/or a
+    # `team_appearances` collection used by team-level markets. We index
+    # both so we can dereference team/game-level appearances cleanly.
+    teams = {t.get("id"): t for t in (payload.get("teams") or []) if isinstance(t, dict)}
+    team_appearances = {
+        a.get("id"): a
+        for a in (
+            (payload.get("team_appearances") or [])
+            + (payload.get("game_appearances") or [])
+        )
+        if isinstance(a, dict)
+    }
 
     out: list[Prop] = []
     for line in payload.get("over_under_lines") or []:
@@ -102,17 +161,30 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
 
         player: dict[str, Any] | None = None
         game: dict[str, Any] | None = None
+        team: dict[str, Any] | None = None  # for team-level markets
         game_title: str | None = None
         scheduled_at: datetime | None = None
         team_abbr: str | None = None
         opp_abbr: str | None = None
 
-        if appearance_id and appearance_id in appearances:
-            app = appearances[appearance_id]
+        # Resolve the appearance — it may live in either `appearances`
+        # (player-keyed) or `team_appearances` (team-keyed). Some payloads
+        # use a single appearances list with mixed kinds.
+        app: dict[str, Any] | None = None
+        if appearance_id:
+            if appearance_id in appearances:
+                app = appearances[appearance_id]
+            elif appearance_id in team_appearances:
+                app = team_appearances[appearance_id]
+
+        if app is not None:
             player_id = app.get("player_id")
+            team_id = app.get("team_id")
             match_id = app.get("match_id")
             if player_id and player_id in players:
                 player = players[player_id]
+            if not player and team_id and team_id in teams:
+                team = teams[team_id]
             if match_id and match_id in games:
                 game = games[match_id]
                 game_title = game.get("title") or game.get("short_title") or game.get("abbreviated_title")
@@ -166,6 +238,51 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
             full = (first + " " + last).strip()
             player_name = full or player.get("full_name")
 
+        # Team-level markets: derive a display "team name" from the team
+        # record + the home/away split. Falls back to the abbreviation
+        # captured from the game title when needed.
+        team_display: str | None = None
+        if team:
+            team_display = (
+                team.get("display_name")
+                or team.get("name")
+                or team.get("abbr")
+                or team.get("abbreviation")
+            )
+            if not team_abbr:
+                team_abbr = team.get("abbr") or team.get("abbreviation")
+            # Compute is_home / opp_abbr for team-level markets too.
+            if game and isinstance(abbr_title := (game.get("abbreviated_title") or game.get("title")), str) and "@" in abbr_title:
+                _away, _home = [p.strip() for p in abbr_title.split("@", 1)]
+                if team_abbr:
+                    if team_abbr == _home:
+                        is_home, opp_abbr = True, _away
+                    elif team_abbr == _away:
+                        is_home, opp_abbr = False, _home
+
+        # Classify the market — player record present is the strongest
+        # signal it's a player_prop. Otherwise inspect the stat label.
+        market_type = _classify_market(str(stat), has_player=bool(player))
+        subject_kind: SubjectKind = (
+            "player" if market_type == "player_prop" else ("team" if team else "game")
+        )
+
+        # Build the display name. For team / game markets the existing
+        # downstream code paths key off `player_name`, so we put a
+        # human-readable subject there and also stash the canonical name
+        # in `subject_name`.
+        subject_name: str | None = None
+        if market_type == "player_prop":
+            pass  # player_name already set above
+        elif market_type == "team_total":
+            subject_name = team_display or team_abbr or game_title
+            player_name = subject_name
+        elif market_type in ("game_total", "moneyline", "spread"):
+            subject_name = game_title or (
+                f"{team_display} vs {opp_abbr}" if team_display and opp_abbr else None
+            )
+            player_name = subject_name or "Game Line"
+
         for opt in line.get("options") or []:
             if not isinstance(opt, dict):
                 continue
@@ -176,6 +293,13 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
             if choice == "higher":
                 side = "over"
             elif choice == "lower":
+                side = "under"
+            elif market_type == "moneyline" and choice in ("yes", "win", "team_a", "home", "favorite"):
+                # Binary moneyline: encode "win" as the over side so the
+                # rest of the pipeline (which assumes binary over/under)
+                # keeps working without special cases.
+                side = "over"
+            elif market_type == "moneyline" and choice in ("no", "loss", "team_b", "away", "underdog"):
                 side = "under"
             else:
                 continue
@@ -229,6 +353,9 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     team_abbr=team_abbr,
                     opponent_abbr=opp_abbr,
                     is_home=is_home,
+                    market_type=market_type,
+                    subject_kind=subject_kind,
+                    subject_name=subject_name,
                     stat=str(stat),
                     display_stat=str(display_stat) if display_stat else None,
                     line=float(line_value),

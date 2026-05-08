@@ -91,6 +91,31 @@ export function entryEv(
   };
 }
 
+/**
+ * True decimal-odds parlay EV. Used when at least one leg is NOT a
+ * Pick'em market and Underdog's flat payout tables don't apply (e.g. a
+ * game total or moneyline leg priced at its real decimal odds). The
+ * parlay payout is the product of the per-leg decimal prices.
+ */
+export function decimalParlayEv(
+  legProbs: number[],
+  legDecimalOdds: number[],
+): EntryEv | null {
+  if (legProbs.length === 0 || legProbs.length !== legDecimalOdds.length) return null;
+  const probs = legProbs.map(clampProb);
+  const odds = legDecimalOdds.map((o) => (isFinite(o) && o > 1 ? o : 1.82));
+  const joint = probs.reduce((acc, p) => acc * p, 1);
+  const payout = odds.reduce((acc, o) => acc * o, 1);
+  return {
+    entryType: "standard",
+    legs: probs.length,
+    evPerDollar: joint * payout - 1,
+    expectedPayoutMultiplier: joint * payout,
+    winProbabilityFull: joint,
+    breakdown: { [probs.length]: joint },
+  };
+}
+
 /** Returns the highest-EV entry-type variant for these legs (or null). */
 export function bestEntryType(
   legs: number,
