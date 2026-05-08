@@ -371,6 +371,46 @@ class Ranker:
 
         await _emit_stage("fetch", f"Found {len(props)} props")
 
+        # ── Inject ESPN-sourced game-line markets ──────────────────
+        # Underdog Pick'em rarely surfaces moneyline / spread / game-total
+        # markets in `over_under_lines`, but ESPN bundles consensus
+        # sportsbook lines on every event summary. We synthesize a Prop
+        # entry per market so the user can see + parlay them. These are
+        # clearly tagged with `market_type != player_prop` and have
+        # synthetic option ids prefixed with `espn:game:`. Failure here
+        # never blocks the main flow — game-lines are additive.
+        if self._espn is not None:
+            try:
+                from app.services.game_lines import fetch_game_line_props
+                game_line_sports: list[SportId] = (
+                    [sport] if sport in ("NBA", "NFL", "NHL")
+                    else [s for s in ("NBA", "NFL", "NHL") if any(p.sport == s for p in props)]  # type: ignore[list-item]
+                )
+                for gl_sport in game_line_sports:
+                    teams_for_sport = sorted(
+                        {p.team_abbr for p in props if p.sport == gl_sport and p.team_abbr}
+                    )
+                    if not teams_for_sport:
+                        continue
+                    extra = await fetch_game_line_props(
+                        espn=self._espn,
+                        sport=gl_sport,
+                        team_abbrs=list(teams_for_sport),
+                        cache=self._cache,
+                    )
+                    if extra:
+                        await _emit_stage(
+                            "fetch",
+                            f"Added {len(extra)} ESPN game-line markets for {gl_sport}",
+                        )
+                        # De-dupe against props that already exist with the same
+                        # synthetic option id (safe-guards repeated runs).
+                        existing_ids = {p.underdog_option_id for p in props}
+                        props.extend(p for p in extra if p.underdog_option_id not in existing_ids)
+            except Exception:
+                log = __import__("logging").getLogger(__name__)
+                log.exception("Failed to inject ESPN game-line props")
+
         # Pricing fallback: prefer real Underdog payout_multiplier > decimal_price >
         # american_price > documented Pick'em default (~55% break-even, NOT -110).
         for p in props:

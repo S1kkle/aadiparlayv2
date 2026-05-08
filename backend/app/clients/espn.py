@@ -597,51 +597,133 @@ class EspnClient:
         spread is from `team_id`'s perspective (negative = favorite). Best-effort:
         returns dict with None values rather than raising on missing data.
         """
+        full = await self.fetch_event_market_lines(
+            sport=sport, league=league, event_id=event_id
+        )
+        spread_val = full.get("spread_home")
+        total_val = full.get("total")
+        # Re-orient spread to team_id's perspective if we know both.
+        spread_team_id = full.get("home_team_id")
+        if (
+            isinstance(spread_val, (int, float))
+            and team_id is not None
+            and isinstance(spread_team_id, int)
+            and team_id != spread_team_id
+        ):
+            spread_val = -spread_val
+        return {"spread": spread_val, "total": total_val}
+
+    async def fetch_event_market_lines(
+        self,
+        *,
+        sport: EspnSport,
+        league: EspnLeague,
+        event_id: str,
+    ) -> dict[str, Any]:
+        """Pulls the full game-line market from ESPN's event-summary
+        `pickcenter`: spread (home perspective), total (game total),
+        moneyline (home + away in American odds), and the home / away
+        team ids + abbreviations.
+
+        Returns a dict with keys: spread_home, total, moneyline_home,
+        moneyline_away, home_team_id, away_team_id, home_abbr, away_abbr,
+        provider, scheduled_at, game_title.
+
+        Used as the source-of-truth for synthetic game-line props (game
+        total, team total, spread, moneyline) that we surface alongside
+        player props so the user can build mixed parlays.
+        """
+        result: dict[str, Any] = {
+            "spread_home": None,
+            "total": None,
+            "moneyline_home": None,
+            "moneyline_away": None,
+            "home_team_id": None,
+            "away_team_id": None,
+            "home_abbr": None,
+            "away_abbr": None,
+            "provider": None,
+            "scheduled_at": None,
+            "game_title": None,
+        }
         try:
             summ = await self.fetch_event_summary(sport=sport, league=league, event_id=event_id)
         except Exception:
-            return {"spread": None, "total": None}
+            return result
         pickcenter = summ.get("pickcenter") or []
+        header = summ.get("header") or {}
+        if isinstance(header, dict):
+            comps = header.get("competitions") or []
+            if comps and isinstance(comps[0], dict):
+                comp0 = comps[0]
+                date_str = comp0.get("date") or header.get("timeValid")
+                if isinstance(date_str, str):
+                    result["scheduled_at"] = date_str
+                # Pull team abbreviations + ids from header competitors.
+                for c in comp0.get("competitors") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    team_obj = c.get("team") or {}
+                    if not isinstance(team_obj, dict):
+                        continue
+                    abbr = team_obj.get("abbreviation") or team_obj.get("abbrev")
+                    try:
+                        tid = int(team_obj.get("id")) if team_obj.get("id") is not None else None
+                    except (TypeError, ValueError):
+                        tid = None
+                    home_away = (c.get("homeAway") or "").lower()
+                    if home_away == "home":
+                        result["home_team_id"] = tid
+                        if isinstance(abbr, str):
+                            result["home_abbr"] = abbr.upper()
+                    elif home_away == "away":
+                        result["away_team_id"] = tid
+                        if isinstance(abbr, str):
+                            result["away_abbr"] = abbr.upper()
+                if result.get("home_abbr") and result.get("away_abbr"):
+                    result["game_title"] = f"{result['away_abbr']} @ {result['home_abbr']}"
+
         if not isinstance(pickcenter, list) or not pickcenter:
-            return {"spread": None, "total": None}
-        # Prefer first provider entry that has both fields populated.
-        spread_val: float | None = None
-        total_val: float | None = None
-        spread_team_id: int | None = None
+            return result
+
         for pc in pickcenter:
             if not isinstance(pc, dict):
                 continue
             sp = pc.get("spread")
             ou = pc.get("overUnder")
-            if isinstance(sp, (int, float)) and spread_val is None:
-                spread_val = float(sp)
-                # ESPN's "spread" is from the perspective of "home" or specified favorite.
-                # The summary header has competitors with team ids.
-                home_competitor = pc.get("homeTeamOdds") or {}
-                if isinstance(home_competitor, dict):
-                    fav = home_competitor.get("favorite")
-                    home_team = home_competitor.get("team") or {}
-                    if isinstance(home_team, dict):
-                        try:
-                            spread_team_id = int(home_team.get("id"))
-                        except (TypeError, ValueError):
-                            spread_team_id = None
-                    if fav is False and isinstance(spread_val, (int, float)):
-                        # If "home" is NOT the favorite, sign is negated in some payloads.
-                        pass
-            if isinstance(ou, (int, float)) and total_val is None:
-                total_val = float(ou)
-            if spread_val is not None and total_val is not None:
+            if isinstance(sp, (int, float)) and result["spread_home"] is None:
+                # ESPN reports `spread` from the home perspective in most
+                # leagues. Some payloads flip the sign when home is the
+                # underdog — we trust the documented convention here.
+                result["spread_home"] = float(sp)
+            if isinstance(ou, (int, float)) and result["total"] is None:
+                result["total"] = float(ou)
+
+            home_odds = pc.get("homeTeamOdds") or {}
+            away_odds = pc.get("awayTeamOdds") or {}
+            if isinstance(home_odds, dict) and result["moneyline_home"] is None:
+                ml = home_odds.get("moneyLine")
+                if isinstance(ml, (int, float)):
+                    result["moneyline_home"] = int(ml)
+            if isinstance(away_odds, dict) and result["moneyline_away"] is None:
+                ml = away_odds.get("moneyLine")
+                if isinstance(ml, (int, float)):
+                    result["moneyline_away"] = int(ml)
+
+            prov = pc.get("provider") or {}
+            if isinstance(prov, dict) and result["provider"] is None:
+                pname = prov.get("name")
+                if isinstance(pname, str) and pname.strip():
+                    result["provider"] = pname.strip()
+
+            if (
+                result["spread_home"] is not None
+                and result["total"] is not None
+                and result["moneyline_home"] is not None
+                and result["moneyline_away"] is not None
+            ):
                 break
-        # Re-orient spread to team_id's perspective if we know both.
-        if (
-            spread_val is not None
-            and team_id is not None
-            and spread_team_id is not None
-            and team_id != spread_team_id
-        ):
-            spread_val = -spread_val
-        return {"spread": spread_val, "total": total_val}
+        return result
 
     async def fetch_team_schedule(self, *, sport: EspnSport, league: EspnLeague, team_id: int) -> dict[str, Any]:
         cache_key = f"espn:schedule:{sport}:{league}:{team_id}"

@@ -100,6 +100,21 @@ function fmtNum(x: number | null | undefined, digits = 3) {
   return x.toFixed(digits);
 }
 
+/** Pretty pick description that adapts to market type so game-line legs
+ * read naturally instead of "OVER 0 Moneyline". */
+function fmtPick(p: Prop): string {
+  const mt = p.market_type;
+  if (mt === "moneyline") return "Win"; // player_name already encodes the team
+  if (mt === "spread") {
+    const sign = p.line >= 0 ? `+${p.line}` : `${p.line}`;
+    return `Spread ${sign}`;
+  }
+  if (mt === "game_total" || mt === "team_total") {
+    return `${(p.side || "").toUpperCase()} ${p.line}`;
+  }
+  return `${(p.side || "").toUpperCase()} ${p.line} ${p.display_stat ?? p.stat}`;
+}
+
 function fmtVal(x: unknown) {
   if (typeof x !== "number" || Number.isNaN(x)) return "—";
   return Number.isInteger(x) ? String(x) : x.toFixed(1);
@@ -1183,7 +1198,7 @@ export default function Home() {
                             </div>
                           </td>
                           <td className="px-3 py-3 font-mono text-xs">
-                            <div>{p.side.toUpperCase()} {p.line} {p.display_stat ?? ""}</div>
+                            <div>{fmtPick(p)}</div>
                             <div className="mt-0.5 text-[11px] text-zinc-500">
                               {p.team_abbr || "?"} vs {p.opponent_abbr || "?"}
                             </div>
@@ -1510,7 +1525,7 @@ export default function Home() {
                       </div>
                       <div className="mt-1 flex flex-wrap gap-2 text-xs text-zinc-500">
                         <span className="font-mono">{p.sport}</span>
-                        <span>{p.side.toUpperCase()} {p.line} {p.display_stat ?? p.stat}</span>
+                        <span>{fmtPick(p)}</span>
                         {p.hit_rate_str && <span className="font-mono">{p.hit_rate_str}</span>}
                         {p.is_home != null && <span className="font-mono text-[10px]">{p.is_home ? "HOME" : "AWAY"}</span>}
                         {p.is_b2b && <span className="font-mono text-[10px] text-amber-600">B2B</span>}
@@ -1693,7 +1708,7 @@ export default function Home() {
                                 <div className="text-[10px] text-zinc-400">{p.sport} {p.team_abbr ? `(${p.team_abbr})` : ""}</div>
                               </td>
                               <td className="px-2 py-1.5 font-mono">
-                                {p.side.toUpperCase()} {p.line} <span className="text-zinc-500">{p.display_stat ?? p.stat}</span>
+                                {fmtPick(p)}
                               </td>
                               <td className="px-2 py-1.5 font-mono">{p.hit_rate_str ?? "—"}</td>
                               <td className="px-2 py-1.5 font-mono">{fmtPct(p.model_prob)}</td>
@@ -1747,7 +1762,7 @@ export default function Home() {
                       </span>
                       <div>
                         <span className="font-medium">{p.player_name}</span>{" "}
-                        <span className="text-zinc-500">{p.side.toUpperCase()} {p.line} {p.display_stat ?? p.stat}</span>
+                        <span className="text-zinc-500">{fmtPick(p)}</span>
                         {p.game_title ? (
                           <span className="ml-1 text-[10px] text-zinc-400">— {p.game_title}</span>
                         ) : null}
@@ -2043,7 +2058,7 @@ export default function Home() {
                 const perLegKelly = parlayProps.map((p) => ({
                   id: p.underdog_option_id,
                   player: p.player_name,
-                  pick: `${p.side.toUpperCase()} ${p.line} ${p.display_stat ?? p.stat}`,
+                  pick: fmtPick(p),
                   kelly: kellyFullFraction(p.model_prob ?? 0.5, p.decimal_price ?? 1.81),
                 }));
                 const totalQuarterKelly = perLegKelly.reduce(
