@@ -145,7 +145,13 @@ _CALIBRATION_INTERVAL_HOURS = _env_int("CALIBRATION_INTERVAL_HOURS", 48)
 
 
 async def _calibration_loop() -> None:
-    """Background loop that runs model calibration on a schedule."""
+    """Background loop that runs model calibration on a schedule.
+
+    Also piggybacks an opportunistic tier-model retrain on each cycle —
+    same cadence makes operational reasoning easy and the threshold guard
+    inside `maybe_train_tier_model` keeps the work cheap when nothing's
+    changed.
+    """
     _log = logging.getLogger("calibration.scheduler")
     while True:
         await asyncio.sleep(_CALIBRATION_INTERVAL_HOURS * 3600)
@@ -162,9 +168,39 @@ async def _calibration_loop() -> None:
             )
         except Exception:
             _log.exception("Scheduled calibration failed")
+        # Tier piggyback — run *after* calibration so tier features pick up
+        # any newly-applied calibration parameters on the next pick batch.
+        try:
+            from app.services.continuous_learning import maybe_train_tier_model
+            tier_outcome = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: maybe_train_tier_model(
+                    cache=cache,
+                    min_new_resolved=_TIER_TRAIN_MIN_NEW_RESOLVED,
+                    min_total=_TIER_TRAIN_MIN_TOTAL,
+                ),
+            )
+            _log.info("Calibration-cycle tier retrain: %s", tier_outcome.get("status"))
+        except Exception:
+            _log.exception("Calibration-cycle tier retrain failed")
 
 
 _CLV_CAPTURE_INTERVAL_MIN = _env_int("CLV_CAPTURE_INTERVAL_MIN", 30)
+
+# ── Continuous-learning interval knobs ────────────────────────────────
+# All in hours. Defaults pick a reasonable cadence for a single-tenant
+# install with a modest pick volume; tune via env vars in production.
+_RESOLVE_INTERVAL_HOURS = _env_int("RESOLVE_INTERVAL_HOURS", 6)
+_MISS_ANALYSIS_INTERVAL_HOURS = _env_int("MISS_ANALYSIS_INTERVAL_HOURS", 24)
+_WEEKLY_REPORT_INTERVAL_HOURS = _env_int("WEEKLY_REPORT_INTERVAL_HOURS", 168)
+_TIER_TRAIN_INTERVAL_HOURS = _env_int("TIER_TRAIN_INTERVAL_HOURS", 24)
+# Don't bother retraining unless we have at least this many *new* resolved
+# entries since the last train — refitting on a handful of new rows is mostly
+# noise and wastes CPU.
+_TIER_TRAIN_MIN_NEW_RESOLVED = _env_int("TIER_TRAIN_MIN_NEW_RESOLVED", 20)
+# Minimum *total* resolved volume before we'll fit at all — below this the
+# logistic is too noisy to deploy.
+_TIER_TRAIN_MIN_TOTAL = _env_int("TIER_TRAIN_MIN_TOTAL", 30)
 
 
 async def _clv_capture_loop() -> None:
@@ -232,6 +268,106 @@ async def _clv_capture_loop() -> None:
         await asyncio.sleep(_CLV_CAPTURE_INTERVAL_MIN * 60)
 
 
+async def _resolve_outcomes_loop() -> None:
+    """Periodic resolve_outcomes — the foundation of continuous learning.
+
+    Without this loop, learning_log only grows when someone manually hits
+    /learning/resolve. Pulls completed-game stat values from ESPN and
+    appends hit/miss rows to the log. Rate-limited by the ESPN client's
+    cache, so consecutive runs that find nothing to do are cheap.
+    """
+    _log = logging.getLogger("learning.resolve")
+    # First run is delayed so the server is fully warm and we don't fight
+    # the warm-cache loop for ESPN bandwidth.
+    await asyncio.sleep(120)
+    while True:
+        try:
+            result = await learning_svc.resolve_outcomes()
+            resolved = (result or {}).get("resolved", 0) if isinstance(result, dict) else 0
+            if resolved:
+                _log.info(
+                    "Resolved %d new pick outcomes (already=%s, failed=%s, future=%s)",
+                    resolved,
+                    result.get("already_done"),
+                    result.get("failed_lookup"),
+                    result.get("skipped_future"),
+                )
+        except Exception:
+            _log.exception("Resolve-outcomes loop failed")
+        await asyncio.sleep(_RESOLVE_INTERVAL_HOURS * 3600)
+
+
+async def _miss_analysis_loop() -> None:
+    """Periodic miss-analysis — runs the LLM diagnosis over unanalyzed
+    misses so weekly reports + future calibration can stratify by failure
+    mode. Skipped automatically when there are no misses to analyze.
+    """
+    _log = logging.getLogger("learning.misses")
+    await asyncio.sleep(_MISS_ANALYSIS_INTERVAL_HOURS * 1800)  # 30-min offset
+    while True:
+        try:
+            result = await learning_svc.analyze_misses()
+            analyzed = (result or {}).get("analyzed", 0) if isinstance(result, dict) else 0
+            if analyzed:
+                _log.info("Analyzed %d new missed picks", analyzed)
+        except Exception:
+            _log.exception("Miss-analysis loop failed")
+        await asyncio.sleep(_MISS_ANALYSIS_INTERVAL_HOURS * 3600)
+
+
+async def _tier_train_loop() -> None:
+    """Periodic threshold-gated tier-model retraining.
+
+    The expensive step (`fit_tier_logistic` + K-fold CV) runs in a thread
+    pool so it doesn't block the event loop. The continuous-learning
+    service decides whether to actually adopt the new fit by comparing
+    its CV-Brier against the currently-deployed model — this prevents
+    accidental regressions when the recent slate of picks happens to be
+    biased.
+    """
+    _log = logging.getLogger("learning.tier_train")
+    # Long initial delay — gives the calibration loop a chance to seed
+    # the model first on a fresh deploy.
+    await asyncio.sleep(_TIER_TRAIN_INTERVAL_HOURS * 1800)  # 30-min offset
+    while True:
+        try:
+            from app.services.continuous_learning import maybe_train_tier_model
+            outcome = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: maybe_train_tier_model(
+                    cache=cache,
+                    min_new_resolved=_TIER_TRAIN_MIN_NEW_RESOLVED,
+                    min_total=_TIER_TRAIN_MIN_TOTAL,
+                ),
+            )
+            status = outcome.get("status", "?")
+            if status in ("adopted", "rejected_regression", "train_failed", "error"):
+                _log.info("Tier-train cycle: %s | %s", status, outcome)
+        except Exception:
+            _log.exception("Tier-train loop failed")
+        await asyncio.sleep(_TIER_TRAIN_INTERVAL_HOURS * 3600)
+
+
+async def _weekly_report_loop() -> None:
+    """Periodic weekly report generation. Quiet no-op if no resolved data."""
+    _log = logging.getLogger("learning.report")
+    # Stagger heavily — first run is one hour in to avoid colliding with
+    # boot-time work; subsequent runs are weekly by default.
+    await asyncio.sleep(3600)
+    while True:
+        try:
+            report = await learning_svc.generate_weekly_report()
+            if isinstance(report, dict) and report.get("total_picks"):
+                _log.info(
+                    "Weekly report generated: %s picks, %.1f%% hit rate",
+                    report.get("total_picks"),
+                    (report.get("hit_rate") or 0) * 100,
+                )
+        except Exception:
+            _log.exception("Weekly-report loop failed")
+        await asyncio.sleep(_WEEKLY_REPORT_INTERVAL_HOURS * 3600)
+
+
 async def _warm_league_matchup_caches() -> None:
     """Compute league-allowed snapshots for upcoming sports.
 
@@ -284,6 +420,12 @@ async def _startup() -> None:
 
     asyncio.create_task(_calibration_loop())
     asyncio.create_task(_clv_capture_loop())
+    # Continuous-learning loops — without these the model stops improving
+    # the moment a human stops manually hitting /learning/resolve.
+    asyncio.create_task(_resolve_outcomes_loop())
+    asyncio.create_task(_miss_analysis_loop())
+    asyncio.create_task(_tier_train_loop())
+    asyncio.create_task(_weekly_report_loop())
 
 
 @app.on_event("shutdown")
@@ -915,4 +1057,77 @@ async def calibration_get_tier_model():
     if m is None:
         return {"trained": False}
     return {"trained": True, **m}
+
+
+@app.post("/calibration/tier-model/auto-train")
+async def calibration_tier_model_auto_train(
+    force: bool = Query(False, description="Bypass new-data threshold (always retrain)"),
+):
+    """Threshold-gated, regression-guarded tier retrain.
+
+    Same code path the scheduled `_tier_train_loop` uses. Returns a
+    structured outcome (`adopted` / `rejected_regression` /
+    `skipped_no_new_data` / etc.) so the caller can see exactly what
+    happened.
+    """
+    from app.services.continuous_learning import maybe_train_tier_model
+    outcome = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: maybe_train_tier_model(
+            cache=cache,
+            min_new_resolved=_TIER_TRAIN_MIN_NEW_RESOLVED,
+            min_total=_TIER_TRAIN_MIN_TOTAL,
+            force=force,
+        ),
+    )
+    return outcome
+
+
+@app.get("/calibration/tier-model/lineage")
+async def calibration_tier_model_lineage(limit: int = Query(20, ge=1, le=100)):
+    """Audit history of tier-model train attempts (adopted + rejected).
+
+    Useful for spotting model drift: if you see a lot of `rejected_regression`
+    in a row, the underlying signal has likely shifted and the canonical
+    parameters need a manual look.
+    """
+    from app.services.continuous_learning import get_tier_lineage
+    return {"lineage": get_tier_lineage(cache, limit=limit)}
+
+
+@app.get("/learning/status")
+async def learning_status():
+    """Snapshot of the continuous-learning system: scheduled intervals,
+    learning_log volume, latest tier model, last calibration. Read-only.
+    """
+    resolved_entries = cache.get_learning_entries(resolved_only=True, limit=100000)
+    unresolved_entries = [
+        e for e in cache.get_learning_entries(resolved_only=False, limit=10000)
+        if e.get("hit") not in (0, 1)
+    ]
+    from app.services.stat_model import get_tier_model
+    tier = get_tier_model()
+    latest_calib = calibration_svc.get_history(limit=1)
+    return {
+        "intervals_hours": {
+            "calibration": _CALIBRATION_INTERVAL_HOURS,
+            "resolve": _RESOLVE_INTERVAL_HOURS,
+            "miss_analysis": _MISS_ANALYSIS_INTERVAL_HOURS,
+            "tier_train": _TIER_TRAIN_INTERVAL_HOURS,
+            "weekly_report": _WEEKLY_REPORT_INTERVAL_HOURS,
+            "clv_capture_minutes": _CLV_CAPTURE_INTERVAL_MIN,
+        },
+        "thresholds": {
+            "tier_train_min_new_resolved": _TIER_TRAIN_MIN_NEW_RESOLVED,
+            "tier_train_min_total": _TIER_TRAIN_MIN_TOTAL,
+        },
+        "learning_log": {
+            "resolved_total": len(resolved_entries),
+            "unresolved_pending": len(unresolved_entries),
+        },
+        "tier_model": (
+            {"trained": True, "metrics": tier.get("metrics")} if tier else {"trained": False}
+        ),
+        "latest_calibration": (latest_calib[0] if latest_calib else None),
+    }
 
