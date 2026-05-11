@@ -158,6 +158,31 @@ export type LearningEntry = {
   entry_type?: string | null;
 };
 
+export type LearningLogKind =
+  | "calibration_run"
+  | "tier_train"
+  | "miss_discovery"
+  | "resolution_batch"
+  | "weekly_report";
+
+export type LearningLogStatus = "adopted" | "rejected" | "skipped" | "info";
+
+export type LearningLogEntry = {
+  id: string;
+  timestamp: string;
+  kind: LearningLogKind;
+  status: LearningLogStatus;
+  title: string;
+  summary: string;
+  details?: Record<string, unknown> | null;
+};
+
+export type LearningLogResponse = {
+  entries: LearningLogEntry[];
+  totals: Partial<Record<LearningLogKind, number>>;
+  generated_at: string;
+};
+
 export type LearningReport = {
   id: string;
   week_start: string;

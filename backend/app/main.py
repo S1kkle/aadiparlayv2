@@ -792,6 +792,31 @@ async def learning_reports(limit: int = Query(5)):
     return {"reports": reports}
 
 
+@app.get("/learning/log")
+async def learning_log_endpoint(
+    limit: int = Query(60, ge=1, le=500),
+    kinds: str | None = Query(
+        None,
+        description=(
+            "Comma-separated list of event kinds to include. "
+            "Valid: calibration_run, tier_train, miss_discovery, resolution_batch, weekly_report. "
+            "Omit to include all kinds."
+        ),
+    ),
+):
+    """Unified time-ordered feed of model events.
+
+    Aggregates calibration runs, tier-model train attempts, resolved-pick
+    batches, miss-category discoveries, and weekly reports into a single
+    "what changed" log the UI can render as a changelog.
+    """
+    from app.services.learning_log import build_learning_log
+    kinds_filter = None
+    if isinstance(kinds, str) and kinds.strip():
+        kinds_filter = [k.strip() for k in kinds.split(",") if k.strip()]
+    return build_learning_log(cache=cache, limit=limit, kinds=kinds_filter)
+
+
 @app.post("/learning/run-full")
 async def learning_run_full():
     """Run the entire learning pipeline: resolve -> analyze misses -> weekly report."""

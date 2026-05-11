@@ -5,6 +5,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import {
   fetchHistory,
   fetchLearningEntries,
+  fetchLearningLog,
   fetchLearningReports,
   fetchPropsJobResult,
   fetchRankedProps,
@@ -16,7 +17,7 @@ import {
   seedHistory,
   startPropsJob,
 } from "@/lib/api";
-import type { HistoryEntry, LearningEntry, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import type { HistoryEntry, LearningEntry, LearningLogEntry, LearningLogKind, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 import {
   type EntryType,
   availableEntryTypes,
@@ -98,6 +99,25 @@ function fmtPct(x: number | null | undefined) {
 function fmtNum(x: number | null | undefined, digits = 3) {
   if (x === null || x === undefined || Number.isNaN(x)) return "—";
   return x.toFixed(digits);
+}
+
+/** Compact "5 min ago" style relative timestamp for the learning log. */
+function fmtTimeAgo(iso: string | undefined | null): string {
+  if (!iso) return "—";
+  const t = new Date(iso).getTime();
+  if (!isFinite(t)) return "—";
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 45) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 36) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 14) return `${day}d ago`;
+  const wk = Math.floor(day / 7);
+  if (wk < 9) return `${wk}w ago`;
+  const mo = Math.floor(day / 30);
+  return `${mo}mo ago`;
 }
 
 /** Pretty pick description that adapts to market type so game-line legs
@@ -295,14 +315,17 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
 
-  // Learning Mode
+  // Learning Mode (now: unified time-ordered log of model events)
   const [showLearning, setShowLearning] = useState(false);
   const [learningLoading, setLearningLoading] = useState(false);
   const [learningEntries, setLearningEntries] = useState<LearningEntry[]>([]);
   const [learningReports, setLearningReports] = useState<LearningReport[]>([]);
   const [learningError, setLearningError] = useState<string | null>(null);
   const [learningStatus, setLearningStatus] = useState<string | null>(null);
-  const [learningTab, setLearningTab] = useState<"overview" | "misses" | "report">("overview");
+  const [learningLog, setLearningLog] = useState<LearningLogEntry[]>([]);
+  const [learningLogTotals, setLearningLogTotals] = useState<Partial<Record<LearningLogKind, number>>>({});
+  const [logFilter, setLogFilter] = useState<"all" | LearningLogKind>("all");
+  const [expandedLogIds, setExpandedLogIds] = useState<Set<string>>(new Set());
 
   const toggleParlay = useCallback((id: string) => {
     setParlayIds((prev) => {
@@ -458,14 +481,27 @@ export default function Home() {
     setShowLearning(true);
     setLearningError(null);
     try {
-      const [entries, reports] = await Promise.all([
+      const [entries, reports, log] = await Promise.all([
         fetchLearningEntries({ limit: 200 }),
         fetchLearningReports(5),
+        fetchLearningLog({ limit: 80 }),
       ]);
       setLearningEntries(entries);
       setLearningReports(reports);
+      setLearningLog(log.entries || []);
+      setLearningLogTotals(log.totals || {});
     } catch (e: any) {
       setLearningError(e?.message ?? "Failed to load learning data");
+    }
+  }
+
+  async function refreshLearningLog() {
+    try {
+      const log = await fetchLearningLog({ limit: 80 });
+      setLearningLog(log.entries || []);
+      setLearningLogTotals(log.totals || {});
+    } catch {
+      // non-fatal — feed will simply show stale data
     }
   }
 
@@ -524,12 +560,15 @@ export default function Home() {
       summaryParts.push("Report: generated");
 
       // Final refresh
-      const [finalEntries, reports] = await Promise.all([
+      const [finalEntries, reports, log] = await Promise.all([
         fetchLearningEntries({ limit: 200 }),
         fetchLearningReports(5),
+        fetchLearningLog({ limit: 80 }),
       ]);
       setLearningEntries(finalEntries);
       setLearningReports(reports);
+      setLearningLog(log.entries || []);
+      setLearningLogTotals(log.totals || {});
 
       setLearningStatus(summaryParts.join(" · "));
     } catch (e: any) {
@@ -2106,11 +2145,15 @@ export default function Home() {
             </div>
           )}
 
-          {/* --- Learning Mode Section --- */}
+          {/* --- Learning Log Section ---
+              Replaces the old multi-tab Learning Mode UI. Shows a unified
+              time-ordered feed of every model event (calibration runs,
+              tier-model upgrades, miss discoveries, weekly reports,
+              resolved-pick batches) so you can see what changed and when. */}
           {showLearning && (
             <div className="mt-6 rounded-xl border border-violet-200 bg-white p-5 shadow-sm dark:border-violet-800/60 dark:bg-zinc-950">
               <div className="flex items-center justify-between">
-                <h3 className="text-base font-semibold text-violet-900 dark:text-violet-200">Learning Mode</h3>
+                <h3 className="text-base font-semibold text-violet-900 dark:text-violet-200">Learning Log</h3>
                 <div className="flex items-center gap-3">
                   <button
                     className="h-8 rounded-md bg-violet-600 px-4 text-xs font-medium text-white shadow-sm hover:bg-violet-700 disabled:opacity-50 dark:bg-violet-500 dark:hover:bg-violet-400"
@@ -2150,365 +2193,361 @@ export default function Home() {
                 </div>
               )}
 
-              {/* Sub-tabs */}
-              <div className="mt-4 flex gap-1 border-b border-zinc-200 dark:border-zinc-800">
-                {([["overview", "Overview"], ["misses", "Miss Analysis"], ["report", "Weekly Report"]] as const).map(([key, label]) => (
-                  <button
-                    key={key}
-                    className={`px-3 py-2 text-sm font-medium transition-colors ${
-                      learningTab === key
-                        ? "border-b-2 border-violet-600 text-violet-700 dark:border-violet-400 dark:text-violet-300"
-                        : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-                    }`}
-                    onClick={() => setLearningTab(key)}
-                  >
-                    {label}
-                  </button>
-                ))}
+              {/* Compact stats strip — total resolved + hit rate + CLV.
+                  Replaces the old "Overview" tab. Pure read-out, no charts.
+                  Charts live below the log. */}
+              {(() => {
+                const resolved = learningEntries.filter((e) => e.resolved === 1);
+                const hits = resolved.filter((e) => e.hit === 1).length;
+                const total = resolved.length;
+                const rate = total ? hits / total : 0;
+                const withClv = resolved.filter((e) => typeof e.clv_cents === "number");
+                const avgClv = withClv.length
+                  ? withClv.reduce((s, e) => s + (e.clv_cents || 0), 0) / withClv.length
+                  : null;
+                return (
+                  <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div className="rounded-lg border border-zinc-100 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-900/30">
+                      <div className="text-[10px] uppercase tracking-wide text-zinc-500">Resolved picks</div>
+                      <div className="mt-1 font-mono text-xl font-bold">{total}</div>
+                    </div>
+                    <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3 dark:border-emerald-800/40 dark:bg-emerald-950/20">
+                      <div className="text-[10px] uppercase tracking-wide text-emerald-600 dark:text-emerald-400">Hit rate</div>
+                      <div className="mt-1 font-mono text-xl font-bold text-emerald-700 dark:text-emerald-300">
+                        {(rate * 100).toFixed(1)}%
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-violet-100 bg-violet-50/50 p-3 dark:border-violet-800/40 dark:bg-violet-950/20">
+                      <div className="text-[10px] uppercase tracking-wide text-violet-600 dark:text-violet-400">Log events</div>
+                      <div className="mt-1 font-mono text-xl font-bold text-violet-700 dark:text-violet-300">
+                        {learningLog.length}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-zinc-100 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
+                      <div className="text-[10px] uppercase tracking-wide text-zinc-500">Avg CLV</div>
+                      <div className={`mt-1 font-mono text-xl font-bold ${
+                        avgClv !== null && avgClv >= 0 ? "text-emerald-700 dark:text-emerald-300" : avgClv !== null ? "text-rose-600" : "text-zinc-400"
+                      }`}>
+                        {avgClv === null ? "—" : `${avgClv >= 0 ? "+" : ""}${avgClv.toFixed(2)}¢`}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Filter chips — narrow the log to one event source */}
+              <div className="mt-4 flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-zinc-500">Filter:</span>
+                {([
+                  { id: "all", label: "All", count: learningLog.length },
+                  { id: "calibration_run", label: "Calibration", count: learningLogTotals.calibration_run ?? 0 },
+                  { id: "tier_train", label: "Tier model", count: learningLogTotals.tier_train ?? 0 },
+                  { id: "miss_discovery", label: "Discoveries", count: learningLogTotals.miss_discovery ?? 0 },
+                  { id: "resolution_batch", label: "Resolutions", count: learningLogTotals.resolution_batch ?? 0 },
+                  { id: "weekly_report", label: "Reports", count: learningLogTotals.weekly_report ?? 0 },
+                ] as const).map((opt) => {
+                  const active = logFilter === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      onClick={() => setLogFilter(opt.id as typeof logFilter)}
+                      className={
+                        "rounded-full border px-2.5 py-1 transition-colors " +
+                        (active
+                          ? "border-violet-500 bg-violet-100 text-violet-800 dark:border-violet-400 dark:bg-violet-900/40 dark:text-violet-200"
+                          : "border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-900")
+                      }
+                    >
+                      {opt.label} <span className="opacity-60">({opt.count})</span>
+                    </button>
+                  );
+                })}
+                <button
+                  onClick={() => void refreshLearningLog()}
+                  className="ml-auto rounded-md border border-zinc-200 bg-white px-2.5 py-1 text-zinc-600 hover:border-zinc-300 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-900"
+                  title="Re-fetch the model event log"
+                >
+                  Refresh
+                </button>
               </div>
 
-              {/* Overview Tab */}
-              {learningTab === "overview" && (
-                <div className="mt-4">
-                  {learningEntries.length === 0 ? (
-                    <div className="rounded-md border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900/30 dark:text-zinc-400">
-                      <div className="font-medium">No resolved picks yet.</div>
-                      <div className="mt-2 space-y-1 text-xs">
-                        <div>1. Run predictions for a sport (the top 10 picks are saved to history automatically)</div>
-                        <div>2. Wait for those games to finish</div>
-                        <div>3. Click &quot;Run Analysis&quot; to resolve outcomes, diagnose misses, and generate a report</div>
+              {/* The unified time-ordered model-event feed. */}
+              {(() => {
+                const filtered = logFilter === "all"
+                  ? learningLog
+                  : learningLog.filter((e) => e.kind === logFilter);
+                if (filtered.length === 0) {
+                  return (
+                    <div className="mt-4 rounded-md border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/30 dark:text-zinc-400">
+                      <div className="font-medium">No model events yet.</div>
+                      <div className="mt-2 text-xs">
+                        The continuous-learning loops populate this feed as they run.
+                        Calibration cycles, tier-model retrains, miss discoveries, and
+                        weekly reports show up here automatically.
                       </div>
                     </div>
-                  ) : (
-                    <>
-                      {(() => {
-                        const resolved = learningEntries.filter(e => e.resolved === 1);
-                        const hits = resolved.filter(e => e.hit === 1).length;
-                        const misses = resolved.filter(e => e.hit === 0).length;
-                        const total = hits + misses;
-                        const rate = total > 0 ? hits / total : 0;
-                        const catCounts: Record<string, number> = {};
-                        for (const e of resolved.filter(e => e.hit === 0)) {
-                          const cat = e.miss_category || "unanalyzed";
-                          catCounts[cat] = (catCounts[cat] || 0) + 1;
-                        }
-                        return (
-                          <>
-                            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                              <div className="rounded-lg border border-zinc-100 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-900/30">
-                                <div className="text-xs text-zinc-500">Total Resolved</div>
-                                <div className="mt-1 text-xl font-bold font-mono">{total}</div>
-                              </div>
-                              <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3 dark:border-emerald-800/40 dark:bg-emerald-950/20">
-                                <div className="text-xs text-emerald-600 dark:text-emerald-400">Hits</div>
-                                <div className="mt-1 text-xl font-bold font-mono text-emerald-700 dark:text-emerald-300">{hits}</div>
-                              </div>
-                              <div className="rounded-lg border border-rose-100 bg-rose-50/50 p-3 dark:border-rose-800/40 dark:bg-rose-950/20">
-                                <div className="text-xs text-rose-600 dark:text-rose-400">Misses</div>
-                                <div className="mt-1 text-xl font-bold font-mono text-rose-700 dark:text-rose-300">{misses}</div>
-                              </div>
-                              <div className="rounded-lg border border-violet-100 bg-violet-50/50 p-3 dark:border-violet-800/40 dark:bg-violet-950/20">
-                                <div className="text-xs text-violet-600 dark:text-violet-400">Hit Rate</div>
-                                <div className="mt-1 text-xl font-bold font-mono text-violet-700 dark:text-violet-300">
-                                  {(rate * 100).toFixed(1)}%
-                                </div>
-                              </div>
-                            </div>
-
-                            {Object.keys(catCounts).length > 0 && (
-                              <div className="mt-4">
-                                <div className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 mb-2">Miss Breakdown by Category</div>
-                                <div className="flex flex-wrap gap-2">
-                                  {Object.entries(catCounts)
-                                    .sort(([, a], [, b]) => b - a)
-                                    .map(([cat, cnt]) => (
-                                      <div key={cat} className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs text-rose-800 dark:border-rose-800/50 dark:bg-rose-950/30 dark:text-rose-300">
-                                        {cat.replace(/_/g, " ")}: {cnt}
-                                      </div>
-                                    ))}
-                                </div>
-                              </div>
-                            )}
-
-                            {/* Calibration + bankroll visualizations */}
-                            <div className="mt-5 grid gap-4 md:grid-cols-2">
-                              <div className="rounded-lg border border-zinc-100 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
-                                <ReliabilityDiagram entries={learningEntries} />
-                              </div>
-                              <div className="rounded-lg border border-zinc-100 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
-                                <BankrollGrowth entries={learningEntries} />
-                              </div>
-                            </div>
-
-                            {/* CLV summary — average closing-line value across resolved picks */}
-                            {(() => {
-                              const withClv = resolved.filter(
-                                (e) => typeof e.clv_cents === "number"
-                              );
-                              if (withClv.length === 0) return null;
-                              const avgClv =
-                                withClv.reduce((s, e) => s + (e.clv_cents || 0), 0) /
-                                withClv.length;
-                              const positiveClv = withClv.filter(
-                                (e) => (e.clv_cents || 0) > 0
-                              ).length;
-                              const beats = (positiveClv / withClv.length) * 100;
-                              return (
-                                <div className="mt-4 rounded-md border border-emerald-200 bg-emerald-50/40 p-3 dark:border-emerald-900/40 dark:bg-emerald-950/20">
-                                  <div className="text-xs font-semibold text-emerald-800 dark:text-emerald-200">
-                                    Closing-line value (CLV) — single best ROI proxy
-                                  </div>
-                                  <div className="mt-1 grid grid-cols-3 gap-3 text-xs font-mono">
-                                    <div>
-                                      <div className="text-zinc-500">Avg CLV</div>
-                                      <div className={`text-lg font-bold ${avgClv >= 0 ? "text-emerald-700 dark:text-emerald-300" : "text-rose-600"}`}>
-                                        {avgClv >= 0 ? "+" : ""}{avgClv.toFixed(2)}¢
-                                      </div>
-                                    </div>
-                                    <div>
-                                      <div className="text-zinc-500">% beat close</div>
-                                      <div className="text-lg font-bold">{beats.toFixed(0)}%</div>
-                                    </div>
-                                    <div>
-                                      <div className="text-zinc-500">CLV samples</div>
-                                      <div className="text-lg font-bold">{withClv.length}</div>
-                                    </div>
-                                  </div>
-                                </div>
-                              );
-                            })()}
-
-                            <div className="mt-4">
-                              <div className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 mb-2">Recent Picks</div>
-                              <div className="space-y-1 max-h-[300px] overflow-auto">
-                                {resolved.slice(0, 30).map((e) => (
-                                  <div
-                                    key={e.id}
-                                    className={`flex items-center justify-between rounded-md px-3 py-2 text-xs ${
-                                      e.hit === 1
-                                        ? "bg-emerald-50 border border-emerald-100 dark:bg-emerald-950/20 dark:border-emerald-800/30"
-                                        : "bg-rose-50 border border-rose-100 dark:bg-rose-950/20 dark:border-rose-800/30"
-                                    }`}
-                                  >
-                                    <div className="flex items-center gap-2">
-                                      <span className={`font-bold ${e.hit === 1 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
-                                        {e.hit === 1 ? "HIT" : "MISS"}
-                                      </span>
-                                      <span className="font-medium">{e.player_name}</span>
-                                      <span className="text-zinc-500">
-                                        {e.side.toUpperCase()} {e.line} {e.stat}
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center gap-3">
-                                      <span className="font-mono text-zinc-600 dark:text-zinc-400">
-                                        Actual: {e.actual_value !== null ? e.actual_value : "?"}
-                                      </span>
-                                      {typeof e.clv_cents === "number" && (
-                                        <span
-                                          className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
-                                            (e.clv_cents || 0) >= 0
-                                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
-                                              : "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
-                                          }`}
-                                          title="Closing-line value (cents)"
-                                        >
-                                          CLV {(e.clv_cents >= 0 ? "+" : "") + e.clv_cents.toFixed(1)}¢
-                                        </span>
-                                      )}
-                                      <span className="text-zinc-400">{e.sport}</span>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          </>
-                        );
-                      })()}
-                    </>
-                  )}
-                </div>
-              )}
-
-              {/* Miss Analysis Tab */}
-              {learningTab === "misses" && (
-                <div className="mt-4">
-                  {(() => {
-                    const misses = learningEntries.filter(e => e.hit === 0 && e.miss_reason);
-                    if (misses.length === 0) {
+                  );
+                }
+                const KIND_META: Record<LearningLogKind, { label: string; color: string }> = {
+                  calibration_run: { label: "CALIBRATION", color: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200 border-emerald-200 dark:border-emerald-800/50" },
+                  tier_train: { label: "TIER MODEL", color: "bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200 border-violet-200 dark:border-violet-800/50" },
+                  miss_discovery: { label: "DISCOVERY", color: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 border-amber-200 dark:border-amber-800/50" },
+                  resolution_batch: { label: "RESOLVED", color: "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200 border-sky-200 dark:border-sky-800/50" },
+                  weekly_report: { label: "REPORT", color: "bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-900/40 dark:text-fuchsia-200 border-fuchsia-200 dark:border-fuchsia-800/50" },
+                };
+                const STATUS_DOT: Record<string, string> = {
+                  adopted: "bg-emerald-500",
+                  rejected: "bg-rose-500",
+                  skipped: "bg-zinc-400",
+                  info: "bg-sky-500",
+                };
+                return (
+                  <div className="mt-3 space-y-2">
+                    {filtered.map((ev) => {
+                      const meta = KIND_META[ev.kind];
+                      const isOpen = expandedLogIds.has(ev.id);
                       return (
-                        <div className="text-sm text-zinc-500">
-                          No analyzed misses yet. Run the analysis pipeline to diagnose missed picks.
-                        </div>
-                      );
-                    }
-                    return (
-                      <div className="space-y-3 max-h-[500px] overflow-auto">
-                        {misses.map((e) => {
-                          let reason: { explanation?: string; model_lesson?: string; prompt_lesson?: string } = {};
-                          try { reason = JSON.parse(e.miss_reason || "{}"); } catch {}
-                          return (
-                            <div key={e.id} className="rounded-lg border border-rose-100 bg-white p-4 dark:border-rose-800/40 dark:bg-zinc-900/40">
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                  <span className="font-semibold text-sm">{e.player_name}</span>
-                                  <span className="text-xs text-zinc-500">
-                                    {e.side.toUpperCase()} {e.line} {e.stat}
+                        <div
+                          key={ev.id}
+                          className="rounded-lg border border-zinc-200 bg-white p-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-950"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setExpandedLogIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(ev.id)) next.delete(ev.id);
+                                else next.add(ev.id);
+                                return next;
+                              });
+                            }}
+                            className="flex w-full items-start justify-between gap-3 text-left"
+                          >
+                            <div className="flex flex-1 items-start gap-2 min-w-0">
+                              <span
+                                className={`mt-1 inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full ${STATUS_DOT[ev.status] || STATUS_DOT.info}`}
+                                title={`status: ${ev.status}`}
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span
+                                    className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${meta.color}`}
+                                  >
+                                    {meta.label}
                                   </span>
-                                  <span className="text-xs font-mono text-rose-600 dark:text-rose-400">
-                                    Actual: {e.actual_value}
+                                  <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100 truncate">
+                                    {ev.title}
                                   </span>
                                 </div>
-                                <div className="flex items-center gap-2">
-                                  <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
-                                    {(e.miss_category || "unknown").replace(/_/g, " ").toUpperCase()}
-                                  </span>
-                                  <span className="text-[10px] text-zinc-400">{e.sport}</span>
-                                </div>
-                              </div>
-
-                              {reason.explanation && (
-                                <div className="mt-2 text-sm text-zinc-700 dark:text-zinc-300">
-                                  {reason.explanation}
-                                </div>
-                              )}
-
-                              <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                                {reason.model_lesson && (
-                                  <div className="rounded-md border border-amber-100 bg-amber-50/50 p-2 dark:border-amber-800/30 dark:bg-amber-950/20">
-                                    <div className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">Model Lesson</div>
-                                    <div className="mt-1 text-xs text-amber-900 dark:text-amber-200">{reason.model_lesson}</div>
-                                  </div>
-                                )}
-                                {reason.prompt_lesson && (
-                                  <div className="rounded-md border border-blue-100 bg-blue-50/50 p-2 dark:border-blue-800/30 dark:bg-blue-950/20">
-                                    <div className="text-[10px] font-semibold text-blue-700 dark:text-blue-400">AI Prompt Lesson</div>
-                                    <div className="mt-1 text-xs text-blue-900 dark:text-blue-200">{reason.prompt_lesson}</div>
+                                {ev.summary && (
+                                  <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                                    {ev.summary}
                                   </div>
                                 )}
                               </div>
-
-                              <div className="mt-2 flex gap-4 text-[10px] text-zinc-400">
-                                <span>Edge: {e.edge !== null ? (e.edge * 100).toFixed(1) + "%" : "?"}</span>
-                                <span>Model: {e.model_prob !== null ? (e.model_prob * 100).toFixed(1) + "%" : "?"}</span>
-                                <span>AI bias: {e.ai_bias !== null ? e.ai_bias : "?"}</span>
-                              </div>
                             </div>
-                          );
-                        })}
-                      </div>
-                    );
-                  })()}
-                </div>
-              )}
-
-              {/* Weekly Report Tab */}
-              {learningTab === "report" && (
-                <div className="mt-4">
-                  {learningReports.length === 0 ? (
-                    <div className="text-sm text-zinc-500">
-                      No weekly reports yet. Run the analysis pipeline to generate your first report.
-                    </div>
-                  ) : (
-                    <div className="space-y-6">
-                      {learningReports.map((r) => (
-                        <div key={r.id} className="rounded-lg border border-violet-100 bg-white p-5 dark:border-violet-800/40 dark:bg-zinc-900/40">
-                          <div className="flex items-center justify-between mb-4">
-                            <div>
-                              <div className="text-sm font-semibold text-violet-900 dark:text-violet-200">
-                                Weekly Report
-                              </div>
-                              <div className="text-[10px] text-zinc-500">
-                                {new Date(r.week_start).toLocaleDateString()} — {new Date(r.week_end).toLocaleDateString()}
-                              </div>
+                            <div className="flex flex-col items-end gap-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+                              <span title={ev.timestamp || ""}>{fmtTimeAgo(ev.timestamp)}</span>
+                              <span className={`transition-transform ${isOpen ? "rotate-90" : ""}`}>▶</span>
                             </div>
-                            <div className="text-right">
-                              <div className="text-lg font-bold font-mono text-violet-700 dark:text-violet-300">
-                                {(r.hit_rate * 100).toFixed(1)}%
-                              </div>
-                              <div className="text-[10px] text-zinc-500">
-                                {r.hits}/{r.total_picks} hits
-                              </div>
-                            </div>
-                          </div>
+                          </button>
 
-                          {/* Hit rate bar */}
-                          <div className="h-2 w-full rounded-full bg-rose-200 dark:bg-rose-800/40">
-                            <div
-                              className="h-2 rounded-full bg-emerald-500 transition-all"
-                              style={{ width: `${Math.min(100, r.hit_rate * 100)}%` }}
-                            />
-                          </div>
-                          <div className="mt-1 flex justify-between text-[10px] text-zinc-400">
-                            <span>{r.hits} hits</span>
-                            <span>{r.misses} misses</span>
-                          </div>
-
-                          {/* Miss breakdown */}
-                          {r.miss_breakdown && Object.keys(r.miss_breakdown).length > 0 && (
-                            <div className="mt-4">
-                              <div className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 mb-2">Why picks missed</div>
-                              <div className="flex flex-wrap gap-2">
-                                {Object.entries(r.miss_breakdown)
-                                  .sort(([, a], [, b]) => b - a)
-                                  .map(([cat, cnt]) => (
-                                    <div key={cat} className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs text-rose-800 dark:border-rose-800/50 dark:bg-rose-950/30 dark:text-rose-300">
-                                      {cat.replace(/_/g, " ")}: {cnt}
+                          {isOpen && ev.details && (
+                            <div className="mt-3 rounded-md border border-zinc-100 bg-zinc-50 p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900/40">
+                              {/* Tier train — show metric delta and the raw fields */}
+                              {ev.kind === "tier_train" && (
+                                <div className="space-y-1">
+                                  {Object.entries(ev.details as Record<string, unknown>).map(([k, v]) => (
+                                    <div key={k} className="flex justify-between gap-4">
+                                      <span className="text-zinc-500">{k}</span>
+                                      <span className="font-mono text-zinc-800 dark:text-zinc-200 text-right break-all">
+                                        {typeof v === "object" ? JSON.stringify(v) : String(v)}
+                                      </span>
                                     </div>
                                   ))}
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Suggestions */}
-                          {r.suggestions && (
-                            <div className="mt-4 space-y-3">
-                              {r.suggestions.biggest_blind_spot && (
-                                <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-800/40 dark:bg-red-950/20">
-                                  <div className="text-[10px] font-bold text-red-700 dark:text-red-400">BIGGEST BLIND SPOT</div>
-                                  <div className="mt-1 text-sm text-red-900 dark:text-red-200">{r.suggestions.biggest_blind_spot}</div>
                                 </div>
                               )}
 
-                              {r.suggestions.stat_model?.length > 0 && (
-                                <div className="rounded-md border border-amber-100 bg-amber-50/50 p-3 dark:border-amber-800/30 dark:bg-amber-950/20">
-                                  <div className="text-[10px] font-bold text-amber-700 dark:text-amber-400">STATISTICAL MODEL IMPROVEMENTS</div>
-                                  <ul className="mt-2 space-y-1 list-disc pl-4">
-                                    {r.suggestions.stat_model.map((s: string, i: number) => (
-                                      <li key={i} className="text-xs text-amber-900 dark:text-amber-200">{s}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
+                              {/* Calibration run details */}
+                              {ev.kind === "calibration_run" && (() => {
+                                const d = ev.details as Record<string, any>;
+                                return (
+                                  <div className="space-y-2">
+                                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                      {Object.entries(d.metrics || {}).map(([k, v]) => (
+                                        <div key={k} className="rounded border border-zinc-200 bg-white px-2 py-1 dark:border-zinc-800 dark:bg-zinc-950">
+                                          <div className="text-[10px] uppercase text-zinc-500">{k.replace(/_/g, " ")}</div>
+                                          <div className="font-mono text-zinc-800 dark:text-zinc-200">
+                                            {v === null || v === undefined ? "—" : typeof v === "number" ? v.toFixed(4) : String(v)}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                    {d.params && (
+                                      <details className="mt-2">
+                                        <summary className="cursor-pointer text-zinc-500">Calibrated parameters</summary>
+                                        <pre className="mt-1 overflow-auto rounded bg-zinc-100 p-2 text-[10px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
+                                          {JSON.stringify(d.params, null, 2)}
+                                        </pre>
+                                      </details>
+                                    )}
+                                  </div>
+                                );
+                              })()}
 
-                              {r.suggestions.ai_prompt?.length > 0 && (
-                                <div className="rounded-md border border-blue-100 bg-blue-50/50 p-3 dark:border-blue-800/30 dark:bg-blue-950/20">
-                                  <div className="text-[10px] font-bold text-blue-700 dark:text-blue-400">AI PROMPT IMPROVEMENTS</div>
-                                  <ul className="mt-2 space-y-1 list-disc pl-4">
-                                    {r.suggestions.ai_prompt.map((s: string, i: number) => (
-                                      <li key={i} className="text-xs text-blue-900 dark:text-blue-200">{s}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
+                              {/* Resolution batch — show sample */}
+                              {ev.kind === "resolution_batch" && (() => {
+                                const d = ev.details as Record<string, any>;
+                                const samples: any[] = Array.isArray(d.sample_picks) ? d.sample_picks : [];
+                                return (
+                                  <div className="space-y-2">
+                                    <div className="text-zinc-600 dark:text-zinc-400">
+                                      {d.count} picks · {d.hits} hits · {d.misses} misses
+                                    </div>
+                                    {samples.length > 0 && (
+                                      <ul className="space-y-1 max-h-[200px] overflow-auto">
+                                        {samples.map((s, i) => (
+                                          <li
+                                            key={i}
+                                            className={`flex items-center justify-between rounded px-2 py-1 ${
+                                              s.hit === 1
+                                                ? "bg-emerald-50 dark:bg-emerald-950/20"
+                                                : "bg-rose-50 dark:bg-rose-950/20"
+                                            }`}
+                                          >
+                                            <span className="truncate">
+                                              <span className="font-semibold">{s.player_name}</span>{" "}
+                                              <span className="text-zinc-500">
+                                                {s.side?.toUpperCase()} {s.line} {s.stat}
+                                              </span>
+                                            </span>
+                                            <span className="font-mono text-[10px] text-zinc-600 dark:text-zinc-400">
+                                              {s.actual_value ?? "?"} ({s.sport})
+                                            </span>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    )}
+                                  </div>
+                                );
+                              })()}
 
-                              {r.suggestions.general_insights?.length > 0 && (
-                                <div className="rounded-md border border-zinc-200 bg-zinc-50/50 p-3 dark:border-zinc-700 dark:bg-zinc-900/30">
-                                  <div className="text-[10px] font-bold text-zinc-600 dark:text-zinc-400">GENERAL INSIGHTS</div>
-                                  <ul className="mt-2 space-y-1 list-disc pl-4">
-                                    {r.suggestions.general_insights.map((s: string, i: number) => (
-                                      <li key={i} className="text-xs text-zinc-700 dark:text-zinc-300">{s}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
+                              {/* Miss discovery — categories + lessons */}
+                              {ev.kind === "miss_discovery" && (() => {
+                                const d = ev.details as Record<string, any>;
+                                const cats: Record<string, number> = d.categories || {};
+                                const lessons: string[] = Array.isArray(d.lessons) ? d.lessons : [];
+                                const samples: any[] = Array.isArray(d.sample_misses) ? d.sample_misses : [];
+                                return (
+                                  <div className="space-y-2">
+                                    <div className="flex flex-wrap gap-1">
+                                      {Object.entries(cats)
+                                        .sort(([, a], [, b]) => (b as number) - (a as number))
+                                        .map(([cat, cnt]) => (
+                                          <span
+                                            key={cat}
+                                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] text-amber-800 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-300"
+                                          >
+                                            {cat.replace(/_/g, " ")}: {cnt as number}
+                                          </span>
+                                        ))}
+                                    </div>
+                                    {lessons.length > 0 && (
+                                      <div>
+                                        <div className="font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Lessons:</div>
+                                        <ul className="list-disc pl-4 space-y-0.5 text-zinc-700 dark:text-zinc-300">
+                                          {lessons.map((l, i) => (
+                                            <li key={i}>{l}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    {samples.length > 0 && (
+                                      <details>
+                                        <summary className="cursor-pointer text-zinc-500">Sample misses ({samples.length})</summary>
+                                        <ul className="mt-1 space-y-0.5">
+                                          {samples.map((s, i) => (
+                                            <li key={i} className="text-[10px] font-mono text-zinc-600 dark:text-zinc-400">
+                                              {s.player_name} · {s.side?.toUpperCase()} {s.line} {s.stat} · actual {s.actual_value ?? "?"} · {s.miss_category}
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      </details>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+
+                              {/* Weekly report */}
+                              {ev.kind === "weekly_report" && (() => {
+                                const d = ev.details as Record<string, any>;
+                                return (
+                                  <div className="space-y-2">
+                                    <div className="text-zinc-600 dark:text-zinc-400">
+                                      {d.week_start?.slice(0, 10)} – {d.week_end?.slice(0, 10)} · {d.total_picks} picks · {d.hits}/{d.total_picks} hits
+                                    </div>
+                                    {d.biggest_blind_spot && (
+                                      <div className="rounded border border-rose-200 bg-rose-50 p-2 dark:border-rose-800/50 dark:bg-rose-950/30">
+                                        <div className="text-[10px] font-bold text-rose-700 dark:text-rose-400">BIGGEST BLIND SPOT</div>
+                                        <div className="mt-1 text-zinc-800 dark:text-zinc-200">{d.biggest_blind_spot}</div>
+                                      </div>
+                                    )}
+                                    {Array.isArray(d.stat_model_suggestions) && d.stat_model_suggestions.length > 0 && (
+                                      <div>
+                                        <div className="font-semibold text-amber-700 dark:text-amber-400">Stat model:</div>
+                                        <ul className="list-disc pl-4 space-y-0.5">
+                                          {d.stat_model_suggestions.map((s: string, i: number) => (
+                                            <li key={i}>{s}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    {Array.isArray(d.ai_prompt_suggestions) && d.ai_prompt_suggestions.length > 0 && (
+                                      <div>
+                                        <div className="font-semibold text-blue-700 dark:text-blue-400">AI prompt:</div>
+                                        <ul className="list-disc pl-4 space-y-0.5">
+                                          {d.ai_prompt_suggestions.map((s: string, i: number) => (
+                                            <li key={i}>{s}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                    {Array.isArray(d.general_insights) && d.general_insights.length > 0 && (
+                                      <div>
+                                        <div className="font-semibold text-zinc-700 dark:text-zinc-300">Insights:</div>
+                                        <ul className="list-disc pl-4 space-y-0.5">
+                                          {d.general_insights.map((s: string, i: number) => (
+                                            <li key={i}>{s}</li>
+                                          ))}
+                                        </ul>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                             </div>
                           )}
                         </div>
-                      ))}
-                    </div>
-                  )}
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+
+              {/* Calibration + bankroll visualizations — kept as the only
+                  numeric panels under the log because they're the
+                  highest-signal "is this getting better" charts. */}
+              {learningEntries.filter((e) => e.resolved === 1).length > 0 && (
+                <div className="mt-6 grid gap-4 md:grid-cols-2">
+                  <div className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
+                    <ReliabilityDiagram entries={learningEntries} />
+                  </div>
+                  <div className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
+                    <BankrollGrowth entries={learningEntries} />
+                  </div>
                 </div>
               )}
+
             </div>
           )}
 

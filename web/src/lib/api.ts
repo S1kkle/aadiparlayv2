@@ -1,4 +1,4 @@
-import { HistoryEntry, LearningEntry, LearningReport, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import { HistoryEntry, LearningEntry, LearningLogResponse, LearningReport, ParlayRecommendation, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
@@ -181,6 +181,19 @@ export async function fetchLearningReports(limit?: number): Promise<LearningRepo
   if (!res.ok) return [];
   const data = await res.json();
   return (data?.reports ?? []) as LearningReport[];
+}
+
+export async function fetchLearningLog(params?: {
+  limit?: number;
+  kinds?: string[];
+}): Promise<LearningLogResponse> {
+  const backend = getBackendUrl();
+  const url = new URL("/learning/log", backend);
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  if (params?.kinds?.length) url.searchParams.set("kinds", params.kinds.join(","));
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return { entries: [], totals: {}, generated_at: "" };
+  return (await res.json()) as LearningLogResponse;
 }
 
 export async function recommendParlay(params: {
