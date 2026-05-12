@@ -191,8 +191,27 @@ export async function fetchLearningLog(params?: {
   const url = new URL("/learning/log", backend);
   if (params?.limit) url.searchParams.set("limit", String(params.limit));
   if (params?.kinds?.length) url.searchParams.set("kinds", params.kinds.join(","));
-  const res = await fetch(url.toString(), { cache: "no-store" });
-  if (!res.ok) return { entries: [], totals: {}, generated_at: "" };
+  let res: Response;
+  try {
+    res = await fetch(url.toString(), { cache: "no-store" });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      entries: [],
+      totals: {},
+      generated_at: "",
+      load_error: `Network error: ${msg}`,
+    };
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return {
+      entries: [],
+      totals: {},
+      generated_at: "",
+      load_error: `HTTP ${res.status}: ${text || res.statusText}`,
+    };
+  }
   return (await res.json()) as LearningLogResponse;
 }
 

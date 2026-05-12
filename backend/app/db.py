@@ -367,6 +367,38 @@ class SqliteTTLCache:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_learning_pipeline_snapshot(self) -> dict[str, int]:
+        """Row counts for Learning Log empty-state diagnostics (read-only)."""
+        self._ensure_learning_table()
+        self._ensure_calibration_table()
+        with self._connection() as conn:
+            learning_total = int(
+                conn.execute("SELECT COUNT(*) FROM learning_log").fetchone()[0]
+            )
+            learning_resolved = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM learning_log WHERE resolved = 1"
+                ).fetchone()[0]
+            )
+            learning_resolved_scored = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM learning_log WHERE resolved = 1 AND hit IN (0, 1)"
+                ).fetchone()[0]
+            )
+            calibration_runs = int(
+                conn.execute("SELECT COUNT(*) FROM calibration_runs").fetchone()[0]
+            )
+            learning_reports = int(
+                conn.execute("SELECT COUNT(*) FROM learning_reports").fetchone()[0]
+            )
+        return {
+            "learning_total": learning_total,
+            "learning_resolved": learning_resolved,
+            "learning_resolved_scored": learning_resolved_scored,
+            "calibration_runs": calibration_runs,
+            "learning_reports": learning_reports,
+        }
+
     def get_unresolved_learning_entries(self) -> list[dict[str, Any]]:
         self._ensure_learning_table()
         with self._connection() as conn:

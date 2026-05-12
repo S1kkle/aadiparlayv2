@@ -177,10 +177,22 @@ export type LearningLogEntry = {
   details?: Record<string, unknown> | null;
 };
 
+export type LearningPipelineSnapshot = {
+  learning_total: number;
+  learning_resolved: number;
+  learning_resolved_scored: number;
+  calibration_runs: number;
+  learning_reports: number;
+  tier_lineage_entries: number;
+};
+
 export type LearningLogResponse = {
   entries: LearningLogEntry[];
   totals: Partial<Record<LearningLogKind, number>>;
   generated_at: string;
+  snapshot?: LearningPipelineSnapshot;
+  /** Present when the log HTTP request failed (wrong URL, CORS, server down). */
+  load_error?: string;
 };
 
 export type LearningReport = {

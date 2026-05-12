@@ -17,7 +17,7 @@ import {
   seedHistory,
   startPropsJob,
 } from "@/lib/api";
-import type { HistoryEntry, LearningEntry, LearningLogEntry, LearningLogKind, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
+import type { HistoryEntry, LearningEntry, LearningLogEntry, LearningLogKind, LearningPipelineSnapshot, LearningReport, Prop, RankedPropsResponse, SportId } from "@/lib/types";
 import {
   type EntryType,
   availableEntryTypes,
@@ -326,6 +326,8 @@ export default function Home() {
   const [learningLogTotals, setLearningLogTotals] = useState<Partial<Record<LearningLogKind, number>>>({});
   const [logFilter, setLogFilter] = useState<"all" | LearningLogKind>("all");
   const [expandedLogIds, setExpandedLogIds] = useState<Set<string>>(new Set());
+  const [learningLogSnapshot, setLearningLogSnapshot] = useState<LearningPipelineSnapshot | null>(null);
+  const [learningLogLoadError, setLearningLogLoadError] = useState<string | null>(null);
 
   const toggleParlay = useCallback((id: string) => {
     setParlayIds((prev) => {
@@ -480,6 +482,7 @@ export default function Home() {
   async function openLearning() {
     setShowLearning(true);
     setLearningError(null);
+    setLearningLogLoadError(null);
     try {
       const [entries, reports, log] = await Promise.all([
         fetchLearningEntries({ limit: 200 }),
@@ -490,6 +493,8 @@ export default function Home() {
       setLearningReports(reports);
       setLearningLog(log.entries || []);
       setLearningLogTotals(log.totals || {});
+      setLearningLogSnapshot(log.snapshot ?? null);
+      setLearningLogLoadError(log.load_error ?? null);
     } catch (e: any) {
       setLearningError(e?.message ?? "Failed to load learning data");
     }
@@ -497,9 +502,12 @@ export default function Home() {
 
   async function refreshLearningLog() {
     try {
+      setLearningLogLoadError(null);
       const log = await fetchLearningLog({ limit: 80 });
       setLearningLog(log.entries || []);
       setLearningLogTotals(log.totals || {});
+      setLearningLogSnapshot(log.snapshot ?? null);
+      setLearningLogLoadError(log.load_error ?? null);
     } catch {
       // non-fatal — feed will simply show stale data
     }
@@ -569,6 +577,8 @@ export default function Home() {
       setLearningReports(reports);
       setLearningLog(log.entries || []);
       setLearningLogTotals(log.totals || {});
+      setLearningLogSnapshot(log.snapshot ?? null);
+      setLearningLogLoadError(log.load_error ?? null);
 
       setLearningStatus(summaryParts.join(" · "));
     } catch (e: any) {
@@ -2187,6 +2197,18 @@ export default function Home() {
                 </div>
               )}
 
+              {learningLogLoadError && (
+                <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-100">
+                  <div className="font-semibold">Learning Log could not be loaded</div>
+                  <div className="mt-1 font-mono text-xs break-all">{learningLogLoadError}</div>
+                  <div className="mt-2 text-xs text-amber-900/90 dark:text-amber-200/90">
+                    Deployed sites need <code className="rounded bg-amber-100/80 px-1 dark:bg-amber-900/50">NEXT_PUBLIC_BACKEND_URL</code>{" "}
+                    pointing at the same API you use for props. Local dev defaults to{" "}
+                    <span className="font-mono">{backendUrl}</span>.
+                  </div>
+                </div>
+              )}
+
               {learningStatus && !learningLoading && (
                 <div className="mt-3 rounded-md border border-violet-200 bg-violet-50 p-3 text-sm text-violet-800 dark:border-violet-800/50 dark:bg-violet-950/30 dark:text-violet-200">
                   {learningStatus}
@@ -2277,13 +2299,25 @@ export default function Home() {
                   ? learningLog
                   : learningLog.filter((e) => e.kind === logFilter);
                 if (filtered.length === 0) {
+                  const snap = learningLogSnapshot;
                   return (
                     <div className="mt-4 rounded-md border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/30 dark:text-zinc-400">
-                      <div className="font-medium">No model events yet.</div>
+                      <div className="font-medium">No timeline events match this filter (or nothing has been recorded yet).</div>
                       <div className="mt-2 text-xs">
-                        The continuous-learning loops populate this feed as they run.
-                        Calibration cycles, tier-model retrains, miss discoveries, and
-                        weekly reports show up here automatically.
+                        Automatic loops only write here after the server has run long enough: outcome resolution (graded picks),
+                        optional calibration cron, tier-model checks, miss tagging, and weekly reports. On a brand-new database
+                        you will mostly see tier-model &ldquo;skipped&rdquo; rows until enough picks resolve.
+                      </div>
+                      {snap && Object.keys(snap).length > 0 && (
+                        <div className="mt-3 rounded border border-zinc-200 bg-white p-2 font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300">
+                          <div className="mb-1 text-[10px] font-sans font-semibold uppercase tracking-wide text-zinc-500">API database snapshot</div>
+                          <div>learning_log rows: {snap.learning_total ?? "—"} (resolved: {snap.learning_resolved ?? "—"}, scored hits/misses: {snap.learning_resolved_scored ?? "—"})</div>
+                          <div>calibration_runs: {snap.calibration_runs ?? "—"} · learning_reports: {snap.learning_reports ?? "—"} · tier lineage rows: {snap.tier_lineage_entries ?? "—"}</div>
+                        </div>
+                      )}
+                      <div className="mt-3 text-xs">
+                        If <span className="font-mono">resolved</span> stays at 0: load props so top picks are persisted, then wait for games to finish — the resolve loop grades them.
+                        Hosting on ephemeral disks resets SQLite on every deploy unless you attach persistent storage.
                       </div>
                     </div>
                   );

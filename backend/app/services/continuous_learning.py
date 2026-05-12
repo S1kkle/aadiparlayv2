@@ -120,6 +120,7 @@ def maybe_train_tier_model(
     min_new_resolved: int,
     min_total: int,
     force: bool = False,
+    record_skip_attempts: bool = False,
 ) -> dict[str, Any]:
     """Threshold-gated tier-model retrain with no-regression adoption.
 
@@ -130,8 +131,14 @@ def maybe_train_tier_model(
       - `skipped_no_new_data`  — total grew < `min_new_resolved` since last train
       - `train_failed`         — fit returned None (degenerate input)
       - `adopted`              — new model deployed (CV-Brier ≤ current)
-      - `rejected_regression`  — new model trained but CV-Brier worse than current
+      - `rejected_regression` — new model trained but CV-Brier worse than current
       - `error`                — unexpected exception
+
+    `record_skip_attempts`: when True (scheduled `_tier_train_loop` only),
+    low-volume / no-new-data skips are appended to tier lineage so the
+    Learning Log is not empty on fresh installs until the first full fit.
+    Calibration piggyback calls use False to avoid duplicate skip rows every
+    48h alongside the dedicated tier loop.
     """
     from app.services.stat_model import (
         fit_tier_logistic,
@@ -160,27 +167,37 @@ def maybe_train_tier_model(
     new_since = max(0, total_resolved - last_seen)
 
     if total_resolved < min_total:
-        return {
+        outcome = {
             "status": "skipped_low_volume",
             "total_resolved": total_resolved,
             "min_total": min_total,
         }
+        if record_skip_attempts:
+            _append_lineage(cache, {"timestamp": _now_iso(), **outcome})
+        return outcome
 
     if not force and new_since < min_new_resolved:
-        return {
+        outcome = {
             "status": "skipped_no_new_data",
             "total_resolved": total_resolved,
             "new_since_last_train": new_since,
             "min_new_resolved": min_new_resolved,
         }
+        if record_skip_attempts:
+            _append_lineage(cache, {"timestamp": _now_iso(), **outcome})
+        return outcome
 
     try:
         result = fit_tier_logistic(rows)
     except Exception as exc:
         log.exception("continuous_learning: fit_tier_logistic raised")
-        return {"status": "error", "error": str(exc)}
+        outcome_err = {"status": "error", "error": str(exc)}
+        _append_lineage(cache, {"timestamp": _now_iso(), **outcome_err})
+        return outcome_err
     if result is None:
-        return {"status": "train_failed", "total_resolved": total_resolved}
+        outcome = {"status": "train_failed", "total_resolved": total_resolved}
+        _append_lineage(cache, {"timestamp": _now_iso(), **outcome})
+        return outcome
 
     new_metrics = result.get("metrics") or {}
     new_brier = _cv_brier(new_metrics)

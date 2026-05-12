@@ -338,10 +338,18 @@ async def _tier_train_loop() -> None:
                     cache=cache,
                     min_new_resolved=_TIER_TRAIN_MIN_NEW_RESOLVED,
                     min_total=_TIER_TRAIN_MIN_TOTAL,
+                    record_skip_attempts=True,
                 ),
             )
             status = outcome.get("status", "?")
-            if status in ("adopted", "rejected_regression", "train_failed", "error"):
+            if status in (
+                "adopted",
+                "rejected_regression",
+                "train_failed",
+                "error",
+                "skipped_low_volume",
+                "skipped_no_new_data",
+            ):
                 _log.info("Tier-train cycle: %s | %s", status, outcome)
         except Exception:
             _log.exception("Tier-train loop failed")
@@ -395,6 +403,32 @@ async def _warm_league_matchup_caches() -> None:
                 continue
 
 
+async def _bootstrap_learning_visibility() -> None:
+    """Once at startup: if tier lineage is still empty, run a single
+    `maybe_train_tier_model` with `record_skip_attempts=True` so the
+    Learning Log shows *something* on a fresh deploy without waiting for
+    the 12-hour-staggered `_tier_train_loop` first tick.
+
+    Skips immediately when lineage already has entries (restarts / warm DB).
+    """
+    await asyncio.sleep(8)
+    try:
+        from app.services.continuous_learning import get_tier_lineage, maybe_train_tier_model
+        if get_tier_lineage(cache, limit=1):
+            return
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: maybe_train_tier_model(
+                cache=cache,
+                min_new_resolved=_TIER_TRAIN_MIN_NEW_RESOLVED,
+                min_total=_TIER_TRAIN_MIN_TOTAL,
+                record_skip_attempts=True,
+            ),
+        )
+    except Exception:
+        log.exception("Bootstrap learning visibility (tier check) failed")
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Purge stale gamelog caches from old key formats (v1, v2) on startup
@@ -426,6 +460,7 @@ async def _startup() -> None:
     asyncio.create_task(_miss_analysis_loop())
     asyncio.create_task(_tier_train_loop())
     asyncio.create_task(_weekly_report_loop())
+    asyncio.create_task(_bootstrap_learning_visibility())
 
 
 @app.on_event("shutdown")

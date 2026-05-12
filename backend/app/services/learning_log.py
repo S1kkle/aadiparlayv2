@@ -399,8 +399,18 @@ def build_learning_log(
 
     totals = Counter(e["kind"] for e in entries)
 
+    snapshot: dict[str, Any]
+    try:
+        snap = cache.get_learning_pipeline_snapshot()
+        snap["tier_lineage_entries"] = len(get_tier_lineage(cache, limit=100))
+        snapshot = snap
+    except Exception:
+        log.exception("learning_log: snapshot failed")
+        snapshot = {}
+
     return {
         "entries": truncated,
         "totals": dict(totals),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot": snapshot,
     }
