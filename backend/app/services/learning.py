@@ -132,6 +132,39 @@ class LearningService:
                             except (TypeError, ValueError):
                                 continue
 
+                # Online Bayesian update of the per-player posterior using
+                # the freshly-resolved actual_value. Closed-form conjugate
+                # update; the next time this player's prop is ranked the
+                # ranker's `get_hierarchical_prior` will see a sharper
+                # estimate than the static league baseline.
+                try:
+                    from app.services.online_priors import update_player_prior
+                    update_player_prior(
+                        self._cache,
+                        sport=str(p.get("sport") or ""),
+                        stat_field=str(p.get("stat_field") or p.get("stat") or ""),
+                        player=str(p.get("player_name") or ""),
+                        position=p.get("player_position"),
+                        observation=float(actual),
+                    )
+                except Exception:
+                    log.debug("online_priors update failed (non-fatal)", exc_info=True)
+
+                # Online SGD step on the tier-logistic. One step per resolved
+                # outcome — keeps the deployed model tracking drift between
+                # the (slower) batch retrain cycles. The regression-guarded
+                # batch retrain remains the source of truth.
+                try:
+                    from app.services.stat_model import (
+                        online_tier_step, _tier_features_from_dict,
+                    )
+                    feat_dict = dict(p)
+                    feat_dict["side"] = side
+                    feats = _tier_features_from_dict(feat_dict)
+                    online_tier_step(feats, 1 if hit else 0)
+                except Exception:
+                    log.debug("online_tier_step failed (non-fatal)", exc_info=True)
+
                 self._cache.save_learning_entry({
                     "id": lid,
                     "history_id": hid,

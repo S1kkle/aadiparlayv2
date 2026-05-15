@@ -548,6 +548,22 @@ class Ranker:
                 "rank", f"Filtered {out_count} props for OUT/DOUBTFUL injuries"
             )
 
+        # Active-learning diagnostic flag: props whose model_prob sits within
+        # ±0.04 of 50% are exactly the picks we learn the MOST from when they
+        # resolve, because the model is most uncertain there. Tagging a small
+        # number per slate (and persisting them via the history-save path)
+        # systematically increases the information content of `learning_log`.
+        # Capped at 8 per slate to avoid swamping the displayed rankings.
+        diagnostic_count = 0
+        for p in props:
+            if (
+                p.model_prob is not None
+                and 0.46 <= float(p.model_prob) <= 0.54
+                and diagnostic_count < 8
+            ):
+                p.is_diagnostic = True
+                diagnostic_count += 1
+
         props.sort(key=lambda p: (p.score is None, -(p.score or 0.0)))
 
         # --- Deduplicate over/under for same player+stat (#14) ---
@@ -1276,7 +1292,19 @@ class Ranker:
             # Bayesian shrinkage for small samples — shrink toward the LEAGUE/POSITION
             # baseline, NEVER toward the betting line. Falls back to player's own
             # mean when no prior is registered for the (sport, stat) cohort.
-            prior_mean = league_prior_mean(
+            #
+            # Hierarchical-pooled online prior: when the player has accumulated
+            # resolved-outcome history, the three-level pool (player → position
+            # → league) beats the static league prior because it represents a
+            # sharper, time-updated estimate of the player's true mean. Falls
+            # through to the static prior when no online history exists.
+            from app.services.online_priors import get_hierarchical_prior
+            online_prior = get_hierarchical_prior(
+                self._cache,
+                sport=p.sport, stat_field=field_used or "",
+                player=p.player_name, position=p.player_position,
+            )
+            prior_mean = online_prior if online_prior is not None else league_prior_mean(
                 sport=p.sport, stat_field=field_used, position=p.player_position,
                 fallback=params.mu,
             )

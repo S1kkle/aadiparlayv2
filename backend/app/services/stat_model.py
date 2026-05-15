@@ -1215,6 +1215,45 @@ def predict_hit_prob(prop_dict: dict) -> float | None:
     return ez / (1.0 + ez)
 
 
+def online_tier_step(
+    feature_row: list[float],
+    hit: int,
+    *,
+    lr: float = 0.01,
+    l2: float = 0.005,
+) -> dict[str, float] | None:
+    """Apply ONE SGD step to the in-process tier model weights.
+
+    Called from the learning-resolution path so every newly-resolved
+    outcome incrementally nudges the deployed model between batch
+    retrain cycles (typically 24-48h apart). Keeps the model tracking
+    drift continuously instead of stepwise.
+
+    Conservative defaults: small learning rate (0.01) and modest L2
+    keep individual updates from torching the batch-trained weights;
+    the regression guard in the next batch retrain catches any drift
+    that goes off the rails. Returns the new in-sample metrics for
+    debugging or None when no model is loaded.
+    """
+    global _tier_weights
+    with _tier_lock:
+        if _tier_weights is None:
+            return None
+        weights = list(_tier_weights)
+    if len(feature_row) != len(weights):
+        return None
+    z = sum(w * v for w, v in zip(weights, feature_row))
+    p = 1.0 / (1.0 + math.exp(-z)) if z >= 0 else math.exp(z) / (1.0 + math.exp(z))
+    err = p - float(hit)
+    new_weights: list[float] = []
+    for i, (w, v) in enumerate(zip(weights, feature_row)):
+        reg = 0.0 if i == 0 else l2 * w
+        new_weights.append(w - lr * (err * v + reg))
+    with _tier_lock:
+        _tier_weights = new_weights
+    return {"prob_before_step": round(p, 4), "abs_err": round(abs(err), 4)}
+
+
 def _train_logistic(
     X: list[list[float]],
     y: list[int],

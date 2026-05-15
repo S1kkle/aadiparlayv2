@@ -138,6 +138,11 @@ class Prop(BaseModel):
     # derived
     confidence_tier: str | None = None  # "high" | "medium" | "low"
     model_ai_agree: bool | None = None
+    # Active-learning flag: this prop was deliberately selected as a near-50/50
+    # diagnostic pick to maximize information gain about model parameters.
+    # See active learning literature (Springer "Active Thompson Sampling").
+    # Frontend can render these in a separate "Watch these" lane.
+    is_diagnostic: bool | None = None
 
     # final
     score: float | None = None

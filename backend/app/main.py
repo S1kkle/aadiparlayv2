@@ -191,7 +191,12 @@ _CLV_CAPTURE_INTERVAL_MIN = _env_int("CLV_CAPTURE_INTERVAL_MIN", 30)
 # ── Continuous-learning interval knobs ────────────────────────────────
 # All in hours. Defaults pick a reasonable cadence for a single-tenant
 # install with a modest pick volume; tune via env vars in production.
-_RESOLVE_INTERVAL_HOURS = _env_int("RESOLVE_INTERVAL_HOURS", 6)
+# Faster outcome ingestion: 30 min vs the legacy 6h. The resolve loop is
+# cheap on no-op cycles (ESPN client caches gamelog responses; entries that
+# don't have completed games yet short-circuit). Cutting the cadence
+# shortens the feedback loop for the online tier-step + online player
+# priors — every batch retrain has a fresher gradient direction baked in.
+_RESOLVE_INTERVAL_HOURS = float(_env("RESOLVE_INTERVAL_HOURS", "0.5") or "0.5")
 _MISS_ANALYSIS_INTERVAL_HOURS = _env_int("MISS_ANALYSIS_INTERVAL_HOURS", 24)
 _WEEKLY_REPORT_INTERVAL_HOURS = _env_int("WEEKLY_REPORT_INTERVAL_HOURS", 168)
 _TIER_TRAIN_INTERVAL_HOURS = _env_int("TIER_TRAIN_INTERVAL_HOURS", 24)
@@ -295,7 +300,7 @@ async def _resolve_outcomes_loop() -> None:
                 )
         except Exception:
             _log.exception("Resolve-outcomes loop failed")
-        await asyncio.sleep(_RESOLVE_INTERVAL_HOURS * 3600)
+        await asyncio.sleep(int(_RESOLVE_INTERVAL_HOURS * 3600))
 
 
 async def _miss_analysis_loop() -> None:
@@ -358,6 +363,7 @@ async def _tier_train_loop() -> None:
 
 
 _CORRELATIONS_REFRESH_HOURS = _env_int("CORRELATIONS_REFRESH_HOURS", 24)
+_INACTIVE_WATCH_INTERVAL_SEC = _env_int("INACTIVE_WATCH_INTERVAL_SEC", 180)
 
 
 async def _correlations_refresh_loop() -> None:
@@ -528,6 +534,15 @@ async def _startup() -> None:
     asyncio.create_task(_weekly_report_loop())
     asyncio.create_task(_dynamic_priors_refresh_loop())
     asyncio.create_task(_correlations_refresh_loop())
+    # Inactive-list watcher — exploits the 30-90 min stale-line window on
+    # Underdog/PrizePicks after a star scratch. Invalidates AI caches so
+    # the next /props fetch reprices teammates against the fresh roster.
+    from app.services.inactive_watcher import inactive_watcher_loop
+    asyncio.create_task(
+        inactive_watcher_loop(
+            espn_client, cache, interval_seconds=_INACTIVE_WATCH_INTERVAL_SEC,
+        )
+    )
     asyncio.create_task(_bootstrap_learning_visibility())
 
 
@@ -1211,6 +1226,26 @@ async def calibration_tier_model_auto_train(
         ),
     )
     return outcome
+
+
+@app.get("/inactives/recent")
+async def inactives_recent(hours: int = Query(6, ge=1, le=48)):
+    """Recently-detected inactive players (OUT/DOUBTFUL/SUSPENDED).
+
+    Useful for the UI to render a 'fresh inactive' banner so users can
+    take advantage of the typical 30-90 min stale-line window on
+    Underdog/PrizePicks after a star scratch lands on the report.
+    """
+    from app.services.inactive_watcher import get_recent_inactives
+    entries = get_recent_inactives(cache, hours=hours)
+    return {"count": len(entries), "entries": entries}
+
+
+@app.post("/inactives/scan")
+async def inactives_scan():
+    """Manually trigger one inactive-watcher scan cycle."""
+    from app.services.inactive_watcher import scan_all
+    return await scan_all(espn_client, cache)
 
 
 @app.get("/calibration/dynamic-priors")
