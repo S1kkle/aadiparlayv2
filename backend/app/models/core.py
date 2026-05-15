@@ -123,6 +123,12 @@ class Prop(BaseModel):
     ai_risk_factors: list[str] = Field(default_factory=list)
     ai_prob_adjustment: float | None = None  # e.g. +0.05 or -0.03
 
+    # ── Structured features extracted by the LLM (v4 prompt schema) ─────
+    # These are CONSUMED BY THE QUANTITATIVE MODEL, not just rendered as
+    # text. Optional; LLM emits only when injury/news context warrants.
+    ai_play_probability: float | None = None  # P(player actually plays | QUESTIONABLE/DTD/GTD)
+    ai_minutes_delta_pct: float | None = None  # expected minutes shift, % (e.g. +10 when star teammate is out)
+
     # provenance — which prompt revision and calibration snapshot was used.
     # Persisted to learning_log so we can attribute pick performance to
     # specific prompt / model revisions.

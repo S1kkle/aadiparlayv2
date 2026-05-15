@@ -357,6 +357,33 @@ async def _tier_train_loop() -> None:
         await asyncio.sleep(_TIER_TRAIN_INTERVAL_HOURS * 3600)
 
 
+_CORRELATIONS_REFRESH_HOURS = _env_int("CORRELATIONS_REFRESH_HOURS", 24)
+
+
+async def _correlations_refresh_loop() -> None:
+    """Per-(player, stat_a, stat_b) Pearson correlation refresher.
+
+    The static 0.85 same-player parlay penalty over-punishes some pairs
+    (e.g. points+3PM, near r=+0.6 — should be ~0.73 multiplier) and
+    under-punishes others (steals+blocks, near r=+0.05 — should be ~0.98).
+    This loop recomputes empirical correlations from resolved
+    learning_log entries that have both stats measured on the same date.
+    """
+    _log = logging.getLogger("correlations.refresh")
+    await asyncio.sleep(75)  # offset from dynamic-priors refresh
+    while True:
+        try:
+            from app.services.correlations import refresh_correlations
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: refresh_correlations(cache)
+            )
+            if (result or {}).get("status") == "ok":
+                _log.info("Correlations refreshed: %d player-pairs", result.get("n_pairs", 0))
+        except Exception:
+            _log.exception("Correlations refresh failed")
+        await asyncio.sleep(_CORRELATIONS_REFRESH_HOURS * 3600)
+
+
 async def _dynamic_priors_refresh_loop() -> None:
     """Rolling-window league-prior overlay refresher.
 
@@ -500,6 +527,7 @@ async def _startup() -> None:
     asyncio.create_task(_tier_train_loop())
     asyncio.create_task(_weekly_report_loop())
     asyncio.create_task(_dynamic_priors_refresh_loop())
+    asyncio.create_task(_correlations_refresh_loop())
     asyncio.create_task(_bootstrap_learning_visibility())
 
 

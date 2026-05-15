@@ -44,6 +44,54 @@ def fit_normal(series: list[float], *, sigma_floor: float = 1e-6) -> NormalParam
     return NormalParams(mu=mu, sigma=max(sigma_floor, sigma))
 
 
+def filter_garbage_time_games(
+    stat_series: list[float],
+    minutes_series: list[float] | None,
+    *,
+    min_min_share: float = 0.60,
+    min_keep: int = 3,
+) -> tuple[list[float], list[float] | None]:
+    """Drop games where player minutes were materially below their typical
+    workload — a proxy for blowouts, foul-out games, garbage-time-only
+    appearances, and DNP-ish brief appearances.
+
+    Cleaning the Glass / FantasyLabs research shows starter usage is
+    systematically depressed in these low-minute games (because the rest
+    happens against bench lineups, often in junk-time minutes); including
+    them in the training set biases starter μ down and bench μ up. We
+    don't have play-by-play access to do surgical leverage-weighted
+    filtering, but minutes-share-of-median is a robust proxy.
+
+    Lists are assumed parallel and index-0 = most recent. When the filter
+    would leave fewer than `min_keep` games we return the original series
+    untouched — better to model on noisy data than on no data.
+    """
+    if (
+        not stat_series
+        or not minutes_series
+        or len(stat_series) != len(minutes_series)
+        or len(stat_series) < min_keep
+    ):
+        return stat_series, minutes_series
+
+    sorted_mins = sorted(minutes_series)
+    n = len(sorted_mins)
+    median = sorted_mins[n // 2] if n % 2 else (sorted_mins[n // 2 - 1] + sorted_mins[n // 2]) / 2.0
+    if median <= 0:
+        return stat_series, minutes_series
+    threshold = median * min_min_share
+
+    kept_stats: list[float] = []
+    kept_mins: list[float] = []
+    for s, m in zip(stat_series, minutes_series):
+        if m >= threshold:
+            kept_stats.append(s)
+            kept_mins.append(m)
+    if len(kept_stats) < min_keep:
+        return stat_series, minutes_series
+    return kept_stats, kept_mins
+
+
 def fit_normal_weighted(
     series: list[float],
     *,
@@ -311,12 +359,39 @@ def stat_distribution_family(field_name: str | None) -> str:
 
 
 def prob_over_for_field(
-    *, line: float, mean: float, variance: float, field_name: str | None,
+    *,
+    line: float,
+    mean: float,
+    variance: float,
+    field_name: str | None,
+    series: list[float] | None = None,
 ) -> float:
     """Dispatch P(X > line) using the right distribution for the stat type.
 
+    Hurdle/zero-inflated distribution is preferred for stats in `_HURDLE_STATS`
+    when a non-empty `series` is supplied (so we can estimate pi empirically).
+    Without `series`, falls back to the vanilla family dispatch — preserves
+    backwards compatibility for callers that don't track game-level history.
+
     Falls through to Normal for unknown stats and degenerate variance.
     """
+    # Hurdle for zero-heavy counting stats — beats NB/Poisson when
+    # series-empirical zero rate > 0 (almost always for blocks/steals/TDs).
+    if field_name in _HURDLE_STATS and series and len(series) >= 5:
+        nonzero = [v for v in series if v > 0]
+        if nonzero:
+            mu_nz = sum(nonzero) / len(nonzero)
+            var_nz = (
+                sum((v - mu_nz) ** 2 for v in nonzero) / max(1, len(nonzero) - 1)
+                if len(nonzero) >= 2 else max(mu_nz * 1.2, 1.0)
+            )
+        else:
+            mu_nz = max(mean, 1e-3)
+            var_nz = max(variance, mu_nz * 1.2)
+        return hurdle_prob_over(
+            line=line, series=series, mean_nonzero=mu_nz, variance_nonzero=var_nz,
+        )
+
     family = stat_distribution_family(field_name)
     if variance <= 0 or mean <= 0:
         # Degenerate — Normal handles trivial cases gracefully.
@@ -580,6 +655,136 @@ def blowout_minutes_discount(spread: float, avg_minutes: float) -> float:
     if abs_spread <= 14:
         return avg_minutes * 0.90
     return avg_minutes * 0.85
+
+
+def project_minutes_with_uncertainty(
+    *,
+    recent_minutes: list[float],
+    spread: float | None = None,
+    is_b2b: bool = False,
+    rest_days: int | None = None,
+) -> tuple[float, float] | None:
+    """Project next-game minutes plus a standard error for downstream variance
+    propagation.
+
+    Returns (mu_minutes, sigma_minutes) or None when the sample is too small.
+
+    Minutes is the single largest variance source for NBA counting-stat
+    distributions; treating projected minutes as a *point estimate* (the
+    legacy behaviour) systematically under-states σ on stats. The right
+    move is variance-inflation: total stat variance = E[min]^2 * Var(rate)
+    + E[rate]^2 * Var(min) + Var(rate)*Var(min). Callers can add this
+    minutes-uncertainty term to their stat sigma directly.
+
+    Adjustments:
+      - Blowout: apply `blowout_minutes_discount` if spread is provided.
+      - B2B: ~1.5-minute reduction for older starters (well-documented).
+      - Long rest (>=3 days): mild bump back toward avg.
+    """
+    if not recent_minutes or len(recent_minutes) < 3:
+        return None
+    avg = sum(recent_minutes) / len(recent_minutes)
+    if avg <= 0:
+        return None
+    # Recent-game minutes deviation from average — our empirical sigma.
+    var = sum((m - avg) ** 2 for m in recent_minutes) / max(1, len(recent_minutes) - 1)
+    sigma = math.sqrt(var) if var > 0 else 0.0
+
+    mu = avg
+    if spread is not None:
+        mu = blowout_minutes_discount(float(spread), mu)
+    if is_b2b:
+        mu = max(0.0, mu - 1.5)
+    if rest_days is not None and rest_days >= 3:
+        mu = min(48.0, mu + 0.5)
+
+    # Floor sigma at 2 minutes — even rock-solid starters bounce ±2 game-to-
+    # game from foul trouble, garbage time, and game flow. Without a floor,
+    # the variance-inflation term collapses and we under-state stat sigma.
+    sigma = max(2.0, sigma)
+    return (round(mu, 2), round(sigma, 2))
+
+
+# ── Hurdle / zero-inflated count distribution ─────────────────────────
+#
+# Vanilla Negative Binomial / Poisson under-prices the under at 0.5 for
+# stats where a large fraction of player-games are exactly zero (blocks,
+# steals, knockdowns, takedowns, TDs for non-RB/QB skill players).
+# References: https://stats.oarc.ucla.edu/.../Zero_inf_2024_2.html
+#
+# Hurdle parameterization:
+#   P(X = 0)        = pi
+#   P(X = k | X > 0) = truncated NB / Poisson
+# Therefore:
+#   P(X > line) = (1 - pi) * P(X > line | X > 0)
+#                  + 0 if line >= 0  (since X = 0 cannot exceed any non-negative line)
+# We estimate pi from the empirical zero rate of the recent series with a
+# small Bayesian shrink toward 0.20 so a 3-game sample of {0,0,0} doesn't
+# collapse pi to 1.0 (which would set P(X>any line) = 0).
+
+
+def _empirical_zero_rate(series: list[float], *, prior: float = 0.20, k: float = 4.0) -> float:
+    """Bayesian-shrunk empirical zero rate. Shrinkage prior is 0.20 (rough
+    league average across hurdle-suitable counting stats).
+    """
+    if not series:
+        return prior
+    zeros = sum(1 for x in series if x <= 0)
+    n = len(series)
+    return (zeros + k * prior) / (n + k)
+
+
+def hurdle_prob_over(
+    *,
+    line: float,
+    series: list[float],
+    mean_nonzero: float,
+    variance_nonzero: float,
+) -> float:
+    """P(X > line) under a zero-inflated/hurdle Negative Binomial.
+
+    `mean_nonzero` and `variance_nonzero` should be computed on the subset
+    of series where X > 0 (or fall back to the full series mean/var when
+    the non-zero subset is too small).
+
+    Below 0 returns 1.0 (degenerate guard); at line=0 returns (1-pi)
+    exactly, which is the calibrated probability that the stat happens at
+    all this game — the right value for a 0.5 line.
+    """
+    pi = _empirical_zero_rate(series)
+    if line < 0:
+        return 1.0
+    # At line=0: P(X > 0) = 1 - pi
+    if line == 0:
+        return max(0.0, min(1.0, 1.0 - pi))
+    # For positive lines, conditional NB on X > 0. Approximation: use
+    # unconditional NB with the non-zero moments, which over-states tail
+    # mass slightly — but multiplied by (1-pi) the net is a small bias
+    # toward calibration on the under-at-0.5 case we care about.
+    if mean_nonzero <= 0:
+        # No positive-game evidence — defer to pi only.
+        return max(0.0, min(1.0, 1.0 - pi)) * 0.5
+    p_over_given_nonzero = negbin_prob_over(
+        line=line, mean=mean_nonzero, variance=max(variance_nonzero, mean_nonzero * 1.05),
+    )
+    return max(0.0, min(1.0, (1.0 - pi) * p_over_given_nonzero))
+
+
+# Stats whose game-to-game distribution is dominated by zeros — using a
+# vanilla NB/Poisson systematically misprices the under at 0.5 for these.
+# Order matters: this set is consulted by `prob_over_for_field` before
+# the standard family dispatch.
+_HURDLE_STATS: frozenset[str] = frozenset({
+    "blocks",
+    "steals",
+    "knockDowns",
+    "submissions",
+    "takedownsLanded",
+    "rushingTouchdowns",
+    "receivingTouchdowns",
+    "interceptions",  # for QB INT-thrown, almost always 0
+    "blockedShots",
+})
 
 
 def edge_confidence(
@@ -873,6 +1078,15 @@ _TIER_FEATURE_NAMES = (
     "abs_streak_aligned",
     "n_games_norm",
     "ai_confidence",
+    # Interaction terms — capture nonlinearity the raw-feature logistic misses.
+    # Empirical regularity: high edge × high confidence is a much stronger
+    # signal than either alone (steamrolls true positives); low consistency
+    # × strong recent trend is a sucker-trap signal (looks hot but the
+    # underlying distribution is too noisy to trust).
+    "edge_x_confidence",     # edge * edge_confidence
+    "prob_x_consistency",    # (model_prob - 0.5) * stat_consistency
+    "streak_x_hitrate",      # abs_streak_aligned/8 * hit_rate_last10
+    "n_games_x_edge_conf",   # n_games_norm * edge_confidence
 )
 
 
@@ -893,20 +1107,40 @@ def get_tier_model() -> dict | None:
 
 
 def set_tier_model(weights: list[float], *, metrics: dict | None = None) -> None:
+    """Install a fresh tier-logistic model.
+
+    Raises ValueError only on outright corruption (empty / non-numeric). A
+    feature-count mismatch (which now happens at boot when a stale 10-weight
+    blob loads after the schema bumped to 14) is logged but tolerated: the
+    in-process tier weights are simply left at None, which causes
+    `predict_hit_prob` to fall back to the heuristic until the next
+    `maybe_train_tier_model` cycle deploys a fresh fit.
+    """
+    expected = len(_TIER_FEATURE_NAMES)
+    if not weights:
+        raise ValueError("Tier model weights must be non-empty.")
+    if len(weights) != expected:
+        # Forwards-compat: don't crash startup when an old persisted blob
+        # has fewer features than the current schema. Just refuse to install.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Tier model schema mismatch: expected %d weights, got %d. "
+            "Discarding stale model; next training cycle will repopulate.",
+            expected, len(weights),
+        )
+        return
     with _tier_lock:
         global _tier_weights, _tier_metrics
-        if len(weights) != len(_TIER_FEATURE_NAMES):
-            raise ValueError(
-                f"Tier model expects {len(_TIER_FEATURE_NAMES)} weights, got {len(weights)}"
-            )
         _tier_weights = list(weights)
         _tier_metrics = dict(metrics or {})
 
 
 def _tier_features_from_dict(data: dict) -> list[float]:
-    """Build the 10-feature row for tier prediction from a dict-shaped prop/entry.
+    """Build the feature row for tier prediction from a dict-shaped prop/entry.
 
     Robust to None / missing fields. The order MUST match _TIER_FEATURE_NAMES.
+    Currently 14 features: 10 raw + 4 interactions (capture nonlinearity the
+    plain logistic misses without committing to a full GBM dependency).
     """
     def _f(k: str, default: float = 0.0) -> float:
         v = data.get(k)
@@ -930,17 +1164,37 @@ def _tier_features_from_dict(data: dict) -> list[float]:
     n = len(n_games) if isinstance(n_games, list) else 0
     n_norm = min(n / 15.0, 1.0)
 
+    model_prob = _f("model_prob", 0.5)
+    edge = _f("edge", 0.0)
+    kelly = _f("kelly_fraction", 0.0)
+    edge_conf = _f("edge_confidence", 0.0)
+    consistency = _f("stat_consistency", 0.5)
+    hit_rate = _f("hit_rate_last10", 0.5)
+    ai_conf = _f("ai_confidence", 0.5)
+
+    # Interaction features. Centered where appropriate so the intercept
+    # absorbs the bulk shift; otherwise the logistic over-allocates a
+    # coefficient just to undo a constant.
+    edge_x_conf = edge * edge_conf
+    prob_x_consistency = (model_prob - 0.5) * consistency
+    streak_x_hitrate = (streak_aligned / 8.0) * hit_rate
+    n_x_conf = n_norm * edge_conf
+
     return [
         1.0,  # intercept
-        _f("model_prob", 0.5),
-        _f("edge", 0.0),
-        _f("kelly_fraction", 0.0),
-        _f("edge_confidence", 0.0),
-        _f("stat_consistency", 0.5),
-        _f("hit_rate_last10", 0.5),
+        model_prob,
+        edge,
+        kelly,
+        edge_conf,
+        consistency,
+        hit_rate,
         streak_aligned,
         n_norm,
-        _f("ai_confidence", 0.5),
+        ai_conf,
+        edge_x_conf,
+        prob_x_consistency,
+        streak_x_hitrate,
+        n_x_conf,
     ]
 
 

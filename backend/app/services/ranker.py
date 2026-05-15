@@ -28,6 +28,7 @@ from app.services.stat_model import (
     devig_power,
     edge_confidence as compute_edge_confidence,
     edge_skepticism,
+    filter_garbage_time_games,
     fit_normal_weighted,
     get_calibrated_params,
     get_tier_model,
@@ -42,6 +43,7 @@ from app.services.stat_model import (
     predict_hit_prob,
     prob_over,
     prob_over_for_field,
+    project_minutes_with_uncertainty,
     projected_value,
     stat_distribution_family,
     stat_volatility_multiplier,
@@ -655,14 +657,60 @@ class Ranker:
         # treat the LLM as ONE small bounded probability nudge, not three additive
         # signals. The nudge is also applied directly to model_prob so the
         # displayed probability matches the score.
-        AI_MAX_PROB_NUDGE = 0.05
+        #
+        # Per-stat caps reflect where LLM qualitative signal genuinely adds
+        # value versus where it's pure noise:
+        #   - Assists / receptions / receiving_yards: LLM injury + role-context
+        #     signal is materially predictive. Loosen the cap to ±0.07.
+        #   - Hurdle counting stats (blocks, steals, TDs): LLM has essentially
+        #     no information advantage on rare-event distributions; tighten
+        #     to ±0.03 to avoid amplifying noise.
+        #   - Default (points, rebounds, yards, etc.): legacy ±0.05.
+        AI_NUDGE_CAP_BY_STAT: dict[str, float] = {
+            "assists": 0.07,
+            "receptions": 0.07,
+            "receivingYards": 0.07,
+            "blocks": 0.03,
+            "steals": 0.03,
+            "knockDowns": 0.03,
+            "submissions": 0.03,
+            "rushingTouchdowns": 0.03,
+            "receivingTouchdowns": 0.03,
+            "passingTouchdowns": 0.03,
+            "interceptions": 0.03,
+            "blockedShots": 0.03,
+        }
+        AI_NUDGE_DEFAULT_CAP = 0.05
         for p in selected:
             ez, evz, vz = z_by_option.get(p.underdog_option_id, (0.0, 0.0, 0.0))
             ai_adj_raw = float(p.ai_prob_adjustment or 0.0)
-            # Hard cap to ±0.05; the schema lets the LLM emit ±0.15 but we don't
-            # trust uncalibrated nudges that large.
-            ai_adj = max(-AI_MAX_PROB_NUDGE, min(AI_MAX_PROB_NUDGE, ai_adj_raw))
+            cap = AI_NUDGE_CAP_BY_STAT.get(p.stat_field or "", AI_NUDGE_DEFAULT_CAP)
+            ai_adj = max(-cap, min(cap, ai_adj_raw))
             p.ai_prob_adjustment = round(ai_adj, 4)
+
+            # v4 structured-feature consumption: when the LLM emits a
+            # play_probability for an injured-questionable player, *override*
+            # the static INJURY_STATUS_HAIRCUT with the empirical estimate.
+            # The static map has a single 0.92 multiplier for QUESTIONABLE
+            # regardless of how the day's news actually shakes out; the LLM
+            # can read beat-writer signal and produce a sharper estimate.
+            if (
+                p.model_prob is not None
+                and p.ai_play_probability is not None
+                and p.injury_status
+                and p.injury_status.upper().replace("DAY TO DAY", "DAY-TO-DAY") in (
+                    "QUESTIONABLE", "DAY-TO-DAY", "GAME-TIME DECISION"
+                )
+            ):
+                play_p = float(p.ai_play_probability)
+                # Blend model_prob toward 0.5 by complement of play_p — same
+                # mechanism as the static haircut but with a per-player value.
+                p.injury_haircut_applied = round(play_p, 3)
+                p.model_prob = round(0.5 + (p.model_prob - 0.5) * play_p, 4)
+                p.notes.append(
+                    f"AI play_probability override: ×{play_p:.2f} (was static "
+                    f"{INJURY_STATUS_HAIRCUT.get(p.injury_status.upper(), 0.92):.2f})."
+                )
 
             # Apply nudge to model_prob so EV/edge/score all reflect the same
             # number. Recompute edge against the (already de-vigged) market price.
@@ -697,18 +745,26 @@ class Ranker:
         remaining = [p for p in props if p.underdog_option_id not in selected_ids]
         return selected + remaining
 
-    @staticmethod
-    def _correlation_factor(legs: list[Prop]) -> tuple[float, list[str]]:
-        """Heuristic same-game / same-team correlation tax for parlay independence.
+    def _correlation_factor(self, legs: list[Prop]) -> tuple[float, list[str]]:
+        """Same-game / same-team / same-player correlation tax for parlay
+        independence — backed by empirical Pearson estimates when available.
 
         Per Wizard-of-Odds / AgentBets correlation literature, naive product-of-
         probs systematically over-prices correlated parlays. We apply a small
         multiplicative penalty per detected correlation pair:
-        - same player (different stat): not allowed; caller filters but penalize anyway
+        - **same player (different stat)**: prefer the empirical pairwise
+          Pearson r from `correlations.py` when we have ≥5 resolved
+          paired observations; fall back to the legacy 0.85 (≈r=0.20)
+          when no empirical estimate exists.
         - same team:  ~r=0.20, penalty 0.92
         - same game (opposing team): weaker but real, penalty 0.96
         Penalties stack multiplicatively. Notes describe the penalties applied.
         """
+        from app.services.correlations import (
+            correlation_penalty,
+            get_player_stat_correlation,
+        )
+
         if len(legs) < 2:
             return 1.0, []
         notes: list[str] = []
@@ -716,13 +772,22 @@ class Ranker:
         for i in range(len(legs)):
             for j in range(i + 1, len(legs)):
                 a, b = legs[i], legs[j]
-                # Same player on the same stat is disallowed; same player different
-                # stats (e.g. points + rebounds) — strong positive correlation.
                 if a.player_name and a.player_name == b.player_name:
-                    factor *= 0.85
-                    notes.append(
-                        f"{a.player_name} appears on both legs (same-player correlation)."
-                    )
+                    sa = a.stat_field or a.stat or ""
+                    sb = b.stat_field or b.stat or ""
+                    emp_r = get_player_stat_correlation(
+                        self._cache, a.player_name, sa, sb
+                    ) if (self._cache and sa and sb) else None
+                    pen = correlation_penalty(emp_r)
+                    factor *= pen
+                    if emp_r is not None:
+                        notes.append(
+                            f"{a.player_name} {sa}+{sb}: empirical r={emp_r:+.2f} → ×{pen:.2f}."
+                        )
+                    else:
+                        notes.append(
+                            f"{a.player_name} appears on both legs (same-player correlation, default ×{pen:.2f})."
+                        )
                     continue
                 same_game = (
                     a.game_title and b.game_title and a.game_title == b.game_title
@@ -1183,6 +1248,21 @@ class Ranker:
                 p.notes.append("ESPN gamelog has no values for this stat field.")
                 continue
 
+            # Garbage-time / DNP-ish brief-appearance filter (NBA only — minutes
+            # signal is reliable). Drops games where minutes were < 60% of the
+            # player's median minutes; these are systematically biased low-usage
+            # games (foul-outs, blowouts, late-game garbage) and skew μ down for
+            # starters / up for benches. See Cleaning the Glass garbage-time
+            # heuristics for the underlying motivation.
+            if p.sport == "NBA":
+                _mins_for_filter = self._espn.extract_stat_series(
+                    gamelog, field_name="minutes", last_n=self._cfg.last_n,
+                )
+                if _mins_for_filter and len(_mins_for_filter) == len(series):
+                    series, _ = filter_garbage_time_games(
+                        series, [float(x) for x in _mins_for_filter]
+                    )
+
             params = fit_normal_weighted(series, decay=get_calibrated_params().get("decay", 0.88))
             if params is None:
                 p.notes.append("Unable to fit distribution (insufficient ESPN data).")
@@ -1401,12 +1481,53 @@ class Ranker:
             status = injury_status_by_player.get((p.sport, p.player_name))
             p.injury_status = status
 
+            # Minutes-uncertainty variance inflation: when we have a reliable
+            # per-minute rate and a projected-minutes std, propagate σ_min into
+            # σ_stat. Total variance ≈ σ²_rate · μ²_min + σ²_min · μ²_rate
+            # (delta-method approximation; ignores the cross-term, which is
+            # second-order on the player-game timescale we care about).
+            #
+            # Only fires for NBA where we have minutes data. Effect on Gamma/
+            # Gauss stats is a calibrated bump on σ; for NB/Poisson families
+            # the moments propagate cleanly because we re-derive (r, p) from
+            # the bumped variance inside `prob_over_for_field`.
+            if (
+                p.sport == "NBA"
+                and p.per_minute_rate is not None
+                and p.per_minute_rate > 0
+                and p.avg_minutes is not None
+                and p.avg_minutes > 0
+            ):
+                recent_mins_for_var = self._espn.extract_stat_series(
+                    gamelog, field_name="minutes", last_n=8,
+                )
+                if recent_mins_for_var and len(recent_mins_for_var) >= 3:
+                    proj_min = project_minutes_with_uncertainty(
+                        recent_minutes=[float(x) for x in recent_mins_for_var],
+                        spread=p.vegas_spread,
+                        is_b2b=bool(p.is_b2b),
+                        rest_days=p.rest_days,
+                    )
+                    if proj_min is not None:
+                        mu_min, sigma_min = proj_min
+                        if mu_min > 0 and sigma_min > 0:
+                            var_rate = (params.sigma / max(mu_min, 1.0)) ** 2
+                            var_total = var_rate * mu_min * mu_min + (sigma_min ** 2) * (
+                                float(p.per_minute_rate) ** 2
+                            )
+                            inflated_sigma = math.sqrt(var_total)
+                            if inflated_sigma > params.sigma:
+                                params = NormalParams(mu=params.mu, sigma=inflated_sigma)
+
             # Model probability — dispatch by distribution family per stat type.
             # NB > Poisson for over-dispersed counts (points, rebounds, assists);
             # Gamma for skewed continuous yards; Normal as fallback.
+            # The recent `series` enables hurdle-distribution routing for stats
+            # like blocks/steals/TDs where ~30-50% of games are zeros.
             p_over = prob_over_for_field(
                 line=p.line, mean=params.mu, variance=params.sigma * params.sigma,
                 field_name=field_used,
+                series=[float(x) for x in series] if series else None,
             )
             p.model_prob = p_over if p.side == "over" else (1.0 - p_over)
 
@@ -2240,6 +2361,14 @@ class Ranker:
         if isinstance(prob_adj, (int, float)):
             # Hard cap at ±0.05 to align with the calibrated nudge contract.
             p.ai_prob_adjustment = max(-0.05, min(0.05, float(prob_adj)))
+
+        # v4 structured features. Optional; LLM emits only when warranted.
+        play_p = result.get("play_probability")
+        if isinstance(play_p, (int, float)):
+            p.ai_play_probability = max(0.0, min(1.0, float(play_p)))
+        mins_delta = result.get("minutes_delta_pct")
+        if isinstance(mins_delta, (int, float)):
+            p.ai_minutes_delta_pct = max(-25.0, min(25.0, float(mins_delta)))
 
         # Stamp provenance so future learning-log rows can attribute the pick
         # to a specific prompt revision and calibration snapshot. Defer the

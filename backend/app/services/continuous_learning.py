@@ -85,12 +85,21 @@ def _append_lineage(cache: SqliteTTLCache, entry: dict[str, Any], *, max_keep: i
 
 def _current_active_metrics(cache: SqliteTTLCache) -> dict[str, Any] | None:
     """Return the metrics dict of the currently-deployed tier model, or
-    None if no model is deployed. Reads from the canonical `tier_model:v1`
-    cache key written by main.py / fit_tier_logistic so we always compare
-    against the live model rather than a stale local snapshot.
+    None if no model is deployed.
+
+    Schema-aware: when the persisted blob's weight count doesn't match the
+    current `_TIER_FEATURE_NAMES` length (e.g. after a feature schema bump),
+    treat as "no current model" so the next fit is unconditionally adopted.
+    Otherwise we'd compare a walk-forward CV-Brier against a stale K-fold
+    CV-Brier from a model that's structurally a different beast.
     """
+    from app.services.stat_model import _TIER_FEATURE_NAMES
+
     raw = cache.get_json("tier_model:v1")
     if not isinstance(raw, dict):
+        return None
+    weights = raw.get("weights")
+    if not isinstance(weights, list) or len(weights) != len(_TIER_FEATURE_NAMES):
         return None
     metrics = raw.get("metrics")
     if not isinstance(metrics, dict):
