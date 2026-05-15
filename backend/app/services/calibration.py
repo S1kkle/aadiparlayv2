@@ -728,29 +728,45 @@ class CalibrationService:
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
-        # Fit a post-hoc isotonic calibrator from resolved real entries (when
-        # we have enough). The mapping from raw model_prob -> calibrated prob
-        # is applied at request time inside the ranker.
+        # Post-hoc isotonic calibration is now a SEPARATE stage:
+        #
+        #   Stage A (above) — grid_search optimizes raw probability parameters
+        #     (decay, shrinkage_k, vol_*, prob_cap, ...) against Brier.
+        #   Stage B (here)  — re-simulate every resolved real entry under the
+        #     winning Stage A config to get FRESH probs, then fit isotonic on
+        #     (fresh_prob, outcome) pairs.
+        #
+        # The previous implementation fit isotonic on `e.get("model_prob")` —
+        # those values were the predictions saved at pick-time under the
+        # PREVIOUS calibration. After Stage A picks new params, the old probs
+        # are stale, so the isotonic mapping was correcting a model that no
+        # longer existed. Per Niculescu-Mizil & Caruana (ICML 2005), isotonic
+        # must be fit on the same model whose output it will be applied to.
         isotonic_breakpoints = None
         if has_real:
+            fresh_results = _backtest_real_entries(real_entries_flat, best_cfg)
             probs: list[float] = []
             outcomes: list[int] = []
-            for e in real_entries_flat:
-                mp = e.get("model_prob")
-                hit = e.get("hit")
-                if mp is None or hit is None:
-                    continue
-                # Direction-correct the prob: store P(side wins).
-                # Existing model_prob is already side-normalised at write time.
+            for r in fresh_results:
                 try:
-                    probs.append(float(mp))
-                    outcomes.append(1 if int(hit) == 1 else 0)
-                except (TypeError, ValueError):
+                    probs.append(float(r["model_prob"]))
+                    outcomes.append(1 if r["hit"] else 0)
+                except (TypeError, ValueError, KeyError):
                     continue
-            isotonic_breakpoints = fit_isotonic(probs, outcomes)
-            if isotonic_breakpoints:
-                log.info("Isotonic calibrator fit on %d real entries (%d breakpoints)",
-                         len(probs), len(isotonic_breakpoints))
+            if len(probs) >= 50:
+                isotonic_breakpoints = fit_isotonic(probs, outcomes)
+                if isotonic_breakpoints:
+                    log.info(
+                        "Isotonic calibrator fit on %d FRESH (re-simulated) real entries "
+                        "under Stage-A best_cfg (%d breakpoints)",
+                        len(probs), len(isotonic_breakpoints),
+                    )
+            else:
+                log.info(
+                    "Isotonic skipped: only %d re-simulated probs (need >= 50). "
+                    "Falling back to no post-hoc calibration this run.",
+                    len(probs),
+                )
 
         run_record = {
             "id": run_id,

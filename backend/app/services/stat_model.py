@@ -399,33 +399,92 @@ _PRIORS: dict[str, dict[str, dict[str, float]]] = {
 }
 
 
+# ── Dynamic league priors ─────────────────────────────────────────────
+#
+# Hardcoded _PRIORS reflect a snapshot of league-average production from
+# whenever this file was last edited. NBA pace, 3PT rate, and positional
+# usage drift 5-10% over the course of a season; a quarterly calibration
+# run is too slow to keep up. The dynamic overlay below stores rolling
+# 30-day empirical means computed from resolved learning_log entries and
+# is refreshed nightly by `_dynamic_priors_refresh_loop` in main.py.
+#
+# Override priority (high -> low):
+#   1. _DYNAMIC_PRIORS[sport][stat_field][position]  (rolling 30-day empirical)
+#   2. _DYNAMIC_PRIORS[sport][stat_field]["*"]       (rolling 30-day, any position)
+#   3. _PRIORS[sport][stat_field][position]          (hardcoded baseline)
+#   4. _PRIORS[sport][stat_field]["*"]               (hardcoded wildcard)
+#   5. caller-supplied fallback
+#
+# Empirical means are partially-pooled with the hardcoded baseline using
+# weight `n_observations / (n_observations + 5)` so small samples don't
+# yank the prior around.
+
+_dynamic_priors_lock = threading.Lock()
+_DYNAMIC_PRIORS: dict[str, dict[str, dict[str, float]]] = {}
+
+
+def set_dynamic_priors(priors: dict[str, dict[str, dict[str, float]]] | None) -> None:
+    """Hot-load the dynamic-priors overlay. Pass None or {} to disable."""
+    with _dynamic_priors_lock:
+        global _DYNAMIC_PRIORS
+        _DYNAMIC_PRIORS = priors or {}
+
+
+def get_dynamic_priors() -> dict[str, dict[str, dict[str, float]]]:
+    """Read-only snapshot of the active dynamic-priors overlay."""
+    with _dynamic_priors_lock:
+        return {
+            s: {f: dict(p) for f, p in fields.items()}
+            for s, fields in _DYNAMIC_PRIORS.items()
+        }
+
+
+def _lookup_position_prior(
+    stat_priors: dict[str, float], position: str | None
+) -> float | None:
+    if not stat_priors:
+        return None
+    if position:
+        pos = position.strip().upper()
+        if pos in stat_priors:
+            return stat_priors[pos]
+        for key in stat_priors:
+            if key != "*" and (pos.startswith(key) or key.startswith(pos)):
+                return stat_priors[key]
+    return stat_priors.get("*")
+
+
 def league_prior_mean(
     *, sport: str | None, stat_field: str | None, position: str | None = None,
     fallback: float | None = None,
 ) -> float | None:
     """Return a league/position-baseline prior mean for the given stat.
 
-    Falls back through: position-specific -> "*" wildcard -> caller fallback -> None.
+    Checks the dynamic (rolling-30d empirical) overlay first, then falls
+    back to the static _PRIORS, then to the caller's fallback.
     """
     if not sport or not stat_field:
         return fallback
     sport_key = sport.upper()
+
+    with _dynamic_priors_lock:
+        dyn_sport = _DYNAMIC_PRIORS.get(sport_key)
+        if dyn_sport:
+            dyn_stat = dyn_sport.get(stat_field)
+            if dyn_stat:
+                dyn_val = _lookup_position_prior(dyn_stat, position)
+                if dyn_val is not None:
+                    return dyn_val
+
     sport_priors = _PRIORS.get(sport_key)
     if not sport_priors:
         return fallback
     stat_priors = sport_priors.get(stat_field)
     if not stat_priors:
         return fallback
-    if position:
-        pos = position.strip().upper()
-        # Try exact match, then prefix match (e.g. "PG" matches "PG/SG")
-        if pos in stat_priors:
-            return stat_priors[pos]
-        for key in stat_priors:
-            if key != "*" and (pos.startswith(key) or key.startswith(pos)):
-                return stat_priors[key]
-    if "*" in stat_priors:
-        return stat_priors["*"]
+    static_val = _lookup_position_prior(stat_priors, position)
+    if static_val is not None:
+        return static_val
     return fallback
 
 
@@ -962,16 +1021,26 @@ def fit_tier_logistic(
     n_iter: int = 400,
     l2: float = 0.01,
     k_folds: int = 5,
+    cv_strategy: str = "walk_forward",
 ) -> dict | None:
-    """Fit a small logistic regression on resolved learning_log rows with
-    K-fold cross-validation. Reports out-of-fold metrics so the user can tell
-    whether the in-sample fit is over-optimistic.
+    """Fit a logistic regression on resolved learning_log rows with cross-validation.
 
-    `rows` shape: {features (list[float] keyed by _TIER_FEATURE_NAMES), "hit": 0/1}.
-    Returns dict with `weights` (final model trained on full data), in-sample
-    `metrics` and out-of-fold `cv_metrics`.
+    `rows` must be in CHRONOLOGICAL ORDER (oldest first) when cv_strategy is
+    "walk_forward" — required to avoid look-ahead bias from temporal correlation
+    (player streaks, injury cascades, schedule strength rotation). Shuffled
+    K-fold on time-series data systematically over-estimates OOS performance,
+    which corrupts the regression-guard in continuous_learning.maybe_train_tier_model.
 
-    Uses plain-Python batch gradient descent; no scipy/sklearn dependency.
+    `cv_strategy`:
+      - "walk_forward" (default, correct for time-series): expanding training
+        window, sequential validation windows. Each fold trains on
+        rows[0:t] and evaluates on rows[t:t+w]. Five folds by default.
+      - "k_fold" (legacy, retained for ablation): shuffled 5-fold. May
+        over-estimate OOS quality on temporally-correlated data — kept only
+        for backwards-compat in tests.
+
+    Returns: dict(weights, metrics, cv_metrics, feature_names). cv_metrics
+    includes `strategy` so audit logs distinguish honest from optimistic.
     """
     if len(rows) < 30:
         return None
@@ -992,30 +1061,64 @@ def fit_tier_logistic(
         return None
     n = len(X)
 
-    # K-fold CV — out-of-fold metrics are the honest gauge of generalisation.
-    folds_to_use = max(2, min(k_folds, n // 10))
     fold_metrics: list[dict] = []
-    if folds_to_use >= 2:
-        order = list(range(n))
-        rng = random.Random(0)  # deterministic CV
-        rng.shuffle(order)
-        fold_size = n // folds_to_use
-        for f in range(folds_to_use):
-            start = f * fold_size
-            end = (start + fold_size) if f < folds_to_use - 1 else n
-            test_idx = set(order[start:end])
-            X_train = [X[i] for i in range(n) if i not in test_idx]
-            y_train = [y[i] for i in range(n) if i not in test_idx]
-            X_test = [X[i] for i in range(n) if i in test_idx]
-            y_test = [y[i] for i in range(n) if i in test_idx]
-            if not X_train or not X_test:
-                continue
-            w_fold = _train_logistic(X_train, y_train, lr=lr, n_iter=n_iter, l2=l2)
-            fold_metrics.append(_eval_logistic(w_fold, X_test, y_test))
+    strategy_used = cv_strategy
+
+    if cv_strategy == "walk_forward":
+        # Expanding-window walk-forward CV. Train on past, validate on
+        # immediate future. This mirrors how the deployed model is actually
+        # used: predict tomorrow's slate from history we already have.
+        # Splits chosen to give each fold a meaningful (>= 5 row) test set
+        # while keeping the initial training window large enough to fit
+        # 10 features without trivial degeneracy.
+        min_train = max(20, n // 4)
+        remaining = n - min_train
+        if remaining < 5:
+            # Tiny dataset — fall back to a single train/test split.
+            split = max(20, int(n * 0.8))
+            if n - split >= 5:
+                w_fold = _train_logistic(X[:split], y[:split], lr=lr, n_iter=n_iter, l2=l2)
+                fold_metrics.append(_eval_logistic(w_fold, X[split:], y[split:]))
+        else:
+            n_splits = max(2, min(k_folds, remaining // 5))
+            test_size = max(5, remaining // n_splits)
+            for f in range(n_splits):
+                train_end = min_train + f * test_size
+                test_start = train_end
+                test_end = min(test_start + test_size, n)
+                if test_end <= test_start or train_end >= n:
+                    break
+                X_train, y_train = X[:train_end], y[:train_end]
+                X_test, y_test = X[test_start:test_end], y[test_start:test_end]
+                if not X_train or not X_test:
+                    continue
+                w_fold = _train_logistic(X_train, y_train, lr=lr, n_iter=n_iter, l2=l2)
+                fold_metrics.append(_eval_logistic(w_fold, X_test, y_test))
+    else:
+        # Legacy shuffled K-fold — retained behind explicit opt-in only.
+        folds_to_use = max(2, min(k_folds, n // 10))
+        if folds_to_use >= 2:
+            order = list(range(n))
+            rng = random.Random(0)
+            rng.shuffle(order)
+            fold_size = n // folds_to_use
+            for f in range(folds_to_use):
+                start = f * fold_size
+                end = (start + fold_size) if f < folds_to_use - 1 else n
+                test_idx = set(order[start:end])
+                X_train = [X[i] for i in range(n) if i not in test_idx]
+                y_train = [y[i] for i in range(n) if i not in test_idx]
+                X_test = [X[i] for i in range(n) if i in test_idx]
+                y_test = [y[i] for i in range(n) if i in test_idx]
+                if not X_train or not X_test:
+                    continue
+                w_fold = _train_logistic(X_train, y_train, lr=lr, n_iter=n_iter, l2=l2)
+                fold_metrics.append(_eval_logistic(w_fold, X_test, y_test))
 
     cv_metrics: dict | None = None
     if fold_metrics:
         cv_metrics = {
+            "strategy": strategy_used,
             "n_folds": len(fold_metrics),
             "accuracy": sum(m["accuracy"] for m in fold_metrics) / len(fold_metrics),
             "brier": sum(m["brier"] for m in fold_metrics) / len(fold_metrics),

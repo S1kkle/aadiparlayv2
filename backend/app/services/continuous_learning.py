@@ -152,8 +152,14 @@ def maybe_train_tier_model(
         log.exception("continuous_learning: failed to load learning entries")
         return {"status": "error", "error": str(exc)}
 
+    # `get_learning_entries` returns ORDER BY timestamp DESC; walk-forward CV
+    # requires chronological order (oldest first) so each fold trains on the
+    # past and validates on the next-in-time slice. Sorting here keeps the
+    # contract local rather than scattered through fit_tier_logistic.
+    entries_sorted = sorted(entries, key=lambda e: (e.get("timestamp") or ""))
+
     rows: list[dict[str, Any]] = []
-    for e in entries:
+    for e in entries_sorted:
         if e.get("hit") not in (0, 1):
             continue
         try:

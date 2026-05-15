@@ -142,6 +142,7 @@ learning_svc = LearningService(cache=cache, espn=espn_client, llm=llm_client)
 calibration_svc = CalibrationService(cache=cache)
 
 _CALIBRATION_INTERVAL_HOURS = _env_int("CALIBRATION_INTERVAL_HOURS", 48)
+_DYNAMIC_PRIORS_REFRESH_HOURS = _env_int("DYNAMIC_PRIORS_REFRESH_HOURS", 24)
 
 
 async def _calibration_loop() -> None:
@@ -356,6 +357,35 @@ async def _tier_train_loop() -> None:
         await asyncio.sleep(_TIER_TRAIN_INTERVAL_HOURS * 3600)
 
 
+async def _dynamic_priors_refresh_loop() -> None:
+    """Rolling-window league-prior overlay refresher.
+
+    The static `_PRIORS` in stat_model.py reflect a moment-in-time snapshot;
+    NBA pace, 3PT rate, and positional usage drift several percent per
+    month. This loop blends rolling-30d empirical means from resolved
+    learning_log entries with the static baseline (partial pooling by
+    sample count) so the model's Bayesian shrinkage target tracks the
+    current league environment.
+    """
+    _log = logging.getLogger("priors.refresh")
+    await asyncio.sleep(45)  # short initial delay so the first refresh runs near boot
+    while True:
+        try:
+            from app.services.dynamic_priors import refresh_dynamic_priors
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: refresh_dynamic_priors(cache)
+            )
+            if (result or {}).get("status") == "ok":
+                _log.info(
+                    "Dynamic priors refreshed: %d buckets (n_resolved=%d)",
+                    result.get("n_buckets", 0),
+                    result.get("n_resolved", 0),
+                )
+        except Exception:
+            _log.exception("Dynamic priors refresh failed")
+        await asyncio.sleep(_DYNAMIC_PRIORS_REFRESH_HOURS * 3600)
+
+
 async def _weekly_report_loop() -> None:
     """Periodic weekly report generation. Quiet no-op if no resolved data."""
     _log = logging.getLogger("learning.report")
@@ -441,6 +471,15 @@ async def _startup() -> None:
 
     calibration_svc.load_active_params_from_db()
 
+    # Hot-load any previously-persisted dynamic-priors overlay so the model
+    # isn't running on hardcoded baselines for the ~24h until the refresh
+    # loop's first tick completes.
+    try:
+        from app.services.dynamic_priors import load_persisted_dynamic_priors
+        load_persisted_dynamic_priors(cache)
+    except Exception:
+        log.exception("Failed to hot-load persisted dynamic priors at startup")
+
     # Restore the trained confidence-tier model if one exists; falls back
     # silently to the heuristic when absent or corrupt.
     try:
@@ -460,6 +499,7 @@ async def _startup() -> None:
     asyncio.create_task(_miss_analysis_loop())
     asyncio.create_task(_tier_train_loop())
     asyncio.create_task(_weekly_report_loop())
+    asyncio.create_task(_dynamic_priors_refresh_loop())
     asyncio.create_task(_bootstrap_learning_visibility())
 
 
@@ -1088,6 +1128,8 @@ async def calibration_train_tier_model(min_rows: int = Query(30, ge=10, le=10000
     from app.services.stat_model import fit_tier_logistic, _tier_features_from_dict
 
     entries = cache.get_learning_entries(resolved_only=True, limit=10000)
+    # Walk-forward CV requires chronological order (oldest first).
+    entries = sorted(entries, key=lambda e: (e.get("timestamp") or ""))
     rows = []
     for e in entries:
         if e.get("hit") not in (0, 1):
@@ -1141,6 +1183,24 @@ async def calibration_tier_model_auto_train(
         ),
     )
     return outcome
+
+
+@app.get("/calibration/dynamic-priors")
+async def calibration_dynamic_priors():
+    """Inspect the rolling-30d empirical league-prior overlay."""
+    from app.services.stat_model import get_dynamic_priors
+    overlay = get_dynamic_priors()
+    n_buckets = sum(len(stat_map) for sport in overlay.values() for stat_map in sport.values())
+    return {"n_buckets": n_buckets, "overlay": overlay}
+
+
+@app.post("/calibration/dynamic-priors/refresh")
+async def calibration_refresh_dynamic_priors():
+    """Manually trigger the rolling-30d empirical priors refresh."""
+    from app.services.dynamic_priors import refresh_dynamic_priors
+    return await asyncio.get_event_loop().run_in_executor(
+        None, lambda: refresh_dynamic_priors(cache)
+    )
 
 
 @app.get("/calibration/tier-model/lineage")
