@@ -265,10 +265,26 @@ def _stat_field_candidates(*, sport: SportId, stat: str) -> list[str]:
             "takedowns": ["takedownsLanded"],
             "takedowns_landed": ["takedownsLanded"],
             "knockdowns": ["knockDowns"],
+            "knockouts": ["knockDowns"],
             "total_strikes": ["totalStrikesLanded"],
             "total_strikes_landed": ["totalStrikesLanded"],
             "submissions": ["submissions"],
             "advances": ["advances"],
+            # Survival / hazard-model fields — these don't have ESPN gamelog
+            # equivalents; ranker routes them through `mma_hazard` instead
+            # of the counting-stat distribution dispatch.
+            "fight_time": ["__fight_time"],
+            "fight_time_mins": ["__fight_time"],
+            "fight_time_rounds": ["__fight_time"],
+            "fight_total_rounds": ["__fight_time"],
+            "finishes": ["__fight_finishes"],
+            "fight_finishes": ["__fight_finishes"],
+            "fight_pick": ["__fight_pick"],
+            "moneyline": ["__fight_pick"],
+            "round_of_finish": ["__round_of_finish"],
+            "round_of_ko": ["__round_of_ko"],
+            "round_of_sub": ["__round_of_sub"],
+            "round_of_submission": ["__round_of_sub"],
         }
         return mapping.get(raw, []) or mapping.get(s, [])
 
@@ -1801,6 +1817,106 @@ class Ranker:
                 p.notes.append(f"Stat '{p.stat}' not mapped to ESPN MMA stat fields yet.")
                 continue
 
+            # Survival / hazard props ("fight_time", "round_of_finish", etc.)
+            # don't have an ESPN gamelog stat field — they're routed through
+            # the discrete-time hazard model in `mma_hazard.py` which consumes
+            # UFCStats-scraped finish history. Fields prefixed with "__"
+            # signal this path; we set p.model_prob and skip the rest of the
+            # counting-stat pipeline for these props.
+            survival_field = candidates[0] if candidates and candidates[0].startswith("__") else None
+            if survival_field is not None:
+                weight_class = p.player_position  # MMA: position holds weight class
+                scheduled_rounds = 5 if any(
+                    kw in (p.game_title or "").lower()
+                    for kw in ("title", "main event")
+                ) else 3
+                try:
+                    from app.services import mma_hazard
+                    haz_prob: float | None = None
+                    if survival_field == "__fight_time":
+                        # Line is in rounds (e.g. 2.5). Over = fight survives.
+                        haz_prob = mma_hazard.prob_fight_total_rounds(
+                            self._cache,
+                            fighter_a=p.player_name,
+                            fighter_b=p.opponent_abbr or "",
+                            weight_class=weight_class,
+                            line_rounds=float(p.line),
+                            scheduled_rounds=scheduled_rounds,
+                        )
+                    elif survival_field == "__fight_finishes":
+                        haz_prob = mma_hazard.prob_finishes_inside(
+                            self._cache,
+                            fighter_a=p.player_name,
+                            fighter_b=p.opponent_abbr or "",
+                            weight_class=weight_class,
+                            scheduled_rounds=scheduled_rounds,
+                        )
+                    elif survival_field == "__fight_pick":
+                        # Win probability for the named fighter. Without ELO
+                        # ratings this is intentionally weak — we return 0.5
+                        # if we have no UFCStats data so the implied price wins.
+                        f_self = mma_hazard.estimate_fighter_finish_propensity(
+                            self._cache, fighter=p.player_name, weight_class=weight_class,
+                        )
+                        f_opp = mma_hazard.estimate_fighter_finish_propensity(
+                            self._cache, fighter=p.opponent_abbr or "", weight_class=weight_class,
+                        )
+                        # Use career win rates from finish history (proxy).
+                        if (f_self.get("n_career") or 0) >= 3 and (f_opp.get("n_career") or 0) >= 3:
+                            # Crude: P(self wins) proportional to finish_rate * n_career
+                            self_strength = f_self["finish_rate"] * (1 + f_self["n_career"] / 10)
+                            opp_strength = f_opp["finish_rate"] * (1 + f_opp["n_career"] / 10)
+                            haz_prob = self_strength / max(1e-6, self_strength + opp_strength)
+                        else:
+                            haz_prob = 0.5
+                    elif survival_field == "__round_of_finish":
+                        target_round = int(round(float(p.line)))
+                        haz_prob = mma_hazard.prob_round_of_finish(
+                            self._cache,
+                            fighter=p.player_name,
+                            opponent=p.opponent_abbr or "",
+                            weight_class=weight_class,
+                            target_round=target_round,
+                            scheduled_rounds=scheduled_rounds,
+                        )
+                    elif survival_field == "__round_of_ko":
+                        target_round = int(round(float(p.line)))
+                        haz_prob = mma_hazard.prob_round_of_finish(
+                            self._cache,
+                            fighter=p.player_name,
+                            opponent=p.opponent_abbr or "",
+                            weight_class=weight_class,
+                            target_round=target_round,
+                            method_filter="ko",
+                            scheduled_rounds=scheduled_rounds,
+                        )
+                    elif survival_field == "__round_of_sub":
+                        target_round = int(round(float(p.line)))
+                        haz_prob = mma_hazard.prob_round_of_finish(
+                            self._cache,
+                            fighter=p.player_name,
+                            opponent=p.opponent_abbr or "",
+                            weight_class=weight_class,
+                            target_round=target_round,
+                            method_filter="sub",
+                            scheduled_rounds=scheduled_rounds,
+                        )
+
+                    if haz_prob is not None:
+                        # For OVER side use as-is; for UNDER use the complement.
+                        p.model_prob = round(
+                            haz_prob if p.side == "over" else (1.0 - haz_prob), 4,
+                        )
+                        p.stat_field = survival_field
+                        p.notes.append(
+                            f"Hazard model ({survival_field.lstrip('_')}): "
+                            f"P({p.side})={p.model_prob}"
+                        )
+                except Exception as e:
+                    p.notes.append(f"Hazard model unavailable for {survival_field}: {e}")
+                # Skip the rest of the counting-stat pipeline for survival props.
+                continue
+
             series: list[float] = []
             field_used: str | None = None
             for field in candidates:
@@ -1902,6 +2018,38 @@ class Ranker:
                             f"Opponent-style factor (×{opp_factor:.3f}) applied based on "
                             f"{p.opponent_abbr}'s career striking/grappling volume."
                         )
+
+            # UFCStats enrichment: when the scraper has populated per-round
+            # data for both fighters, compute style matchup factor and apply
+            # to striking stats. This is the single highest-ROI MMA feature
+            # per the research synthesis (rock-paper-scissors striker vs
+            # grappler) — no-ops cleanly when UFCStats data is absent.
+            if p.opponent_abbr and field_used in ("sigStrikesLanded", "totalStrikesLanded"):
+                try:
+                    from app.services.mma_style import get_fighter_style, matchup_factor
+                    f_style, f_agg = get_fighter_style(self._cache, fighter=p.player_name)
+                    o_style, _ = get_fighter_style(self._cache, fighter=p.opponent_abbr)
+                    if f_style != "unknown" and o_style != "unknown":
+                        sm_factor = matchup_factor(f_style, o_style)
+                        if abs(sm_factor - 1.0) > 0.01:
+                            params = NormalParams(
+                                mu=params.mu * sm_factor, sigma=params.sigma,
+                            )
+                            p.notes.append(
+                                f"UFCStats style matchup: {f_style} vs {o_style} "
+                                f"→ ×{sm_factor:.2f} on μ."
+                            )
+                    # Per-minute rate / control time / head-strike pct — store
+                    # for AI prompt + downstream feature richness.
+                    if f_agg:
+                        p.notes.append(
+                            f"UFCStats per-min: SLpM={f_agg.get('sig_strikes_per_min')}, "
+                            f"SApM={f_agg.get('sig_strikes_absorbed_pm')}, "
+                            f"TD/15={f_agg.get('takedowns_per_15min')}, "
+                            f"Ctrl%={f_agg.get('control_time_pct')}"
+                        )
+                except Exception:
+                    pass  # UFCStats DB not populated yet; silent no-op
 
             p.volatility = float(params.sigma)
             p.stat_field = field_used

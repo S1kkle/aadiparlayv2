@@ -1228,6 +1228,57 @@ async def calibration_tier_model_auto_train(
     return outcome
 
 
+@app.get("/ufcstats/status")
+async def ufcstats_status():
+    """Read-only snapshot of the UFCStats scraper's persisted DB."""
+    from app.services.ufcstats_db import get_scraper_status
+    return get_scraper_status(cache)
+
+
+@app.post("/ufcstats/scrape")
+async def ufcstats_scrape(
+    max_events: int = Query(10, ge=1, le=100),
+    delay_seconds: float = Query(2.0, ge=0.5, le=10.0),
+    x_cron_token: str | None = Header(default=None, alias="X-Cron-Token"),
+):
+    """Trigger the UFCStats scraper.
+
+    When CRON_TOKEN env var is set, the X-Cron-Token header must match —
+    use this from a Render Cron Job to schedule scraping. Without the
+    env var, the endpoint is open for manual invocation.
+
+    The scraper is conservative by design: 2s delay between requests,
+    resumes from the latest event already in the DB, no headless browser.
+    """
+    if _CRON_TOKEN_ENV and (x_cron_token or "").strip() != _CRON_TOKEN_ENV:
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "message": "invalid X-Cron-Token"},
+        )
+    from app.services.ufcstats_scraper import scrape_ufcstats
+    result = await scrape_ufcstats(
+        cache, max_events=max_events, delay_seconds=delay_seconds,
+    )
+    return result
+
+
+@app.get("/ufcstats/fighter/{fighter_name}")
+async def ufcstats_fighter(fighter_name: str, last_n: int = Query(8, ge=1, le=20)):
+    """Per-fighter aggregates from the UFCStats DB — SLpM/SApM/TD/15min/
+    control_time_pct, plus style classification. Empty payload when no
+    UFCStats history exists for this fighter."""
+    from app.services.mma_style import get_fighter_style
+    from app.services.ufcstats_db import get_fighter_recent_fights
+    style, agg = get_fighter_style(cache, fighter=fighter_name, last_n_fights=last_n)
+    recent = get_fighter_recent_fights(cache, fighter=fighter_name, limit=last_n)
+    return {
+        "fighter": fighter_name,
+        "style": style,
+        "per_minute": agg,
+        "recent_fights": recent,
+    }
+
+
 @app.get("/inactives/recent")
 async def inactives_recent(hours: int = Query(6, ge=1, le=48)):
     """Recently-detected inactive players (OUT/DOUBTFUL/SUSPENDED).
