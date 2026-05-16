@@ -611,14 +611,28 @@ class Ranker:
                 raise RuntimeError("Ollama not available.")
 
             # --- Step 1: AI selection — let AI pick the best N from top candidates ---
-            # Deduplicate candidate pool: one prop per player (best score)
-            _seen_players: set[str] = set()
+            # Deduplicate candidate pool by (player, stat-type) — NOT by player
+            # alone. The old player-only dedup was throwing away every prop
+            # type except the highest-scoring one per fighter, which for MMA
+            # meant sig strikes dominated and fight time / takedowns / round
+            # of finish were never even SHOWN to the AI selector. The fix
+            # lets every distinct stat type per fighter survive into the
+            # candidate pool so the AI can evaluate them all and pick whatever
+            # actually scores best — including all sig strikes if that's
+            # genuinely the right call. We don't impose a stat-type quota:
+            # if the model thinks 9 sig strikes is right, that stands.
+            def _stat_key(p: Prop) -> str:
+                return (p.display_stat or p.stat or "").lower().strip()
+            _seen_ps: set[tuple[str, str]] = set()
             _deduped_pool: list[Prop] = []
             for p in props:
-                if p.player_name not in _seen_players:
-                    _seen_players.add(p.player_name)
+                key = (p.player_name, _stat_key(p))
+                if key not in _seen_ps:
+                    _seen_ps.add(key)
                     _deduped_pool.append(p)
-            candidate_pool = _deduped_pool[:min(40, len(_deduped_pool))]
+            # Pool size increased from 40 → 60 because the dedup now produces
+            # more candidates per fighter (several stat types instead of one).
+            candidate_pool = _deduped_pool[:min(60, len(_deduped_pool))]
 
             await _emit_stage("ai_select", f"AI selecting best {require_ai_count} from {len(candidate_pool)} candidates...")
 
@@ -627,18 +641,25 @@ class Ranker:
             )
 
             ai_picks: list[Prop] = []
-            seen_pick_players: set[str] = set()
+            # Dedup the AI's selections by (player, stat-type) — matches the
+            # candidate-pool dedup so an AI that picked 'Pereira sig strikes'
+            # AND 'Pereira fight time' keeps BOTH, but a degenerate model
+            # that picked 'Pereira sig strikes' twice with different lines
+            # still collapses to one.
+            seen_pick_keys: set[tuple[str, str]] = set()
             if ai_selected_indices:
                 for idx in ai_selected_indices:
                     if 0 <= idx < len(candidate_pool):
                         p = candidate_pool[idx]
-                        if p.player_name not in seen_pick_players:
-                            seen_pick_players.add(p.player_name)
+                        key = (p.player_name, _stat_key(p))
+                        if key not in seen_pick_keys:
+                            seen_pick_keys.add(key)
                             ai_picks.append(p)
             if len(ai_picks) < require_ai_count:
                 for p in candidate_pool:
-                    if p.player_name not in seen_pick_players:
-                        seen_pick_players.add(p.player_name)
+                    key = (p.player_name, _stat_key(p))
+                    if key not in seen_pick_keys:
+                        seen_pick_keys.add(key)
                         ai_picks.append(p)
                         if len(ai_picks) >= require_ai_count:
                             break
