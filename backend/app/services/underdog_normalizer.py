@@ -1,10 +1,81 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any
 
 from app.models.core import MarketType, Prop, SportId, SubjectKind
+
+
+# Pattern for splitting MMA / 1v1 sport game titles. Handles:
+#   "Fighter A vs Fighter B"
+#   "Fighter A vs. Fighter B"
+#   "Fighter A VS Fighter B"
+#   "Fighter A vs.  Fighter B"  (double space)
+_VS_SPLIT_RE = re.compile(r"\s+vs\.?\s+", re.IGNORECASE)
+
+
+def _canon_name(name: str) -> str:
+    """Lower-case, strip diacritics, drop non-alphanumeric. Use ONLY for
+    name comparison — preserves the original for display elsewhere.
+
+    Mirrors the canonicalizer in `clients/espn.py` so MMA name-matching
+    behaves consistently across modules. Example:
+      "Jiří Procházka, Jr." → "jiriprochazkajr"
+    """
+    if not name:
+        return ""
+    # NFKD decomposes accents → base char + combining mark; filter combining.
+    nfkd = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", stripped.lower())
+
+
+def _parse_vs_title(title: str) -> tuple[str | None, str | None]:
+    """Split an MMA/1v1 game title on the 'vs' separator."""
+    parts = _VS_SPLIT_RE.split(title, maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    a, b = parts[0].strip(), parts[1].strip()
+    if not a or not b:
+        return None, None
+    return a, b
+
+
+def _matches_fighter(player: dict[str, Any] | None, candidate: str) -> bool:
+    """True if `candidate` (a side of the 'A vs B' title) refers to the
+    given Underdog player record. Tries, in order:
+
+      1. Full name substring (preserves the legacy fast path).
+      2. Last-name word-boundary match (handles 'J. Aldo' / 'C. Sandhagen'
+         where the title abbreviates the first name).
+      3. Canonicalized substring (strips diacritics, punctuation, case).
+
+    Returns False when player is None or no strategy hits.
+    """
+    if not player or not candidate:
+        return False
+    first = (player.get("first_name") or "").strip()
+    last = (player.get("last_name") or "").strip()
+    full = f"{first} {last}".strip()
+    if not full:
+        full = (player.get("full_name") or "").strip()
+    if not full:
+        return False
+
+    cand_lower = candidate.lower()
+    if full.lower() in cand_lower:
+        return True
+
+    # Last-name word match — survives first-name abbreviations.
+    if last:
+        last_lower = last.lower()
+        if re.search(rf"\b{re.escape(last_lower)}\b", cand_lower):
+            return True
+
+    # Canonicalized comparison — survives diacritics and punctuation.
+    return _canon_name(full) and _canon_name(full) in _canon_name(candidate)
 
 
 # Regex heuristics for detecting non-player markets purely from the stat
@@ -200,22 +271,35 @@ def normalize_underdog_over_under_lines(payload: dict[str, Any]) -> list[Prop]:
                     else:
                         team_abbr, opp_abbr = None, None
                 elif isinstance(abbr_title, str) and " vs" in abbr_title.lower():
-                    # MMA / 1v1 sport: "Fighter A vs. Fighter B" or "Fighter A vs Fighter B"
-                    import re as _re
-                    parts = _re.split(r"\s+vs\.?\s+", abbr_title, maxsplit=1, flags=_re.IGNORECASE)
-                    if len(parts) == 2:
-                        a_name, b_name = parts[0].strip(), parts[1].strip()
-                        player_full = ""
-                        if player:
-                            first = player.get("first_name") or ""
-                            last = player.get("last_name") or ""
-                            player_full = (first + " " + last).strip().lower()
-                        if player_full and player_full in a_name.lower():
-                            opp_abbr = b_name
-                        elif player_full and player_full in b_name.lower():
-                            opp_abbr = a_name
+                    # MMA / 1v1 sport: "Fighter A vs. Fighter B" or "Fighter A vs Fighter B".
+                    # Robust name-matching: exact substring → last-name word
+                    # match → diacritic-stripped substring. Without this, fighters
+                    # with accented names (Procházka, Błachowicz), abbreviated
+                    # title strings (J. Aldo vs C. Sandhagen), or nicknames in
+                    # the title fall through to opp_abbr=None and the UI
+                    # renders "? vs ?". We also populate team_abbr with the
+                    # fighter's own name so the matchup displays correctly —
+                    # MMA has no team concept, but the display layer expects
+                    # both sides.
+                    a_name, b_name = _parse_vs_title(abbr_title)
+                    if a_name and b_name:
+                        player_is_a = _matches_fighter(player, a_name)
+                        player_is_b = _matches_fighter(player, b_name)
+                        if player_is_a:
+                            team_abbr, opp_abbr = a_name, b_name
+                        elif player_is_b:
+                            team_abbr, opp_abbr = b_name, a_name
                         else:
-                            opp_abbr = None
+                            # Last resort: when we can't determine which fighter
+                            # is the prop subject, use the resolved player name
+                            # itself (built later from first/last fields) as
+                            # team_abbr and assume the OTHER name is opponent.
+                            # This is the right call when the player record is
+                            # present but the title uses a different
+                            # transliteration. Setting both side names ensures
+                            # the UI / AI prompt still shows the matchup.
+                            team_abbr = a_name
+                            opp_abbr = b_name
                 dt_raw = game.get("scheduled_at")
                 if isinstance(dt_raw, str):
                     try:

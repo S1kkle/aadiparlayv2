@@ -2423,12 +2423,29 @@ class Ranker:
 
             if is_mma:
                 sport_rules = (
-                    "- Analyze the matchup between the two fighters (striking vs grappling, style clashes, reach/weight advantages).\n"
-                    "- Consider recent fight outcomes (wins/losses, finishes vs decisions, activity level).\n"
-                    "- Mention key career stats from MATCHUP_CONTEXT if available (SLpM, TDAcc, etc.).\n"
+                    "- THIS IS A 1v1 FIGHT — your analysis MUST explicitly frame the matchup\n"
+                    "  between the two fighters by name. Reference both fighters in `summary`.\n"
+                    "- Analyze style matchup (striker vs grappler, wrestler vs BJJ, reach +/- ).\n"
+                    "  Style is the dominant covariate in MMA — a high-volume striker against a\n"
+                    "  control wrestler will produce VERY different sig-strike totals than the same\n"
+                    "  striker against another striker.\n"
+                    "- Consider recent fight outcomes (wins/losses, finishes vs decisions, layoff).\n"
+                    "- Mention key career stats from MATCHUP_CONTEXT if available (SLpM, SApM, TDAcc).\n"
                     "- Fighters compete infrequently; note the time gap between fights if significant.\n"
+                    "- Weight class matters: heavyweight = 66% finish rate, women's strawweight = 33%.\n"
                 )
-                context_label = f"Fight: {p.game_title or 'N/A'}\nFighter: {p.player_name} vs {p.opponent_abbr or '?'}"
+                # Explicit matchup framing — even if opponent_abbr ends up
+                # None (rare after normalizer fix), surface the full game
+                # title and player name so the LLM still gets context.
+                fighter_a = p.team_abbr or p.player_name
+                fighter_b = p.opponent_abbr or "Unknown Opponent"
+                wc = p.player_position or "Unknown"
+                context_label = (
+                    f"Fight: {p.game_title or f'{fighter_a} vs {fighter_b}'}\n"
+                    f"Prop subject (the fighter this leg is on): {p.player_name}\n"
+                    f"Matchup: {fighter_a} vs {fighter_b}\n"
+                    f"Weight class: {wc}"
+                )
                 recent_label = "Recent fights (most recent first):"
                 vs_label = "Previous fights vs this opponent:"
             else:
