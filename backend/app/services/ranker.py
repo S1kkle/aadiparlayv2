@@ -1748,6 +1748,8 @@ class Ranker:
         """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog.
 
         Adds MMA-specific adjustments that don't apply to team sports:
+        - Card-index enrichment (ESPN scoreboard) to backfill matchup
+          info Underdog's payload doesn't reliably include
         - Opponent style/exchange factor (opponent's career SLpM/TDA/SubAvg)
         - Layoff (ring-rust) regression to prior for > 90-day inactivity
         - Era decay on the prior so a fighter's recent fights dominate
@@ -1762,6 +1764,60 @@ class Ranker:
         )
 
         assert self._espn is not None
+
+        # ── Card-index enrichment ──
+        # Underdog's payload sometimes omits the matchup string for MMA
+        # props, leaving team_abbr / opponent_abbr / game_title empty.
+        # Pull the upcoming fight card from ESPN's scoreboard and use it
+        # to backfill those fields. Looks up each prop's fighter via
+        # canonicalized name match (diacritic + punctuation tolerant).
+        try:
+            card_index = await self._espn.fetch_mma_card_index()
+        except Exception:
+            card_index = {}
+
+        if card_index:
+            from app.clients.espn import _canon_name as _canon
+            from datetime import datetime as _dt
+            enriched = 0
+            for p in props:
+                canon = _canon(p.player_name)
+                entry = card_index.get(canon)
+                if not entry:
+                    # Try last-word match (handles "C. McGregor" vs full record).
+                    last_word = p.player_name.split()[-1] if p.player_name else ""
+                    if last_word:
+                        canon_lw = _canon(last_word)
+                        for k, v in card_index.items():
+                            if canon_lw and (k.endswith(canon_lw) or canon_lw in k):
+                                entry = v
+                                break
+                if not entry:
+                    continue
+                # Backfill only fields that are missing — never overwrite
+                # Underdog-provided values (they take precedence when present).
+                if not p.team_abbr:
+                    p.team_abbr = entry.get("fighter_name") or p.player_name
+                if not p.opponent_abbr:
+                    p.opponent_abbr = entry.get("opponent_name")
+                if not p.game_title:
+                    p.game_title = entry.get("event_title")
+                if not p.player_position and entry.get("weight_class"):
+                    p.player_position = entry.get("weight_class")
+                if not p.scheduled_at and isinstance(entry.get("scheduled_at"), str):
+                    try:
+                        p.scheduled_at = _dt.fromisoformat(
+                            entry["scheduled_at"].replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                enriched += 1
+            if enriched:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "MMA card-index enrichment: backfilled matchup info for %d/%d props",
+                    enriched, len(props),
+                )
 
         unique_fighters: list[str] = []
         seen: set[str] = set()

@@ -481,6 +481,154 @@ class EspnClient:
             self._cache.set_json(cache_key, results, ttl_seconds=12 * 60 * 60)
         return results
 
+    async def fetch_mma_scoreboard(self, *, league: str = "ufc") -> dict[str, Any]:
+        """Fetch the MMA scoreboard for a league (UFC by default).
+
+        ESPN's scoreboard endpoint returns the current week's events plus
+        each event's full card — every scheduled fight with both
+        competitors. This is the canonical source for "who's fighting on
+        this weekend's card" that we use to backfill matchup info
+        Underdog's payload doesn't reliably include for MMA.
+
+        Result is cached for 30 minutes — fights occasionally get added
+        or pulled in the 24h before a card, but not more frequently
+        than that.
+        """
+        cache_key = f"espn:mma_scoreboard:{league}"
+        cached = self._cache.get_json(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        url = f"{self._cfg.site_api_base}/apis/site/v2/sports/mma/{league}/scoreboard"
+        try:
+            data = await self._get_json(url)
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            self._cache.set_json(cache_key, data, ttl_seconds=30 * 60)
+        return data if isinstance(data, dict) else {}
+
+    async def fetch_mma_card_index(
+        self, *, leagues: tuple[str, ...] = ("ufc",), upcoming_days: int = 14,
+    ) -> dict[str, dict[str, Any]]:
+        """Build a name → matchup lookup index from the MMA scoreboard.
+
+        Returns a dict keyed by canonicalized fighter name with values:
+          {
+            "fighter_name": "Display Name",
+            "opponent_name": "Display Name",
+            "opponent_canon": "<canonical>",
+            "event_title": "UFC 311: ...",
+            "scheduled_at": "ISO datetime",
+            "weight_class": "Lightweight" (or None),
+            "is_main_event": True/False,
+          }
+
+        Covers all leagues passed in `leagues` (default: just UFC; can
+        expand to "pfl", "bellator", "one" if/when Underdog props those).
+        Only includes events scheduled within `upcoming_days`, plus past
+        events from the last 3 days (so a Saturday card whose props are
+        still live Sunday afternoon resolves).
+
+        Idempotent and cache-friendly — safe to call multiple times per
+        slate.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cache_key = f"espn:mma_card_index:{','.join(leagues)}:{upcoming_days}"
+        cached = self._cache.get_json(cache_key)
+        if isinstance(cached, dict) and cached.get("by_canon"):
+            return cached["by_canon"]
+
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(days=3)
+        window_end = now + timedelta(days=upcoming_days)
+
+        out: dict[str, dict[str, Any]] = {}
+        for league in leagues:
+            data = await self.fetch_mma_scoreboard(league=league)
+            events = data.get("events") or []
+            if not isinstance(events, list):
+                continue
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                event_title = ev.get("name") or ev.get("shortName") or ""
+                date_str = ev.get("date")
+                scheduled_at = None
+                if isinstance(date_str, str):
+                    try:
+                        scheduled_at = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        scheduled_at = None
+                # Filter to events in our window.
+                if scheduled_at is not None and not (window_start <= scheduled_at <= window_end):
+                    continue
+                comps = ev.get("competitions") or []
+                if not isinstance(comps, list):
+                    continue
+                # Track which competition we're on so we can flag main event.
+                for ci, comp in enumerate(comps):
+                    if not isinstance(comp, dict):
+                        continue
+                    is_main = bool(comp.get("conferenceCompetition")) or (ci == 0)
+                    weight_class = None
+                    notes = comp.get("notes") or []
+                    if isinstance(notes, list):
+                        for n in notes:
+                            if isinstance(n, dict):
+                                h = n.get("headline") or n.get("type")
+                                if isinstance(h, str) and "weight" in h.lower():
+                                    weight_class = h
+                                    break
+                    # Fall back to competition type.weightClass if present.
+                    if not weight_class:
+                        wc_info = comp.get("type") or {}
+                        if isinstance(wc_info, dict):
+                            weight_class = wc_info.get("text")
+                    competitors = comp.get("competitors") or []
+                    if not isinstance(competitors, list) or len(competitors) != 2:
+                        continue
+                    names: list[str] = []
+                    for c in competitors:
+                        if not isinstance(c, dict):
+                            continue
+                        athlete = c.get("athlete") or {}
+                        if isinstance(athlete, dict):
+                            nm = athlete.get("displayName") or athlete.get("fullName") or ""
+                            if nm:
+                                names.append(nm)
+                    if len(names) != 2:
+                        continue
+                    a_name, b_name = names[0], names[1]
+                    a_canon = _canon_name(a_name)
+                    b_canon = _canon_name(b_name)
+                    # Index BOTH directions so a lookup by either fighter works.
+                    out[a_canon] = {
+                        "fighter_name": a_name,
+                        "opponent_name": b_name,
+                        "opponent_canon": b_canon,
+                        "event_title": event_title,
+                        "scheduled_at": date_str,
+                        "weight_class": weight_class,
+                        "is_main_event": is_main,
+                        "league": league,
+                    }
+                    out[b_canon] = {
+                        "fighter_name": b_name,
+                        "opponent_name": a_name,
+                        "opponent_canon": a_canon,
+                        "event_title": event_title,
+                        "scheduled_at": date_str,
+                        "weight_class": weight_class,
+                        "is_main_event": is_main,
+                        "league": league,
+                    }
+
+        self._cache.set_json(
+            cache_key, {"by_canon": out, "built_at": now.isoformat()}, ttl_seconds=30 * 60,
+        )
+        return out
+
     async def fetch_mma_career_stats(self, *, athlete_id: int) -> dict[str, float]:
         """
         Returns career aggregate stats dict  e.g.

@@ -1228,6 +1228,43 @@ async def calibration_tier_model_auto_train(
     return outcome
 
 
+@app.get("/debug/mma/card")
+async def debug_mma_card(league: str = Query("ufc")):
+    """Return ESPN's MMA scoreboard / fight card for the given league.
+
+    Used to diagnose the '? vs ?' rendering bug: if Underdog's payload
+    omits matchup info, the ranker backfills it from this card index.
+    The response shape mirrors `fetch_mma_card_index` — fighter name
+    keyed lookup with opponent + event + weight class + scheduled time.
+
+    Example: GET /debug/mma/card?league=ufc
+    """
+    index = await espn_client.fetch_mma_card_index(leagues=(league,))
+    fights: dict[str, dict] = {}
+    seen: set[frozenset[str]] = set()
+    for canon, entry in index.items():
+        pair = frozenset([canon, entry.get("opponent_canon") or ""])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        fights[entry.get("event_title", "Unknown")] = fights.get(
+            entry.get("event_title", "Unknown"), []
+        )
+        fights[entry.get("event_title", "Unknown")].append({
+            "fighter_a": entry.get("fighter_name"),
+            "fighter_b": entry.get("opponent_name"),
+            "weight_class": entry.get("weight_class"),
+            "scheduled_at": entry.get("scheduled_at"),
+            "is_main_event": entry.get("is_main_event"),
+        })
+    return {
+        "league": league,
+        "n_fighters_indexed": len(index),
+        "n_events": len(fights),
+        "events": fights,
+    }
+
+
 @app.get("/ufcstats/status")
 async def ufcstats_status():
     """Read-only snapshot of the UFCStats scraper's persisted DB."""
