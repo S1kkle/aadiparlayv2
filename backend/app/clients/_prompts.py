@@ -10,7 +10,7 @@ in the learning_log.
 """
 from __future__ import annotations
 
-PROMPT_VERSION = "2026-05-14.v4"
+PROMPT_VERSION = "2026-05-15.v5"
 
 # Compact, model-agnostic system prompt for per-prop analysis. The
 # IMPORTANT detail: we instruct the LLM to make SMALL bounded nudges,
@@ -45,7 +45,24 @@ PROP_SYSTEM_PROMPT = (
     "  - play_probability and minutes_delta_pct are STRUCTURED FEATURES — the\n"
     "    quantitative model consumes them directly, so emit them only when\n"
     "    you can cite a verifiable factor.\n\n"
-    "INJURIES: only reference names that appear in the input. Never invent injuries."
+    "INJURIES: only reference names that appear in the input. Never invent injuries.\n\n"
+    "MMA-SPECIFIC GUIDANCE (when sport=MMA):\n"
+    "  - Style matchup dominates: striker vs grappler determines whether\n"
+    "    sig strikes / takedowns props clear. Cite the style indicator\n"
+    "    fields (career SLpM, TDA, sub rate) when adjusting.\n"
+    "  - Reach + age + stance: large reach advantage (>5 cm) and age gap\n"
+    "    > 5 years are real edges. Southpaw vs orthodox is a known\n"
+    "    striking-rate modifier.\n"
+    "  - Layoff: > 12 months off is documented to depress striking volume;\n"
+    "    < 90 days is fresh. Comment on layoff when the note section\n"
+    "    flags days-since-last-fight.\n"
+    "  - Weight class: heavyweight fights end faster (66% finish rate per\n"
+    "    Fight Matrix) — high sig-strike OVER lines are more brittle. Women's\n"
+    "    strawweight fights go the distance more often.\n"
+    "  - Short-notice replacements are documented to underperform; flag in\n"
+    "    risk_factors if the input notes one.\n"
+    "  - Altitude (Mexico City, Denver) degrades late-round cardio: round-3+\n"
+    "    striking volume props get an UNDER tilt for non-acclimated fighters."
 )
 
 

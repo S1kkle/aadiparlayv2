@@ -970,8 +970,17 @@ _STAT_VOLATILITY_BASE: dict[str, float] = {
     "double_doubles": 1.25,
     "triple_doubles": 1.35,
     "goals": 1.10,
+    # MMA stats — strikes have higher fight-to-fight variance than NBA
+    # counting stats because finish/stoppage modes vary fight duration
+    # massively. Takedowns and submissions are bursty (many fighters at 0,
+    # then a 4-takedown blowout). Per Diving Into Data + UFCStats volume
+    # distributions; calibrated to match observed quartile spreads.
+    "sigStrikesLanded": 1.30,
+    "totalStrikesLanded": 1.30,
+    "takedownsLanded": 1.25,
     "knockDowns": 1.20,
     "submissions": 1.20,
+    "advances": 1.20,
 }
 
 

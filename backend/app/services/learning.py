@@ -139,13 +139,17 @@ class LearningService:
                 # estimate than the static league baseline.
                 try:
                     from app.services.online_priors import update_player_prior
+                    _sport = str(p.get("sport") or "")
+                    # For MMA the position field doubles as weight class.
+                    _wc = p.get("player_position") if _sport.upper() == "MMA" else None
                     update_player_prior(
                         self._cache,
-                        sport=str(p.get("sport") or ""),
+                        sport=_sport,
                         stat_field=str(p.get("stat_field") or p.get("stat") or ""),
                         player=str(p.get("player_name") or ""),
                         position=p.get("player_position"),
                         observation=float(actual),
+                        weight_class=_wc,
                     )
                 except Exception:
                     log.debug("online_priors update failed (non-fatal)", exc_info=True)

@@ -79,11 +79,13 @@ def update_player_prior(
     player: str,
     position: str | None,
     observation: float,
+    weight_class: str | None = None,
     n_eff_cap: int = _N_EFF_CAP,
 ) -> dict[str, float]:
     """Apply one conjugate update to the player's posterior. O(1) per call.
 
-    Returns the updated entry: {mu, n_eff, position}.
+    For MMA, the optional `weight_class` is persisted so the hierarchical
+    prior lookup can use it as a pooling layer.
     """
     if not sport or not stat_field or not player:
         return {}
@@ -93,6 +95,9 @@ def update_player_prior(
     if prev:
         mu_prior = float(prev.get("mu", observation))
         n_prior = float(prev.get("n_eff", 1))
+        # Preserve weight_class from prior entry when caller didn't supply it.
+        if not weight_class and prev.get("weight_class"):
+            weight_class = prev.get("weight_class")
     else:
         # Seed the prior with the league baseline so the first observation
         # doesn't fully define the player.
@@ -109,6 +114,7 @@ def update_player_prior(
         "mu": round(mu_post, 4),
         "n_eff": round(n_post, 2),
         "position": position or "",
+        "weight_class": weight_class or "",
         "last_updated": _now_iso(),
     }
     _save(cache, data)
@@ -122,8 +128,16 @@ def get_hierarchical_prior(
     stat_field: str,
     player: str,
     position: str | None,
+    weight_class: str | None = None,
 ) -> float | None:
-    """Three-level partial pool: player → position → league.
+    """Multi-level partial pool: player → (weight_class for MMA) → position → league.
+
+    For MMA, `weight_class` (heavyweight / lightweight / women's flyweight…)
+    adds an additional pooling layer between fighter posterior and the
+    global league prior. MMA per-fighter sample sizes are 8-20 fights vs
+    NBA's 500-1000+ games, so partial pooling is more load-bearing here
+    than in team sports — see Diving Into Data's Bayesian MMA ranking
+    work for the motivation.
 
     Each level contributes weight proportional to its effective sample
     size; small-sample players are pulled toward the position posterior,
@@ -141,12 +155,36 @@ def get_hierarchical_prior(
         mu_p = None
         n_p = 0.0
 
-    # Level 2: position pool — empirical average of player posteriors in
-    # the same (sport, stat_field, position). Falls back to league when
-    # no other players have data for this position+stat yet.
+    # Level 2 (MMA only): weight-class pool. Heavyweight fighters average
+    # ~25% fewer significant strikes per fight than featherweights because
+    # KO rate is materially higher; failing to pool by class biases small-
+    # sample heavyweights toward the cross-class league mean.
+    sport_upper = sport.upper()
+    mu_wc_pooled: float | None = None
+    if sport_upper == "MMA" and weight_class:
+        wc_upper = weight_class.strip().lower()
+        prefix = f"{sport_upper}|{stat_field}|"
+        wc_values: list[tuple[float, float]] = []
+        for entry_key, entry in data.items():
+            if not entry_key.startswith(prefix):
+                continue
+            if (entry.get("weight_class") or "").lower() == wc_upper:
+                wc_values.append((float(entry.get("mu", 0)), float(entry.get("n_eff", 0))))
+        if wc_values:
+            total_w = sum(n for _, n in wc_values)
+            mu_wc = sum(mu * n for mu, n in wc_values) / max(1.0, total_w)
+            if league is not None:
+                mu_wc_pooled = (
+                    total_w * mu_wc + _POSITION_POOL_K * league
+                ) / (total_w + _POSITION_POOL_K)
+            else:
+                mu_wc_pooled = mu_wc
+
+    # Level 3 / fallback level 2 for non-MMA: position pool. Falls back to
+    # league when no other players have data for this position+stat yet.
     pos_upper = (position or "").strip().upper()
     if pos_upper:
-        prefix = f"{sport.upper()}|{stat_field}|"
+        prefix = f"{sport_upper}|{stat_field}|"
         pos_values: list[tuple[float, float]] = []
         for entry_key, entry in data.items():
             if not entry_key.startswith(prefix):
@@ -156,8 +194,6 @@ def get_hierarchical_prior(
         if pos_values:
             total_w = sum(n for _, n in pos_values)
             mu_pos = sum(mu * n for mu, n in pos_values) / max(1.0, total_w)
-            # Pool position-mean toward league by _POSITION_POOL_K (Wikipedia
-            # / Murphy textbook partial-pooling formula).
             if league is not None:
                 mu_pos_pooled = (
                     total_w * mu_pos + _POSITION_POOL_K * league
@@ -169,12 +205,14 @@ def get_hierarchical_prior(
     else:
         mu_pos_pooled = league
 
+    # MMA weight-class pool takes precedence over position pool when present.
+    pool_target = mu_wc_pooled if mu_wc_pooled is not None else mu_pos_pooled
+
     if mu_p is not None and n_p > 0:
-        # Pool player toward the (already-pooled) position prior. Same shape.
-        if mu_pos_pooled is not None:
-            return (n_p * mu_p + _POSITION_POOL_K * mu_pos_pooled) / (n_p + _POSITION_POOL_K)
+        if pool_target is not None:
+            return (n_p * mu_p + _POSITION_POOL_K * pool_target) / (n_p + _POSITION_POOL_K)
         return mu_p
-    return mu_pos_pooled
+    return pool_target
 
 
 def replay_from_learning_log(

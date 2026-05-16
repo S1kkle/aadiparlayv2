@@ -1729,7 +1729,22 @@ class Ranker:
                 )
 
     async def _apply_espn_model_mma(self, props: list[Prop]) -> None:
-        """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog."""
+        """MMA model: uses per-fight stats from ESPN eventlog instead of gamelog.
+
+        Adds MMA-specific adjustments that don't apply to team sports:
+        - Opponent style/exchange factor (opponent's career SLpM/TDA/SubAvg)
+        - Layoff (ring-rust) regression to prior for > 90-day inactivity
+        - Era decay on the prior so a fighter's recent fights dominate
+          the shrinkage target rather than a static league-average
+        - MMA-specific volatility multipliers (see _STAT_VOLATILITY_BASE)
+        """
+        from app.services.mma_features import (
+            days_since_last_fight,
+            era_weighted_career_mean,
+            layoff_adjustment,
+            opponent_exchange_factor,
+        )
+
         assert self._espn is not None
 
         unique_fighters: list[str] = []
@@ -1739,28 +1754,40 @@ class Ranker:
                 continue
             seen.add(p.player_name)
             unique_fighters.append(p.player_name)
+        # Pre-resolve opponent names too so the per-prop opponent-exchange
+        # adjustment doesn't fire a fresh ESPN lookup per leg in the hot path.
+        opponent_names: set[str] = set()
+        for p in props:
+            if p.opponent_abbr and p.opponent_abbr not in seen:
+                opponent_names.add(p.opponent_abbr)
 
         fight_history_by_name: dict[str, list[dict[str, Any]]] = {}
         athlete_id_by_name: dict[str, int | None] = {}
         career_stats_by_name: dict[str, dict[str, float]] = {}
         sem = asyncio.Semaphore(6)
 
-        async def fetch_fighter(name: str) -> None:
+        async def fetch_fighter(name: str, *, fetch_history: bool = True) -> None:
             async with sem:
                 aid = await self._espn.find_mma_athlete_id(full_name=name)
             athlete_id_by_name[name] = aid
             if aid is None:
-                fight_history_by_name[name] = []
+                if fetch_history:
+                    fight_history_by_name[name] = []
                 career_stats_by_name[name] = {}
                 return
-            async with sem:
-                fight_history_by_name[name] = await self._espn.fetch_mma_fight_history(
-                    athlete_id=aid, last_n=self._cfg.last_n,
-                )
+            if fetch_history:
+                async with sem:
+                    fight_history_by_name[name] = await self._espn.fetch_mma_fight_history(
+                        athlete_id=aid, last_n=self._cfg.last_n,
+                    )
             async with sem:
                 career_stats_by_name[name] = await self._espn.fetch_mma_career_stats(athlete_id=aid)
 
-        await asyncio.gather(*(fetch_fighter(n) for n in unique_fighters))
+        # Fetch fighters (full history) and opponents (career stats only) in parallel.
+        await asyncio.gather(
+            *(fetch_fighter(n) for n in unique_fighters),
+            *(fetch_fighter(n, fetch_history=False) for n in opponent_names),
+        )
 
         for p in props:
             p.espn_athlete_id = athlete_id_by_name.get(p.player_name)
@@ -1792,16 +1819,89 @@ class Ranker:
                 p.notes.append("Unable to fit distribution (insufficient ESPN MMA data).")
                 continue
 
-            # Bayesian shrinkage for small MMA samples — shrink toward fight-stat
-            # baseline (e.g. ~60 sig strikes, ~1.2 takedowns), NOT toward p.line.
-            mma_prior = league_prior_mean(
-                sport="MMA", stat_field=field_used, position=None, fallback=params.mu,
+            # Inflate sigma for inherently noisy MMA stats — strikes have
+            # higher fight-to-fight variance than the default 1.0 multiplier;
+            # takedowns and submissions are bursty (zero-heavy).
+            vol_mult = stat_volatility_multiplier(field_used)
+            if vol_mult != 1.0:
+                params = NormalParams(mu=params.mu, sigma=params.sigma * vol_mult)
+
+            # Bayesian shrinkage for small MMA samples — use an ERA-WEIGHTED
+            # fighter-specific prior when we have ≥ 6 fights of history,
+            # falling back to the static MMA league baseline otherwise. The
+            # era-weighted mean down-weights pre-modern-MMA performances so
+            # a fighter's recent skill level dominates.
+            from app.services.online_priors import get_hierarchical_prior
+            era_prior = (
+                era_weighted_career_mean(series) if len(series) >= 6 else None
+            )
+            # `player_position` for MMA carries the weight class (e.g.
+            # "Lightweight"), populated by the underdog normalizer when
+            # available. Pass it through as both position AND weight_class
+            # so the hierarchical pooler can use the MMA-specific class layer.
+            wc_for_pool = p.player_position
+            online_p = get_hierarchical_prior(
+                self._cache,
+                sport="MMA", stat_field=field_used or "",
+                player=p.player_name, position=p.player_position,
+                weight_class=wc_for_pool,
+            )
+            mma_prior = (
+                online_p
+                if online_p is not None
+                else (
+                    era_prior
+                    if era_prior is not None
+                    else league_prior_mean(
+                        sport="MMA", stat_field=field_used,
+                        position=None, fallback=params.mu,
+                    )
+                )
             )
             if mma_prior is None:
                 mma_prior = params.mu
             if len(series) < 5:
                 shrunk_mu = bayesian_shrink(params.mu, len(series), mma_prior, shrinkage_k=3.0)
                 params = NormalParams(mu=shrunk_mu, sigma=params.sigma)
+
+            # Layoff / ring-rust adjustment. The fight series is newest-first
+            # so the most-recent fight date is in `fights[0]`. Long layoffs
+            # pull μ back toward the prior; short layoffs are no-ops.
+            layoff_days = days_since_last_fight(fights)
+            if layoff_days is not None and layoff_days > 90:
+                layoff_factor = layoff_adjustment(layoff_days)
+                if abs(layoff_factor - 1.0) > 0.01:
+                    # Regress μ toward the prior by the rust factor: instead of
+                    # multiplying μ directly, we move it some fraction toward
+                    # mma_prior. This makes rust-regression target the
+                    # OUT-OF-MARKET baseline, never the line (avoids the
+                    # market-collapsing shrinkage warned about in stat_model).
+                    pull = (1.0 - layoff_factor)  # how much to regress
+                    new_mu = params.mu * (1.0 - pull) + float(mma_prior) * pull
+                    params = NormalParams(mu=new_mu, sigma=params.sigma)
+                    p.notes.append(
+                        f"Layoff: {layoff_days} days since last fight — μ regressed "
+                        f"{pull * 100:.0f}% toward MMA baseline."
+                    )
+
+            # Opponent-style exchange factor: opponent's career SLpM /
+            # takedownAvg / submissionAvg → multiplicative μ adjustment.
+            # Capped to [0.85, 1.15] inside opponent_exchange_factor() so a
+            # single noisy career-stat datapoint can't dominate the projection.
+            if p.opponent_abbr and field_used:
+                opp_career = career_stats_by_name.get(p.opponent_abbr)
+                if opp_career:
+                    opp_factor = opponent_exchange_factor(
+                        opp_career, stat_field=field_used,
+                    )
+                    if abs(opp_factor - 1.0) > 0.01:
+                        params = NormalParams(
+                            mu=params.mu * opp_factor, sigma=params.sigma,
+                        )
+                        p.notes.append(
+                            f"Opponent-style factor (×{opp_factor:.3f}) applied based on "
+                            f"{p.opponent_abbr}'s career striking/grappling volume."
+                        )
 
             p.volatility = float(params.sigma)
             p.stat_field = field_used

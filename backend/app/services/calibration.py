@@ -44,6 +44,94 @@ NBA_STATS = [
     "threePointFieldGoalsMade", "steals", "blocks",
 ]
 
+# MMA stats we know how to backtest synthetically. Limited to count-style
+# fight totals — round-of-finish / fight-time props need the hazard model
+# in Batch 2 to evaluate properly and don't fit the same Gaussian-fit-then-
+# distribution-dispatch backtest harness.
+MMA_STATS = [
+    "sigStrikesLanded",
+    "totalStrikesLanded",
+    "takedownsLanded",
+    "knockDowns",
+    "submissions",
+]
+
+# MMA fighter archetypes — (mean per-fight, std per-fight) for each stat.
+# Calibrated against public UFCStats career-average distributions across
+# weight classes. The intent is to validate the MMA branch independently
+# of NBA archetypes during calibration runs when real MMA learning_log
+# data is sparse. Per-fight values; treated by `generate_synthetic_data`
+# the same as NBA archetypes (Gaussian draw with archetype mean ± std).
+MMA_ARCHETYPES = [
+    # Striker archetypes (heavy SLpM, low TDA)
+    {"name": "Volume_Striker_LW",
+     "sigStrikesLanded": (95, 30), "totalStrikesLanded": (130, 35),
+     "takedownsLanded": (0.2, 0.4), "knockDowns": (0.4, 0.6),
+     "submissions": (0.1, 0.3)},
+    {"name": "Volume_Striker_WW",
+     "sigStrikesLanded": (85, 28), "totalStrikesLanded": (115, 30),
+     "takedownsLanded": (0.3, 0.5), "knockDowns": (0.5, 0.7),
+     "submissions": (0.1, 0.3)},
+    {"name": "Power_Striker_HW",
+     "sigStrikesLanded": (40, 20), "totalStrikesLanded": (55, 25),
+     "takedownsLanded": (0.1, 0.3), "knockDowns": (0.9, 0.9),
+     "submissions": (0.0, 0.2)},
+    {"name": "Counter_Striker_MW",
+     "sigStrikesLanded": (55, 18), "totalStrikesLanded": (70, 20),
+     "takedownsLanded": (0.3, 0.5), "knockDowns": (0.6, 0.7),
+     "submissions": (0.1, 0.3)},
+    # Wrestler archetypes (low SLpM, high TDA, moderate sub)
+    {"name": "Wrestle_Boxer_LW",
+     "sigStrikesLanded": (60, 22), "totalStrikesLanded": (85, 28),
+     "takedownsLanded": (2.5, 1.5), "knockDowns": (0.2, 0.4),
+     "submissions": (0.3, 0.5)},
+    {"name": "Dominant_Wrestler_WW",
+     "sigStrikesLanded": (45, 18), "totalStrikesLanded": (70, 25),
+     "takedownsLanded": (3.5, 1.8), "knockDowns": (0.1, 0.3),
+     "submissions": (0.4, 0.6)},
+    {"name": "Greco_Wrestler_HW",
+     "sigStrikesLanded": (30, 15), "totalStrikesLanded": (50, 20),
+     "takedownsLanded": (2.0, 1.2), "knockDowns": (0.3, 0.5),
+     "submissions": (0.2, 0.4)},
+    # Grappler archetypes (low SLpM, mid TDA, high sub attempts)
+    {"name": "BJJ_Specialist_LW",
+     "sigStrikesLanded": (40, 18), "totalStrikesLanded": (60, 22),
+     "takedownsLanded": (1.8, 1.0), "knockDowns": (0.1, 0.3),
+     "submissions": (1.2, 0.9)},
+    {"name": "BJJ_Specialist_WW",
+     "sigStrikesLanded": (50, 20), "totalStrikesLanded": (75, 25),
+     "takedownsLanded": (2.0, 1.2), "knockDowns": (0.2, 0.4),
+     "submissions": (1.0, 0.8)},
+    # Hybrid / well-rounded
+    {"name": "Hybrid_LW",
+     "sigStrikesLanded": (70, 25), "totalStrikesLanded": (95, 28),
+     "takedownsLanded": (1.5, 1.0), "knockDowns": (0.4, 0.6),
+     "submissions": (0.4, 0.6)},
+    {"name": "Hybrid_FW",
+     "sigStrikesLanded": (75, 27), "totalStrikesLanded": (100, 30),
+     "takedownsLanded": (1.3, 1.0), "knockDowns": (0.3, 0.5),
+     "submissions": (0.5, 0.6)},
+    # Women's divisions
+    {"name": "WStrawweight_Volume",
+     "sigStrikesLanded": (80, 25), "totalStrikesLanded": (110, 30),
+     "takedownsLanded": (1.0, 0.8), "knockDowns": (0.2, 0.4),
+     "submissions": (0.3, 0.5)},
+    {"name": "WFlyweight_Wrestler",
+     "sigStrikesLanded": (55, 20), "totalStrikesLanded": (80, 25),
+     "takedownsLanded": (2.0, 1.2), "knockDowns": (0.1, 0.3),
+     "submissions": (0.5, 0.6)},
+    # Decision-fighter archetype (low finish rate)
+    {"name": "Decision_Fighter",
+     "sigStrikesLanded": (85, 22), "totalStrikesLanded": (115, 25),
+     "takedownsLanded": (1.5, 1.0), "knockDowns": (0.1, 0.3),
+     "submissions": (0.2, 0.4)},
+    # Early-career / inconsistent
+    {"name": "Young_Prospect",
+     "sigStrikesLanded": (60, 30), "totalStrikesLanded": (85, 35),
+     "takedownsLanded": (1.0, 1.2), "knockDowns": (0.3, 0.5),
+     "submissions": (0.3, 0.5)},
+]
+
 PLAYER_ARCHETYPES = [
     {"name": "Elite_Scorer", "points": (28, 5), "totalRebounds": (5, 2), "assists": (8, 3), "threePointFieldGoalsMade": (3, 1.5), "steals": (1.5, 0.8), "blocks": (0.5, 0.5)},
     {"name": "Pass_First_PG", "points": (22, 5), "totalRebounds": (4, 1.5), "assists": (10, 3), "threePointFieldGoalsMade": (2.5, 1.3), "steals": (1.2, 0.7), "blocks": (0.3, 0.4)},
@@ -158,8 +246,20 @@ class ModelConfig:
 # ── Synthetic data generation ────────────────────────────────────────
 
 def generate_synthetic_data(
-    n_games: int = 25, n_copies: int = 2, seed: int = 42
+    n_games: int = 25,
+    n_copies: int = 2,
+    seed: int = 42,
+    *,
+    include_mma: bool = True,
+    mma_n_fights: int = 12,
 ) -> list[dict]:
+    """Generate synthetic player-data archetypes for calibration backtests.
+
+    NBA archetypes always emitted. MMA archetypes appended when
+    `include_mma=True` (the default) — fewer "games" (fights) per
+    archetype because MMA careers are short. Identifiable by the
+    archetype name prefix "MMA_".
+    """
     rng = random.Random(seed)
     player_data = []
     for copy_idx in range(n_copies):
@@ -182,6 +282,29 @@ def generate_synthetic_data(
                     stats[field] = games
             if stats:
                 player_data.append({"name": f"{arch['name']}_v{copy_idx}", "stats": stats})
+
+    if include_mma:
+        for copy_idx in range(n_copies):
+            for arch in MMA_ARCHETYPES:
+                stats: dict[str, list[float]] = {}
+                for field in MMA_STATS:
+                    if field not in arch:
+                        continue
+                    mean, std = arch[field]
+                    mean_adj = mean * rng.uniform(0.85, 1.15)
+                    std_adj = std * rng.uniform(0.80, 1.20)
+                    fights = []
+                    for _ in range(mma_n_fights):
+                        # All MMA counting stats are integer-valued.
+                        val = max(0, round(rng.gauss(mean_adj, std_adj)))
+                        fights.append(float(val))
+                    if len(fights) >= 5:
+                        stats[field] = fights
+                if stats:
+                    player_data.append({
+                        "name": f"MMA_{arch['name']}_v{copy_idx}",
+                        "stats": stats,
+                    })
     return player_data
 
 
