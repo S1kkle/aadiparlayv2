@@ -610,17 +610,8 @@ class Ranker:
             if not await self._ollama.is_available():
                 raise RuntimeError("Ollama not available.")
 
-            # --- Step 1: AI selection — let AI pick the best N from top candidates ---
-            # Deduplicate candidate pool by (player, stat-type) — NOT by player
-            # alone. The old player-only dedup was throwing away every prop
-            # type except the highest-scoring one per fighter, which for MMA
-            # meant sig strikes dominated and fight time / takedowns / round
-            # of finish were never even SHOWN to the AI selector. The fix
-            # lets every distinct stat type per fighter survive into the
-            # candidate pool so the AI can evaluate them all and pick whatever
-            # actually scores best — including all sig strikes if that's
-            # genuinely the right call. We don't impose a stat-type quota:
-            # if the model thinks 9 sig strikes is right, that stands.
+            # Dedup by (player, stat-type) — same key everywhere so the AI
+            # path is consistent with the simple path.
             def _stat_key(p: Prop) -> str:
                 return (p.display_stat or p.stat or "").lower().strip()
             _seen_ps: set[tuple[str, str]] = set()
@@ -630,75 +621,141 @@ class Ranker:
                 if key not in _seen_ps:
                     _seen_ps.add(key)
                     _deduped_pool.append(p)
-            # Pool size increased from 40 → 60 because the dedup now produces
-            # more candidates per fighter (several stat types instead of one).
-            candidate_pool = _deduped_pool[:min(60, len(_deduped_pool))]
 
-            await _emit_stage("ai_select", f"AI selecting best {require_ai_count} from {len(candidate_pool)} candidates...")
-
-            ai_selected_indices = await self._ai_select_props(
-                candidate_pool, pick_count=require_ai_count
+            # MMA short-circuit: a single UFC card is ~10-13 fights × 4-6 prop
+            # types ≈ 40-80 unique (fighter, stat-type) combos, vs NBA slates
+            # that have 200-400. Running the AI SELECTOR (which prunes the
+            # pool down to require_ai_count picks before analysis) is wasted
+            # signal here — every fighter on the card is genuinely worth
+            # qualitative analysis. We skip the selector and run the full
+            # analysis pass on every deduped prop instead. Same trigger
+            # condition for any slate whose deduped pool is small enough to
+            # afford analyzing everything within reasonable budget.
+            mma_only_slate = all(p.sport == "MMA" for p in _deduped_pool) and len(_deduped_pool) > 0
+            analyze_all = (
+                mma_only_slate
+                or len(_deduped_pool) <= max(int(require_ai_count) * 2, 25)
             )
 
-            ai_picks: list[Prop] = []
-            # Dedup the AI's selections by (player, stat-type) — matches the
-            # candidate-pool dedup so an AI that picked 'Pereira sig strikes'
-            # AND 'Pereira fight time' keeps BOTH, but a degenerate model
-            # that picked 'Pereira sig strikes' twice with different lines
-            # still collapses to one.
-            seen_pick_keys: set[tuple[str, str]] = set()
-            if ai_selected_indices:
-                for idx in ai_selected_indices:
-                    if 0 <= idx < len(candidate_pool):
-                        p = candidate_pool[idx]
+            if analyze_all:
+                await _emit_stage(
+                    "ai",
+                    f"Running deep analysis on all {len(_deduped_pool)} candidates "
+                    f"(skipping selector — pool small enough).",
+                )
+                ai_picks = list(_deduped_pool[:max(int(require_ai_count) * 4, 50)])
+
+                async def _on_prop_done(p: Prop) -> None:
+                    if on_ai_progress is None:
+                        return
+                    try:
+                        ok = isinstance(p.ai_summary, str) and p.ai_summary.strip()
+                        await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok), "prop": p})
+                    except Exception:
+                        return
+
+                await self._apply_ollama(
+                    ai_picks,
+                    on_prop_done=_on_prop_done,
+                    per_prop_timeout_s=90,
+                    ollama_timeout_s=90,
+                )
+
+                if on_ai_progress is not None:
+                    try:
+                        have_ai = sum(1 for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip())
+                        await on_ai_progress({
+                            "type": "ai_batch",
+                            "analyzed": len(ai_picks),
+                            "have_ai": have_ai,
+                            "need_ai": int(require_ai_count),
+                        })
+                    except Exception:
+                        pass
+
+                with_ai = [p for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip()]
+                without_ai = [p for p in ai_picks if not (isinstance(p.ai_summary, str) and p.ai_summary.strip())]
+                selected = with_ai + without_ai
+
+                # Bypass the selector path below — we already ran analysis.
+                # Jump to the post-AI scoring block via a structured-control
+                # flag rather than a goto (Python doesn't have one).
+                _skip_selector = True
+            else:
+                _skip_selector = False
+
+            if not _skip_selector:
+                # --- Step 1: AI selection — let AI pick the best N from top candidates ---
+                # Pool size 60 because dedup now produces multiple candidates
+                # per fighter (several stat types instead of one).
+                candidate_pool = _deduped_pool[:min(60, len(_deduped_pool))]
+
+                await _emit_stage("ai_select", f"AI selecting best {require_ai_count} from {len(candidate_pool)} candidates...")
+
+                ai_selected_indices = await self._ai_select_props(
+                    candidate_pool, pick_count=require_ai_count
+                )
+
+                ai_picks: list[Prop] = []
+                # Dedup the AI's selections by (player, stat-type) — matches the
+                # candidate-pool dedup so an AI that picked 'Pereira sig strikes'
+                # AND 'Pereira fight time' keeps BOTH, but a degenerate model
+                # that picked 'Pereira sig strikes' twice with different lines
+                # still collapses to one.
+                seen_pick_keys: set[tuple[str, str]] = set()
+                if ai_selected_indices:
+                    for idx in ai_selected_indices:
+                        if 0 <= idx < len(candidate_pool):
+                            p = candidate_pool[idx]
+                            key = (p.player_name, _stat_key(p))
+                            if key not in seen_pick_keys:
+                                seen_pick_keys.add(key)
+                                ai_picks.append(p)
+                if len(ai_picks) < require_ai_count:
+                    for p in candidate_pool:
                         key = (p.player_name, _stat_key(p))
                         if key not in seen_pick_keys:
                             seen_pick_keys.add(key)
                             ai_picks.append(p)
-            if len(ai_picks) < require_ai_count:
-                for p in candidate_pool:
-                    key = (p.player_name, _stat_key(p))
-                    if key not in seen_pick_keys:
-                        seen_pick_keys.add(key)
-                        ai_picks.append(p)
-                        if len(ai_picks) >= require_ai_count:
-                            break
+                            if len(ai_picks) >= require_ai_count:
+                                break
 
-            await _emit_stage("ai", f"Running deep analysis on {len(ai_picks)} AI-selected props...")
+                await _emit_stage("ai", f"Running deep analysis on {len(ai_picks)} AI-selected props...")
 
-            # --- Step 2: Full AI analysis on AI-selected props only ---
-            async def _on_prop_done(p: Prop) -> None:
-                if on_ai_progress is None:
-                    return
-                try:
-                    ok = isinstance(p.ai_summary, str) and p.ai_summary.strip()
-                    await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok), "prop": p})
-                except Exception:
-                    return
+                # --- Step 2: Full AI analysis on AI-selected props only ---
+                async def _on_prop_done(p: Prop) -> None:
+                    if on_ai_progress is None:
+                        return
+                    try:
+                        ok = isinstance(p.ai_summary, str) and p.ai_summary.strip()
+                        await on_ai_progress({"type": "ai_prop_done", "ok": bool(ok), "prop": p})
+                    except Exception:
+                        return
 
-            await self._apply_ollama(
-                ai_picks,
-                on_prop_done=_on_prop_done,
-                per_prop_timeout_s=90,
-                ollama_timeout_s=90,
-            )
+                await self._apply_ollama(
+                    ai_picks,
+                    on_prop_done=_on_prop_done,
+                    per_prop_timeout_s=90,
+                    ollama_timeout_s=90,
+                )
 
-            if on_ai_progress is not None:
-                try:
-                    have_ai = sum(1 for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip())
-                    await on_ai_progress({
-                        "type": "ai_batch",
-                        "analyzed": len(ai_picks),
-                        "have_ai": have_ai,
-                        "need_ai": int(require_ai_count),
-                    })
-                except Exception:
-                    pass
+                if on_ai_progress is not None:
+                    try:
+                        have_ai = sum(1 for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip())
+                        await on_ai_progress({
+                            "type": "ai_batch",
+                            "analyzed": len(ai_picks),
+                            "have_ai": have_ai,
+                            "need_ai": int(require_ai_count),
+                        })
+                    except Exception:
+                        pass
 
-            # Keep all AI-selected props; those with summaries first, then the rest
-            with_ai = [p for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip()]
-            without_ai = [p for p in ai_picks if not (isinstance(p.ai_summary, str) and p.ai_summary.strip())]
-            selected = with_ai + without_ai
+                # Keep all AI-selected props; those with summaries first, then the rest
+                with_ai = [p for p in ai_picks if isinstance(p.ai_summary, str) and p.ai_summary.strip()]
+                without_ai = [p for p in ai_picks if not (isinstance(p.ai_summary, str) and p.ai_summary.strip())]
+                selected = with_ai + without_ai
+            # else: _skip_selector path already set `selected` above
         else:
             selected = props[:max_props] if max_props > 0 else props
             if self._ollama is not None and ai_limit > 0:
